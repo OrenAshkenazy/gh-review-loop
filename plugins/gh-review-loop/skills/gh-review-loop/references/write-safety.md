@@ -16,7 +16,7 @@ Do not commit/push/re-review when fixes are ambiguous, tests expose a regression
 
 ## Bundled hooks (what is enforced mechanically)
 
-Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical on runtimes that run plugin hooks (Claude Code). All are gated by local state (free no-ops outside an active loop) and fail open. On runtimes that do not run them (Codex, ChatGPT) the same obligations still apply — follow them yourself. The re-review cap is independent of hooks: `request_rereview.py` counts prior agent pings and refuses past the cap on every runtime.
+Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical on runtimes that run plugin hooks (Claude Code). All are gated by local state (free no-ops outside an active loop) and fail open. On runtimes that do not run them (Codex, ChatGPT) the same obligations still apply — follow them yourself. The re-review cap is independent of hooks: `request_rereview.py` counts prior agent pings and refuses past the cap on every runtime. It also refuses when the count cannot be established (`uncountable_count`: gh login unresolved, comments query failed) or when the phrase has no mention to count by (`uncountable_trigger`) — an uncountable write is an uncapped write. `--no-cap-check` is the only bypass. The count is taken at write time under the agent's own login; the loop assumes one agent per PR and does not lock against concurrent runs of the same login.
 
 | Event | Script | Guarantees |
 |---|---|---|

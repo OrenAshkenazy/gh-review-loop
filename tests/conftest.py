@@ -46,3 +46,25 @@ def _isolate_user_state(tmp_path_factory, monkeypatch):
     themselves and override this.
     """
     monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path_factory.mktemp("ggrl-state")))
+
+
+def stub_cap_check_known_under_cap(monkeypatch):
+    """Neutralize request_rereview's cap check for tests that are not about it.
+
+    The cap needs the authenticated login and the PR's comments, both from
+    `gh`. Since an unknown count now refuses to post (an uncountable write is
+    an uncapped write), "inert" means a *known* count of zero, not an unknown
+    one. Unit tests of the counter pass an explicit runner and still reach the
+    real function.
+    """
+    import request_rereview
+
+    real_count = request_rereview.count_agent_pings
+
+    def count_or_zero(repo, pr, trigger, agent_login, runner=None):
+        if runner is None:
+            return 0
+        return real_count(repo, pr, trigger, agent_login, runner=runner)
+
+    monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
+    monkeypatch.setattr(request_rereview, "count_agent_pings", count_or_zero)

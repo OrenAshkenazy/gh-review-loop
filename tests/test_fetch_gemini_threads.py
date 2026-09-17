@@ -1466,6 +1466,20 @@ class TestRunGhWithoutBinary:
         assert "gh auth login" in msg
         assert "does not fall back" in msg
 
+    def test_a_missing_cwd_is_not_blamed_on_gh(self, monkeypatch):
+        # subprocess raises FileNotFoundError for a bad cwd too; that must not
+        # be reported as "gh not found" (Sourcery, #115).
+        def _bad_cwd(cmd, *args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "/nonexistent/repo")
+
+        monkeypatch.setattr(subprocess, "run", _bad_cwd)
+        with pytest.raises(RuntimeError) as excinfo:
+            fgt.run_gh(["pr", "view"], cwd="/nonexistent/repo")
+        msg = str(excinfo.value)
+        assert "GitHub CLI" not in msg
+        assert "/nonexistent/repo" in msg
+        assert msg.startswith("gh pr view failed")
+
 
 # ---------------------------------------------------------------------------
 # filter_by_min_severity

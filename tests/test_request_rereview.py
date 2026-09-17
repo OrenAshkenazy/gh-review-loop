@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 import request_rereview
+from conftest import stub_cap_check_known_under_cap
 import review_vendors
 
 
@@ -18,18 +19,11 @@ CREATED_AT = "2026-06-09T07:17:16Z"
 def _cap_check_is_inert_by_default(monkeypatch):
     """Neutralize the cap check for tests that are not about the cap.
 
-    Enforcing the cap needs the authenticated login and the PR's existing
-    comments, both of which come from `gh`. Tests covering phrase construction
-    and output formatting do not care, and leaving the lookup live made them
-    issue real API calls on any machine with `gh` authenticated -- which is how
-    this surfaced: as an unrelated-looking failure on a maintainer's laptop and
-    nowhere else.
-
-    Returning no login makes count_agent_pings report "could not count", which
-    is the documented degrade-to-permissive path. TestCapEnforcement overrides
-    this with its own stubs.
+    See conftest.stub_cap_check_known_under_cap for why "inert" is a known
+    count of zero rather than no login. TestCapEnforcement overrides this with
+    its own stubs.
     """
-    monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+    stub_cap_check_known_under_cap(monkeypatch)
 
 
 def _successful_post(**overrides):
@@ -542,7 +536,7 @@ class TestCapEnforcement:
             "acme/widget", 159, "@codex", "agent", runner=failing
         ) is None
         assert request_rereview.count_agent_pings(
-            "acme/widget", 159, "@codex", None
+            "acme/widget", 159, "@codex", None, runner=failing
         ) is None
 
     def test_mention_matches_as_a_whole_word(self):
@@ -682,6 +676,48 @@ class TestMentionExtraction:
         assert rc == 0
         assert posted == [], "an uncountable write is an uncapped write"
         assert payload["status"] == "uncountable_trigger"
+
+    def test_an_unknown_count_refuses_rather_than_posting_uncapped(self, monkeypatch, capsys):
+        # count_agent_pings returns None when the login is unresolved or the
+        # comments query fails. Posting anyway would make the cap advisory in
+        # exactly the situations where it cannot be checked (Sourcery, #115).
+        posted = []
+
+        def fake_post(repo, pr, phrase, **kwargs):
+            posted.append(phrase)
+            return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
+
+        monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+
+        rc = request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--json"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert posted == []
+        assert payload["status"] == "uncountable_count"
+        assert payload["posted"] is False
+        assert payload["rereview_limit"] == 3
+        assert "gh auth status" in payload["message"]
+
+    def test_no_cap_check_still_bypasses_an_unknown_count(self, monkeypatch, capsys):
+        posted = []
+
+        def fake_post(repo, pr, phrase, **kwargs):
+            posted.append(phrase)
+            return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
+
+        monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
+
+        rc = request_rereview.main(
+            ["--repo", "acme/widget", "--pr", "159", "--no-cap-check"]
+        )
+        capsys.readouterr()
+        assert rc == 0
+        assert posted == ["@codex review"]
 
     def test_an_explicit_mention_makes_a_custom_phrase_countable(
         self, monkeypatch, capsys

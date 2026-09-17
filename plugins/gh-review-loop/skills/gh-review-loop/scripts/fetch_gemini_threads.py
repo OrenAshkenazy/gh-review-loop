@@ -129,7 +129,12 @@ def run_gh(args: list[str], cwd: str | None = None) -> Any:
         # A missing binary must surface as the same clean `error: ...` line the
         # rest of the script prints, not a traceback -- reviewers running the
         # skill in a sandbox without gh should get one actionable sentence.
-        raise RuntimeError(GH_NOT_FOUND_MESSAGE) from exc
+        # subprocess raises the same exception for a missing cwd, so only
+        # attribute it to gh when the OS names gh as the missing file.
+        missing = str(exc.filename or "")
+        if missing == "gh" or missing.endswith("/gh"):
+            raise RuntimeError(GH_NOT_FOUND_MESSAGE) from exc
+        raise RuntimeError(f"gh {' '.join(args)} failed: {exc}") from exc
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip()
         raise RuntimeError(f"gh {' '.join(args)} failed: {message}")
@@ -3019,7 +3024,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Post a summary 'loop receipt' comment to the PR after fetch/filter. "
-            "Includes cycles used, threads resolved, severity breakdown, and remaining actionable count. "
+            "Includes re-review requests used, threads resolved, severity breakdown, and remaining actionable count. "
             "Posts a NEW comment each invocation; for one live comment edited in place, use --sticky-receipt."
         ),
     )
