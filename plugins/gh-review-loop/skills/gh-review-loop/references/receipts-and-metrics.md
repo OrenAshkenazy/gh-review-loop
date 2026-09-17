@@ -21,13 +21,13 @@ A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome
 - Discovery fallback: if local state is missing, the script finds the receipt by its embedded marker and re-attaches.
 - Delivery fallback: if the comment write fails (network, permissions) or `--dry-run` is set, the full receipt prints to stdout instead — a receipt is never lost.
 
-**One-shot receipt (`--post-receipt`).** Leaves one standalone audit-trail comment: cycles used, threads resolved (outdated + addressed-by-reply), threads still pending, severity breakdown. Preview with `--dry-run --post-receipt`. Right for scripted/batch contexts where each invocation is independent.
+**One-shot receipt (`--post-receipt`).** Leaves one standalone audit-trail comment: re-review requests used (against the cap), threads resolved (outdated + addressed-by-reply), threads still pending, severity breakdown. Preview with `--dry-run --post-receipt`. Right for scripted/batch contexts where each invocation is independent.
 
 **Standalone sticky status (`--sticky-receipt`).** Posts/updates the same sticky comment outside the cycle/record path (e.g. a status-only invocation). `--receipt-status {running,done,stopped}` sets the header.
 
 ## Run metrics (`runs.jsonl`)
 
-`--record-run` appends one JSON record per completed loop to `~/.config/gh-review-loop/runs.jsonl` (append-only; never transmitted). Each record holds **counts only**: findings fetched/fixed/needs-human/addressed-by-reply, cycles used, verification result, outcome, duration, finding areas/paths, repo + PR number, and a judge-derived breakdown only when judge mode was on. **No identity is recorded** — no git author, no login — so the data cannot become a productivity score.
+`--record-run` appends one JSON record per completed loop to `~/.config/gh-review-loop/runs.jsonl` (append-only; never transmitted). Each record holds **counts only**: findings fetched/fixed/needs-human/addressed-by-reply, re-review requests used, verification result, outcome, duration, finding areas/paths, repo + PR number, and a judge-derived breakdown only when judge mode was on. **No identity is recorded** — no git author, no login — so the data cannot become a productivity score.
 
 The run's start timestamp and per-finding accumulation reuse the same per-PR key in `state.json`; no extra state file.
 

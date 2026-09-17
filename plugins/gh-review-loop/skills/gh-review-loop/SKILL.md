@@ -1,11 +1,17 @@
 ---
 name: gh-review-loop
-description: Use after a GitHub PR is opened or to handle AI reviewer feedback (Codex, CodeRabbit, Copilot, or any reviewer bot) - run the review loop, fix reviewer comments, sweep sibling instances, verify, push, request re-review.
+description: Use after a GitHub PR is opened or to handle AI reviewer feedback (Codex, CodeRabbit, Copilot, or any reviewer bot) - fix reviewer comments, sweep sibling instances, verify, push, request re-review. Needs an open PR and authenticated gh; asks which bot if none is configured; stops at the cap.
 ---
 
 # AI Reviewer PR Review Loop
 
 Run the full GitHub PR loop: wait for the configured AI reviewer, fetch unresolved actionable review threads, acknowledge, fix, verify against the repo's own checks, push, request re-review — capped. Prefer thread-aware review data over flat PR comments (threads preserve `isResolved`, `isOutdated`, paths, line anchors, diff hunks).
+
+## Precedence and preconditions
+
+Explicit user instructions override every default here and in the references (cap, severity filter, auto-resolve, reviewer choice); "never X without an explicit request" means an explicit request unlocks X. Say in one line when you override a default. This file wins over any reference file — don't stop to reconcile them, follow this file.
+
+Requires `python3` (3.10+) and an authenticated `gh` CLI with GitHub access. If either is missing the script prints `error: ...` — relay it and stop. Never substitute raw API calls, unauthenticated requests, or guesses about review state.
 
 ## Reference files (load on demand)
 
@@ -75,7 +81,7 @@ Emit one-line status updates at each phase transition. **N** = session cycle: co
 | After push | `[loop] session cycle N — pushed. Requesting reviewer re-review. Cap now M/K.` |
 | Reviewer wait | Background task (primary) or chunked heartbeats (fallback) — Workflow step 8 |
 | Stop | `[loop] STOP — <stop-condition>: <one-line explanation>.` |
-| Done | `[loop] DONE — 0 actionable threads remaining. Cycles used: M/K.` (cap consumption, not N — a clean PR ends at `0/K`) + relay the `--record-run` pointer; `remaining_actionable > 0` → `references/terminal-report.md` |
+| Done | `[loop] DONE — 0 actionable threads remaining. Re-review requests used: M/K.` (cap consumption, not N — a clean PR ends at `0/K`) + relay the `--record-run` pointer; `remaining_actionable > 0` → `references/terminal-report.md` |
 
 Skip narration only in pure non-interactive batch mode. User stepping away → pair with `--sticky-receipt`.
 

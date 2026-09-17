@@ -109,15 +109,27 @@ class PullRequest:
     url: str | None = None
 
 
+GH_NOT_FOUND_MESSAGE = (
+    "GitHub CLI (`gh`) not found on PATH. This skill needs `gh` installed and "
+    "authenticated (`gh auth login`); it does not fall back to raw API calls."
+)
+
+
 def run_gh(args: list[str], cwd: str | None = None) -> Any:
-    proc = subprocess.run(
-        ["gh", *args],
-        cwd=cwd,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            cwd=cwd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        # A missing binary must surface as the same clean `error: ...` line the
+        # rest of the script prints, not a traceback -- reviewers running the
+        # skill in a sandbox without gh should get one actionable sentence.
+        raise RuntimeError(GH_NOT_FOUND_MESSAGE) from exc
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip()
         raise RuntimeError(f"gh {' '.join(args)} failed: {message}")
@@ -2349,7 +2361,7 @@ def render_receipt(
         "",
         "| metric | value |",
         "|---|---|",
-        f"| re-review cycles used | {rereview_count} / {rereview_limit} |",
+        f"| re-review requests used (cap) | {rereview_count} / {rereview_limit} |",
         f"| outdated threads resolved | {resolved_outdated} |",
         f"| addressed-by-reply threads resolved | {resolved_addressed_by_reply} |",
         f"| addressed-by-reply still pending | {deferred} |",

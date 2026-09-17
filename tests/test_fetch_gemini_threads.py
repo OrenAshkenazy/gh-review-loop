@@ -1439,6 +1439,33 @@ class TestRenderReceipt:
         assert "high=1" in receipt
         assert "actionable threads remaining" in receipt
 
+    def test_cap_row_is_labeled_as_re_review_requests(self):
+        # The public receipt must name the counter the cap actually bounds.
+        # "cycles" invited readers to compare it with the session-cycle
+        # ordinal in the header and conclude the two disagreed.
+        pr_obj = PullRequest(owner="o", repo="r", number=1, url=None)
+        receipt = render_receipt(
+            pr_obj, _pr_with_threads([]), [],
+            author=BOT, resolved_outdated=0, resolved_addressed_by_reply=0,
+            rereview_count=1, rereview_limit=3,
+        )
+        assert "| re-review requests used (cap) | 1 / 3 |" in receipt
+        assert "cycles used" not in receipt
+
+
+class TestRunGhWithoutBinary:
+    def test_missing_gh_surfaces_as_runtime_error_not_traceback(self, monkeypatch):
+        def _no_gh(cmd, *args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "gh")
+
+        monkeypatch.setattr(subprocess, "run", _no_gh)
+        with pytest.raises(RuntimeError) as excinfo:
+            fgt.run_gh(["api", "user"])
+        msg = str(excinfo.value)
+        assert "GitHub CLI" in msg
+        assert "gh auth login" in msg
+        assert "does not fall back" in msg
+
 
 # ---------------------------------------------------------------------------
 # filter_by_min_severity
@@ -2449,7 +2476,7 @@ class TestSingleChannelReceiptDelivery:
         assert "verification passed" in out
         assert "https://github.com/o/r/pull/7#issuecomment-99" in out
         assert "Findings fetched:" not in out
-        assert "Cycles used:" not in out
+        assert "Re-review requests used:" not in out
         # PR comment: the full receipt, delivered once.
         assert len(posted) == 1
         body = posted[0]

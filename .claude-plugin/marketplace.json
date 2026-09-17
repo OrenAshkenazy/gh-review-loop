@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "gh-review-loop",
-  "description": "AI code-review PR loop for Claude Code and Codex. Reads real review-thread state, sweeps the pattern instances the reviewer missed, verifies against your own tests, and stops at a hard cycle cap.",
+  "description": "AI code-review PR loop for Claude Code and Codex. Reads real review-thread state, sweeps the pattern instances the reviewer missed, verifies against your own tests, and stops at a hard cap of 3 re-review requests.",
   "owner": {
     "name": "Oren Ashkenazy"
   },
@@ -10,7 +10,7 @@
       "name": "gh-review-loop",
       "displayName": "GH Review Loop",
       "source": "./plugins/gh-review-loop",
-      "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review — hard-capped so it can never spam the PR. Works with Codex out of the box, or any reviewer bot you configure.",
+      "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review — hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
       "author": {
         "name": "Oren Ashkenazy",
         "email": "oren.as@gmail.com"
@@ -23,8 +23,8 @@
         "github",
         "codex",
         "coderabbit",
-        "pattern-sweep",
-        "severity-aware"
+        "claude-code",
+        "agent-skills"
       ],
       "license": "MIT",
       "repository": "https://github.com/OrenAshkenazy/gh-review-loop",
@@ -38,12 +38,11 @@
         "coderabbit",
         "copilot",
         "review-bot",
-        "pattern-sweep",
-        "severity-aware",
-        "addressed-by-reply",
-        "sticky-receipt",
-        "graphql",
-        "dry-run"
+        "claude-code-plugin",
+        "codex-plugin",
+        "agent-skills",
+        "github-pr",
+        "gemini-code-assist"
       ]
     }
   ]

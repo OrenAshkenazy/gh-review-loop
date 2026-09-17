@@ -167,7 +167,7 @@ class TestFormatRunSummary:
             "Findings fetched: 7",
             "Fixed: 4",
             "Human decision required: 1",
-            "Cycles used: 2/3",
+            "Re-review requests used: 2/3 (cap)",
             "Verification: passed",
             "Outcome: clean",
             "Time to clean PR: 12m",
@@ -495,7 +495,7 @@ class TestFormatAutoSnapshot:
     def test_auto_snapshot_content(self):
         assert metrics.format_auto_snapshot(self._rec()) == (
             "[loop] Summary (auto, agent didn't post one): "
-            "7 seen, 4 resolved, 1 open · cycles 2/3"
+            "7 seen, 4 resolved, 1 open · re-review requests 2/3"
         )
 
     def test_auto_snapshot_appends_degenerate_clustering_warning(self):
@@ -749,7 +749,7 @@ class TestFormatStats:
         }
         out = metrics.format_stats("OrenAshkenazy/gh-review-loop", agg)
         assert "Last 10 runs" in out
-        assert "Average cycles used: 1.8" in out
+        assert "Average re-review requests used: 1.8" in out
         assert "Average elapsed time to terminal outcome: 9m" in out
         assert "Findings fixed: 32 of 41" in out
         assert "False positives avoided: 14   (across 6 of 10 judged runs)" in out
@@ -983,7 +983,7 @@ class TestFormatCompactReceiptLine:
         assert "findings 4 seen this run" in out
         assert "fixed locally 3" in out
         assert "open 1 (1 new, 0 carried over)" in out
-        assert "cycles 2/3" in out
+        assert "re-review requests 2/3" in out
         assert "verification passed" in out
         assert out.endswith(self.URL)
         assert "outcome" not in out  # cycle lines carry no terminal outcome
@@ -1023,7 +1023,7 @@ class TestFormatCompactReceiptLine:
             {"verification": "skipped"}, terminal=False, receipt_url=self.URL,
         )
         assert "findings 0 seen this run" in out
-        assert "cycles 0/0" in out
+        assert "re-review requests 0/0" in out
 
     # --- shared-denominator guard (#90 review) ---------------------------
 

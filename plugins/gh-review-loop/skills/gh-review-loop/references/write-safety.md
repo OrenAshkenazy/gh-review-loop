@@ -16,7 +16,7 @@ Do not commit/push/re-review when fixes are ambiguous, tests expose a regression
 
 ## Bundled hooks (what is enforced mechanically)
 
-Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical. All are gated by local state (free no-ops outside an active loop) and fail open.
+Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical on runtimes that run plugin hooks (Claude Code). All are gated by local state (free no-ops outside an active loop) and fail open. On runtimes that do not run them (Codex, ChatGPT) the same obligations still apply — follow them yourself. The re-review cap is independent of hooks: `request_rereview.py` counts prior agent pings and refuses past the cap on every runtime.
 
 | Event | Script | Guarantees |
 |---|---|---|
