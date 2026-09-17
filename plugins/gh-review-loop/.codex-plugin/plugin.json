@@ -1,7 +1,7 @@
 {
   "name": "gh-review-loop",
-  "version": "0.4.1",
-  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review — hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
+  "version": "0.4.2",
+  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review \u2014 hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
   "author": {
     "name": "Oren Ashkenazy",
     "email": "oren.as@gmail.com",
