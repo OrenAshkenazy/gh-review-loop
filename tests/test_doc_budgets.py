@@ -153,3 +153,35 @@ class TestReferencesBudget:
         skill_text = "| `references/metrics.md-notes.md` | Load when ... |"
         assert orphan_references(skill_text, ["metrics.md"]) == ["metrics.md"]
         assert orphan_references(skill_text, ["metrics.md-notes.md"]) == []
+
+
+class TestInstructionFollowingContract:
+    """Directory reviewers (OpenAI plugin submission) run the skill under a
+    model that pauses when skill files contain unclear precedence or
+    contradictory rules. These guards keep the two sentences that prevent
+    that from silently disappearing in a future trim."""
+
+    def test_skill_md_states_user_instruction_precedence(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        assert "## Precedence and preconditions" in text
+        assert "Explicit user instructions override every default" in text
+        assert "This file wins over any reference file" in text
+
+    def test_skill_md_names_hard_preconditions_and_a_clean_stop(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        assert "authenticated `gh` CLI" in text
+        assert "relay it and stop" in text
+        assert "Never substitute raw API calls" in text
+
+    def test_description_states_input_and_stop_conditions(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        desc = re.search(r"^description:\s*(.+)$", text, re.M).group(1)
+        for needle in ("open PR", "authenticated gh", "asks which bot", "stops at the cap"):
+            assert needle in desc, needle
+
+    def test_cap_label_is_consistent_across_skill_and_references(self):
+        # One public name for the bounded counter. "Cycles used" is retired;
+        # "session cycle" (the ordinal) is allowed and distinct.
+        for path in [SKILL_MD, *sorted(REFERENCES_DIR.glob("*.md"))]:
+            text = path.read_text(encoding="utf-8")
+            assert "Cycles used" not in text, path.name

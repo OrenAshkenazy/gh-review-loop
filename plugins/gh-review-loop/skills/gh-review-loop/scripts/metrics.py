@@ -263,7 +263,7 @@ def format_auto_snapshot(record: dict[str, Any]) -> str:
         f"{record['findings_fetched']} seen, "
         f"{record.get('observed_fixed_count', 0)} resolved, "
         f"{record['remaining_actionable']} open · "
-        f"cycles {record['cycles_used']}/{record['cycle_cap']}"
+        f"re-review requests {record['cycles_used']}/{record['cycle_cap']}"
     )
     patterns = record.get("patterns")
     if (
@@ -470,7 +470,7 @@ def format_compact_receipt_line(
             )
         parts.append(open_part)
     parts.append(
-        f"cycles {_count(record.get('cycles_used'))}/{_count(record.get('cycle_cap'))}"
+        f"re-review requests {_count(record.get('cycles_used'))}/{_count(record.get('cycle_cap'))}"
     )
     parts.append(f"verification {record.get('verification', 'skipped')}")
     if terminal:
@@ -630,7 +630,7 @@ def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
             lines.append(f"Human decision required: {needs_human}")
     if record.get("addressed_by_reply"):
         lines.append(f"Addressed by reply: {record['addressed_by_reply']}")
-    lines.append(f"Cycles used: {record['cycles_used']}/{record['cycle_cap']}")
+    lines.append(f"Re-review requests used: {record['cycles_used']}/{record['cycle_cap']} (cap)")
     lines.append(f"Verification: {record['verification']}")
     if record["verification"] == "failed":
         details = record.get("verification_details")
@@ -889,7 +889,7 @@ def format_stats(repo: str, stats: dict[str, Any], skipped: int = 0) -> str:
             msg += f"\n\n({skipped} unreadable record{'s' if skipped != 1 else ''} skipped)"
         return msg
     lines = [f"Review loop stats — {repo}", f"Last {stats['count']} runs", ""]
-    lines.append(f"Average cycles used: {stats['avg_cycles']:.1f}")
+    lines.append(f"Average re-review requests used: {stats['avg_cycles']:.1f}")
 
     def _elapsed_line(label: str, key: str) -> None:
         val = stats.get(key)

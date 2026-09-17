@@ -215,7 +215,7 @@ Ask *"Show review loop stats for this repo"* (or run `--stats`). Metrics are loc
 Findings fetched: 7
 Fixed: 4
 Human decision required: 1
-Cycles used: 2/3
+Re-review requests used: 2/3 (cap)
 Verification: passed
 Outcome: clean
 Time to clean PR: 12m
@@ -224,7 +224,7 @@ Time to clean PR: 12m
 Your terminal gets one line pointing at it, so a long loop doesn't bury the conversation in repeated receipts:
 
 ```
-[loop] Summary: findings 7 seen this run · fixed 4 · cycles 2/3 · verification passed · outcome clean — full receipt: <link>
+[loop] Summary: findings 7 seen this run · fixed 4 · re-review requests 2/3 · verification passed · outcome clean — full receipt: <link>
 ```
 
 `findings N seen this run` is cumulative across the run; when findings are still open, the split rides on that count — `open 3 (1 new, 2 carried over)`. If the comment can't be written (no network, no permission, `--dry-run`), the full receipt prints to the terminal instead, so a receipt is never lost.
@@ -235,7 +235,7 @@ Your terminal gets one line pointing at it, so a long loop doesn't bury the conv
 Review loop stats — owner/repo
 Last 10 runs
 
-Average cycles used: 1.8
+Average re-review requests used: 1.8
 Average elapsed time to terminal outcome: 9m
 Average active time per run: 6m
 Findings fixed: 32 of 41
