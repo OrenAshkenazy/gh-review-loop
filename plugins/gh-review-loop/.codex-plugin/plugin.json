@@ -43,9 +43,10 @@
     "defaultPrompt": [
       "Run the AI reviewer loop",
       "Only fix high-severity reviewer findings",
-      "Just audit reviewer comments, don't touch anything",
-      "Show review loop stats for this repo"
+      "Just audit reviewer comments, don't touch anything"
     ],
-    "brandColor": "#1F6FEB"
+    "brandColor": "#1F6FEB",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
   }
 }
