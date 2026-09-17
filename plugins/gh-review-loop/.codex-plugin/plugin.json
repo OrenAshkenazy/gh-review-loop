@@ -1,7 +1,7 @@
 {
   "name": "gh-review-loop",
   "version": "0.4.1",
-  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review \u2014 hard-capped so it can never spam the PR. Works with Codex out of the box, or any reviewer bot you configure.",
+  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review — hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
   "author": {
     "name": "Oren Ashkenazy",
     "email": "oren.as@gmail.com",
@@ -19,21 +19,23 @@
     "coderabbit",
     "copilot",
     "review-bot",
-    "pattern-sweep",
-    "severity-aware",
-    "graphql",
-    "gh-cli"
+    "gh-cli",
+    "claude-code-plugin",
+    "codex-plugin",
+    "agent-skills",
+    "gemini-code-assist"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "GH Review Loop",
-    "shortDescription": "Turn AI reviewer PR comments into a verified, capped fix loop.",
-    "longDescription": "Clears AI reviewer feedback on a GitHub PR without leaving your coding agent. Waits for the configured reviewer (Codex, CodeRabbit, Copilot, or any compatible bot), reads real review-thread state via GraphQL so resolved, outdated, and already-answered threads are skipped, then fixes what is actionable in severity order. Findings are clustered by kind, so a pattern flagged at two sites gets swept across the PR's changed files in one cycle instead of dripping back over three reviews. Every fix is gated on your repository's own tests and linters before it is pushed, and re-review requests are hard-capped so the loop can never spam the PR. Optional per-finding triage flags false positives before you spend a cycle on them, and each run leaves an audit trail plus local stats.",
+    "shortDescription": "Capped AI PR review fix loop",
+    "longDescription": "Clears AI reviewer feedback on a GitHub PR without leaving your coding agent. Waits for the configured reviewer (Codex, CodeRabbit, Copilot, or any compatible bot), reads real review-thread state via GraphQL so resolved, outdated, and already-answered threads are skipped, then fixes what is actionable in severity order. Findings are clustered by kind, so a pattern flagged at two sites gets swept across the PR's changed files in one cycle instead of dripping back over three reviews. Every fix is gated on your repository's own tests and linters before it is pushed, and re-review requests are hard-capped (default 3) so the loop cannot spam the PR. Optional per-finding triage flags false positives before you spend a cycle on them, and each run leaves an audit trail plus local stats.",
     "developerName": "Oren Ashkenazy",
     "category": "Developer Tools",
     "capabilities": [
-      "Interactive",
-      "Write"
+      "Read",
+      "Write",
+      "Execute"
     ],
     "websiteURL": "https://github.com/OrenAshkenazy/gh-review-loop",
     "privacyPolicyURL": "https://github.com/OrenAshkenazy/gh-review-loop/blob/main/PRIVACY.md",
@@ -44,7 +46,6 @@
       "Just audit reviewer comments, don't touch anything",
       "Show review loop stats for this repo"
     ],
-    "brandColor": "#1F6FEB",
-    "screenshots": []
+    "brandColor": "#1F6FEB"
   }
 }

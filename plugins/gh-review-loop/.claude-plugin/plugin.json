@@ -1,7 +1,7 @@
 {
   "name": "gh-review-loop",
   "displayName": "GH Review Loop",
-  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review \u2014 hard-capped so it can never spam the PR. Works with Codex out of the box, or any reviewer bot you configure.",
+  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review — hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
   "version": "0.4.1",
   "author": {
     "name": "Oren Ashkenazy",
@@ -19,9 +19,10 @@
     "coderabbit",
     "copilot",
     "review-bot",
-    "pattern-sweep",
-    "severity-aware",
-    "graphql",
-    "gh-cli"
+    "gh-cli",
+    "claude-code-plugin",
+    "codex-plugin",
+    "agent-skills",
+    "gemini-code-assist"
   ]
 }
