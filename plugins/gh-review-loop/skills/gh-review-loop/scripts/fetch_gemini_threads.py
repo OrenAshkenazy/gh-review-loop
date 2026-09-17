@@ -3019,7 +3019,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Post a summary 'loop receipt' comment to the PR after fetch/filter. "
-            "Includes cycles used, threads resolved, severity breakdown, and remaining actionable count. "
+            "Includes re-review requests used, threads resolved, severity breakdown, and remaining actionable count. "
             "Posts a NEW comment each invocation; for one live comment edited in place, use --sticky-receipt."
         ),
     )
