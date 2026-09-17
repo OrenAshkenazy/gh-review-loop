@@ -11,6 +11,7 @@ import judge
 import pytest
 
 import request_rereview
+from conftest import stub_cap_check_known_under_cap
 from fetch_gemini_threads import PullRequest
 from run_profile import main as run_profile_main
 
@@ -283,4 +284,4 @@ def test_wait_timed_out_json_stdout_is_machine_only(tmp_path, monkeypatch, capsy
 def _cap_check_is_inert(monkeypatch):
     """See tests/test_request_rereview.py: the cap check needs `gh`, and these
     tests are about stdout discipline and cycle flow, not the cap."""
-    monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+    stub_cap_check_known_under_cap(monkeypatch)

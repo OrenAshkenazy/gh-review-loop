@@ -290,6 +290,22 @@ def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
     }
 
 
+def uncountable_count_payload(repo: str, pr: int, cap: int) -> dict[str, Any]:
+    return {
+        "status": "uncountable_count",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "rereview_limit": cap,
+        "message": (
+            "Cannot count prior re-review requests on this PR (gh login "
+            "unresolved, or the comments query failed), so the cap of "
+            f"{cap} cannot be enforced. Nothing was posted. Check `gh auth "
+            "status` and retry, or pass --no-cap-check to bypass the cap."
+        ),
+    }
+
+
 def parse_repo(value: str) -> tuple[str, str]:
     """Validate and split an ``OWNER/REPO`` value."""
     if not isinstance(value, str):
@@ -517,7 +533,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[loop] {payload['message']}")
                 return 0
             used = count_agent_pings(args.repo, args.pr, countable, gh_login())
-            if used is not None and used >= cap:
+            if used is None:
+                # The count could not be established (gh login unresolved, the
+                # comments query failed, or its output was unparseable). Posting
+                # anyway would make the cap advisory exactly when it matters, so
+                # refuse for the same reason as an uncountable trigger.
+                payload = uncountable_count_payload(args.repo, args.pr, cap)
+                if args.json_output:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"[loop] {payload['message']}")
+                return 0
+            if used >= cap:
                 payload = capped_payload(args.repo, args.pr, used, cap)
                 if args.json_output:
                     print(json.dumps(payload, indent=2, sort_keys=True))
