@@ -97,6 +97,10 @@ Intersecting across sites is the token sweep's safety property: a candidate has 
 Everything else it does — reading `isResolved`/`isOutdated` off the `reviewThreads` GraphQL, honoring a maintainer's *"wontfix"* reply, sorting by severity, keeping one live-edited status comment instead of comment spam — is table stakes done carefully. Correct, but not why you'd pick this.
 
 
+## Other plugins in this marketplace
+
+**glg-questionnaire** (`/plugin install glg-questionnaire@gh-review-loop`). A separate skill for GLG expert-network members: triages GLG project invitations in Gmail, opens the screening questionnaire or follow-up questions in your signed-in browser, fills it from an answer bank seeded from your own past GLG confirmations plus a profile you write, shows the exact answer sheet with a source per row, and submits only after you say so. It never invents an answer: GLG's terms prohibit AI-generated responses to project opportunities, so the skill is a transcription and bookkeeping tool over your own words, and whether that is acceptable to GLG is your call. Details in [`plugins/glg-questionnaire/skills/glg-questionnaire/SKILL.md`](plugins/glg-questionnaire/skills/glg-questionnaire/SKILL.md).
+
 ## Other install paths
 
 ### Agent Skills (`npx skills`)

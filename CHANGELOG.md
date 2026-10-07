@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **New plugin `glg-questionnaire` (0.1.0).** A second skill in this
+  marketplace for GLG expert-network members. Triages GLG project invitations
+  and follow-up questions from Gmail (`parse_glg_email.py` turns one email into
+  JSON: kind, project, cpid, rate, client type, flags, link expiry from the
+  `_session` JWT, and the Q/A pairs GLG records on acceptance), keeps a local
+  append-only answer bank of the member's own answers (`answer_bank.py`, seeded
+  from "Accept Confirmation" emails, fuzzy lookup by normalized question), and
+  drives the member's signed-in browser to fill and submit the questionnaire
+  only after the member confirms a per-row-sourced answer sheet. Hard rules:
+  no invented answers, no submit or decline without an explicit go, employer
+  and conflict questions always go to the member, paid surveys out of scope.
+  Stdlib only, nothing transmitted. Registered in both marketplace files; CI
+  compiles its scripts and checks manifest drift.
+
 ### Fixed
 
 - **State directory renamed to `~/.config/gh-review-loop`, with automatic
