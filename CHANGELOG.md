@@ -22,6 +22,25 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The scratch directory is no longer a predictable path in `/tmp`.** The
+  per-user path introduced for cross-call stability could be pre-created — or
+  symlinked — by another local account before the first run, after which
+  `mkdir -p` succeeded and email bodies carrying `_session` tokens were written
+  there. It now lives under `$XDG_RUNTIME_DIR` (else `$HOME/.cache`), which
+  only this account can write, and the prelude refuses a symlink or a directory
+  it does not own before using it.
+
+- **`handled()` keys by consultation id.** Two consultations can share a
+  project title; keying on the title let the newer row hide the older, and
+  triage — told to match by title — could mark a never-handled consultation as
+  done. The id identifies the work, with the title as the fallback for records
+  that have none.
+
+- **One bad line no longer hides the whole answer bank.** `load_entries()`
+  called `json.loads()` unconditionally, so an interrupted append or a hand
+  edit of the documented file made every earlier answer unreachable. Malformed
+  and non-object lines are counted, reported on stderr, and skipped.
+
 - **Project titles and detail text travel by file.** `log --project
   "<title>"` was the last shell-interpolation sink: titles come from email
   subjects, so recording an outcome could execute `$(...)` from one.
