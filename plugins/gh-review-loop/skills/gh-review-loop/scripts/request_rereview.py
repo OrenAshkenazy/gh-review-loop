@@ -1065,7 +1065,11 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
     if state["state"] == "PENDING":
         _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
         return 0
-    if not args.no_cap_check:
+    # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
+    # needs. With no completed vendor review there is nothing to count: zero
+    # would mean "no first review", not "no re-reviews", and a cap of 0 or an
+    # unresolvable `gh api user` would block the very first request.
+    if not args.no_cap_check and state["first_completed_review_at"]:
         cap = effective_cap(args.max_rereview_requests)
         used = count_agent_review_requests(
             args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]

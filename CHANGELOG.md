@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The free initial Copilot request is not gated on the cap.** With
+  `max_rereview_requests: 0`, or with `gh api user` unresolvable, a PR Copilot
+  had never reviewed could not get its first request: the count was correct
+  (zero) but `used >= cap` still reported `capped`, and the cap's reads ran for
+  a request that needs no accounting. The branch is skipped while the vendor has
+  no completed review.
+
 - **A pending review never covers the head.** `_reviews_oldest_first()` fed
   `PENDING` reviews into the overview and severity helpers, which
   `head_review()` already excluded: a draft reported as covering the head sent

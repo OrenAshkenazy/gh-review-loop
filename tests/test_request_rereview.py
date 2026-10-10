@@ -1666,3 +1666,74 @@ class TestStateReadFailure:
         assert payload["posted"] is False
         assert "--no-cap-check" not in payload["message"]
         assert "could not be read" in payload["message"].lower()
+
+
+class TestFreeInitialRequest:
+    """Cycle 0 is free, so it must not be gated on the cap or on the reads the
+    cap needs: with `max_rereview_requests: 0`, or with `gh api user` failing,
+    a PR Copilot has never reviewed still gets its first request (PR #116
+    review)."""
+
+    @staticmethod
+    def _state(**overrides):
+        state = {
+            "state": "ABSENT", "head": "abc1234def", "pending_since": None,
+            "first_completed_review_at": None,
+        }
+        state.update(overrides)
+        return state
+
+    def test_a_cap_of_zero_still_allows_the_first_request(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: self._state())
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 0)
+        monkeypatch.setattr(
+            request_rereview, "count_agent_review_requests",
+            lambda *a, **k: pytest.fail("the free initial request needs no cap accounting"),
+        )
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
+            requested.update(login=login)
+            or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
+                "reviewer": login, "posted": True}
+        ))
+
+        rc = request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
+        ])
+
+        assert rc == 0
+        assert requested["login"] == COPILOT_REQUEST
+        assert json.loads(capsys.readouterr().out)["kind"] == "review_request"
+
+    def test_an_unresolvable_login_does_not_block_the_first_request(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: self._state())
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
+            "created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
+            "reviewer": login, "posted": True,
+        })
+
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+
+    def test_once_a_review_exists_the_cap_applies_again(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: self._state(first_completed_review_at=T_FIRST_REVIEW),
+        )
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(
+            request_rereview, "request_review",
+            lambda *a, **k: pytest.fail("capped"),
+        )
+
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "capped"
