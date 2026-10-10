@@ -1664,7 +1664,7 @@ def run_wait_chunk(
         if refusal is not None:
             clear_wait_state(pr)
             return {"status": "refused", "author": author, "pull_request": None, **refusal}
-        fingerprint = review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+        fingerprint = wait_activity_fingerprint(pull_request, author, after_iso)
         now_dt = _dt.datetime.now(_dt.timezone.utc)
         elapsed = wait_elapsed_seconds(wait, after_iso, now=now_dt)
 
@@ -2547,6 +2547,39 @@ def review_activity_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None."""
+    head = pull_request.get("headRefOid") or ""
+    if not head:
+        return None
+    for review in filter_reviews(pull_request, author):
+        if review.get("state") == "PENDING":
+            continue
+        if ((review.get("commit") or {}).get("oid") or "") == head:
+            return review
+    return None
+
+
+def wait_activity_fingerprint(
+    pull_request: dict[str, Any], author: str, after_iso: str | None
+) -> str | None:
+    """What the waiters poll on.
+
+    Comment vendors keep the timestamp-anchored activity fingerprint. A
+    review_request vendor (Copilot) is anchored on the head commit instead:
+    nothing counts until a submitted review carries ``commit.oid ==
+    headRefOid``. A review of the previous head never ends the wait, and a
+    review submitted in the same second as the request does (spec §5.2).
+    ``after_iso`` then only selects settle mode (cycle 1 fast path vs. the
+    cycle-2+ quiet period) in the callers; it is never a filter here.
+    """
+    if reviewer_resolver.trigger_kind_for(author) == "review_request":
+        if head_review(pull_request, author) is None:
+            return None
+        return review_activity_fingerprint(pull_request, author, after_iso=None)
+    return review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+
+
 def wait_for_stable_review(
     pr: PullRequest,
     author: str,
@@ -2589,7 +2622,7 @@ def wait_for_stable_review(
         refusal = reviewer_refusal(pull_request, author, after_iso=after_iso)
         if refusal is not None:
             raise ReviewerRefused(refusal)
-        fingerprint = review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+        fingerprint = wait_activity_fingerprint(pull_request, author, after_iso)
         now = time.monotonic()
 
         if fingerprint is None:
@@ -2597,8 +2630,13 @@ def wait_for_stable_review(
                 last_heartbeat is None
                 or now - last_heartbeat >= WAIT_HEARTBEAT_INTERVAL_SECONDS
             ):
+                if reviewer_resolver.trigger_kind_for(author) == "review_request":
+                    head7 = (pull_request.get("headRefOid") or "")[:7]
+                    waiting_for = f"Waiting for {author} review of {head7}..."
+                else:
+                    waiting_for = f"Waiting for {author} review activity..."
                 print(
-                    f"Waiting for {author} review activity... "
+                    f"{waiting_for} "
                     f"({int(now - start)}s elapsed, timeout {timeout_seconds}s)",
                     file=sys.stderr,
                 )
