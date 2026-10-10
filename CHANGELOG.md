@@ -22,6 +22,32 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **`glg-questionnaire` resolves its plugin root on both runtimes.** The skill
+  addressed its scripts through `${CLAUDE_PLUGIN_ROOT}`, which is unset under
+  Codex, where the plugin is also published — the command expanded to
+  `/skills/glg-questionnaire/...` and failed before triage. It now resolves
+  `GLGQ_PLUGIN_ROOT` from the Codex and Claude install locations, like the
+  other dual-runtime plugin.
+
+- **A malformed URL no longer aborts GLG triage.** `urlsplit()` raises
+  `ValueError` on input like `https://[foo` or an out-of-range port, so one
+  broken link in a forwarded email took down parsing of a message that also
+  carried a valid invitation. Such URLs classify as `other`.
+
+- **Questionnaire answers are stored owner-only.** `answers.jsonl` and
+  `submissions.jsonl` were created `0644` in a `0755` directory under the usual
+  `022` umask, readable by every local account on a shared machine, and they
+  hold employment, customer and conflict answers. The directory is now `0700`
+  and the files `0600`, a looser existing mode is repaired, and the reference
+  tells the agent to create `profile.md` the same way.
+
+- **The marketplace privacy policy covers `glg-questionnaire`.** The Codex
+  manifest linked a policy describing only `gh-review-loop`, GitHub data and
+  `~/.config/gh-review-loop`. PRIVACY.md now discloses what the GLG plugin
+  reads (Gmail messages from GLG, the questionnaire page in the member's own
+  browser) and what it stores under `~/.config/glg-questionnaire`, with its own
+  removal controls. Existing text was added to, not rewritten.
+
 - **GLG action links are trusted by host, not by substring.** `classify_link()`
   matched `members.glgresearch.com` anywhere in the URL, so a crafted or
   forwarded email could present

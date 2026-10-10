@@ -2,6 +2,8 @@
 
 Both live under `~/.config/glg-questionnaire/` (override with `GLGQ_STATE_DIR`). Nothing in this directory is transmitted anywhere; the scripts only read and append locally.
 
+The scripts create that directory `0700` and their own files `0600`, and tighten a looser mode they find. `profile.md` is written by you rather than by a script, so create it the same way (`umask 077` before the write, or `chmod 600` straight after): it names the member's employer and vendor relationships, and on a shared machine the default `022` umask would leave it readable by every local account. None of these files may be committed.
+
 ## profile.md (member-written, bootstrap on first run)
 
 The profile is the member's standing facts, written in their words. On first run, when the file is missing, interview the member and write the file from their answers, then show it and ask them to confirm it line by line. Do not prefill from LinkedIn or guesswork. Sections:

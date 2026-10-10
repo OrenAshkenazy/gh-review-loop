@@ -81,9 +81,18 @@ def classify_link(url: str) -> str:
     the links this parser reports are opened in the member's browser, so
     ``members.glgresearch.com.attacker.example`` (or an ``@``-userinfo trick,
     or the host repeated in a path) must not come back as an accept link.
+
+    A URL the stdlib cannot parse (or whose host it refuses, such as an
+    out-of-range port) is simply not actionable. It must not raise: the caller
+    hands over every URL in the email, so one malformed link would otherwise
+    abort triage for a message that also carries a valid invitation.
     """
-    parts = urlsplit(url)
-    host = (parts.hostname or "").rstrip(".").lower()
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").rstrip(".").lower()
+        parts.port  # noqa: B018 — raises ValueError on an out-of-range port
+    except ValueError:
+        return "other"
     if parts.scheme.lower() not in {"http", "https"} or host != MEMBERS_HOST:
         return "other"
     path = parts.path

@@ -30,6 +30,24 @@ Requires: `python3` (3.10+); Gmail access (the Gmail connector) or an email the 
 | `references/browser-flow.md` | Opening the link, reading the form, filling, screenshotting, submitting, verifying |
 | `references/compliance.md` | Any employer, conflict, recording, blinded-client or non-public-information question; declining |
 
+## Script root
+
+Both scripts are addressed through one runtime-neutral variable. `CLAUDE_PLUGIN_ROOT` is unset under Codex, where this plugin is also installed, so resolve it once per session as its own call:
+
+```bash
+GLGQ_PLUGIN_ROOT="${GLGQ_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+if [ -z "$GLGQ_PLUGIN_ROOT" ]; then
+  GLGQ_PLUGIN_ROOT=$(
+    find ~/.codex/plugins ~/.codex/plugins/cache ~/.claude/plugins/cache \
+      -type d -path "*/skills/glg-questionnaire" 2>/dev/null \
+      | sort -rV | head -1 | sed 's|/skills/glg-questionnaire$||'
+  )
+fi
+export GLGQ_PLUGIN_ROOT
+```
+
+Empty after that means the plugin is not installed where either runtime can see it: say so and stop, rather than running a path that expands to `/skills/...`.
+
 ## Workflow
 
 ### 1. Triage the inbox
@@ -37,7 +55,7 @@ Requires: `python3` (3.10+); Gmail access (the Gmail connector) or an email the 
 Search Gmail for `from:glgroup.com newer_than:14d` (widen on request). Fetch each thread as plain text and run the parser on the newest message:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/glg-questionnaire/scripts/parse_glg_email.py" --subject "<subject>" --file body.txt
+python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/parse_glg_email.py" --subject "<subject>" --file body.txt
 ```
 
 Group by `cpid` so a reminder and its original invitation count once. Judge fit by comparing `project_title`, `description_bullets` and `client_type` against the profile's expertise and decline lists. Print one table: project, kind, rate, client type, link expiry, fit, suggested action (`accept`, `decline`, `ask`, `survey (manual)`). Then ask which to work. Emails of kind `followup` are already-accepted projects with new questions: list them first, they are the fastest win.
@@ -47,7 +65,7 @@ Group by `cpid` so a reminder and its original invitation count once. Judge fit 
 For the chosen project, before touching the browser, look up what the member answered before:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/glg-questionnaire/scripts/answer_bank.py" lookup --question "<question text>"
+python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/answer_bank.py" lookup --question "<question text>"
 ```
 
 You do not know the exact questions until the page is open, so start with the profile (vendors, roles, org facts) and the bank entries closest to the project topic, and finish the sheet in step 3 once the real questions are visible.
