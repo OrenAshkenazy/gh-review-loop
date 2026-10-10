@@ -4409,3 +4409,29 @@ class TestReviewerDiscoverySources:
 
         assert discovery["partial"] is True
         assert discovery["pull_request"]["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
+
+
+class TestSelectionCanonicalizesAliases:
+    """A selection projected from an alias must carry the GraphQL login."""
+
+    @pytest.mark.parametrize("alias", [
+        "copilot", "@copilot", "Copilot", "copilot-pull-request-reviewer[bot]",
+    ])
+    def test_copilot_aliases_project_to_the_graphql_login(self, alias):
+        state = reviewer_selection_state({"login": alias}, source="explicit")
+
+        assert state["login"] == "copilot-pull-request-reviewer"
+        assert state["display_name"] == "Copilot"
+        assert state["trigger_kind"] == "review_request"
+        assert state["request_login"] == "copilot-pull-request-reviewer[bot]"
+
+    def test_codex_alias_projects_to_the_connector_login(self):
+        state = reviewer_selection_state({"login": "@codex"}, source="persisted")
+
+        assert state["login"] == "chatgpt-codex-connector"
+        assert state["review_trigger"] == "@codex"
+
+    def test_an_unknown_login_is_preserved(self):
+        state = reviewer_selection_state({"login": "some-new-bot"}, source="persisted")
+
+        assert state["login"] == "some-new-bot"

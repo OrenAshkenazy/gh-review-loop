@@ -58,29 +58,21 @@ def no_safe_trigger_payload(reviewer_login: str) -> dict[str, Any]:
 # PRs is 4 s to ~8 min (spec §9, LV-5).
 STALE_REQUEST_SECONDS = 1200
 
-# One read for the whole request-side state machine. REST `requested_reviewers`
-# is deliberately not used: it is empty while a Copilot request is pending
-# (spec §9, LV-3); only GraphQL `reviewRequests` lists the bot.
+# The head sha and the pending request, which only GraphQL can answer. REST
+# `requested_reviewers` is deliberately not used: it is empty while a Copilot
+# request is pending (spec §9, LV-3); only GraphQL `reviewRequests` lists the
+# bot. Reviews and review-request events are NOT read here — a single GraphQL
+# page silently truncates both on a busy PR, and the two facts the cap and the
+# dedupe rest on (the vendor's first completed review, and whether it already
+# reviewed this head) must be complete, so they come from the paginated REST
+# APIs below.
 STATE_QUERY = """
 query($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       headRefOid
-      reviews(last:100) {
-        nodes { author { login } state submittedAt commit { oid } }
-      }
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
-      }
-      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT]) {
-        nodes {
-          __typename
-          ... on ReviewRequestedEvent {
-            createdAt
-            actor { login }
-            requestedReviewer { __typename ... on Bot { login } ... on User { login } }
-          }
-        }
       }
     }
   }
@@ -198,7 +190,40 @@ def head_mismatch_payload(repo: str, pr: int, expected_head: str, head: str) -> 
     }
 
 
+def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
+    """The POST may have landed: report the outcome as unknown, not as unposted.
+
+    ``gh`` losing its connection after GitHub accepted the POST but before
+    returning a status leaves no HTTP code, and the timeline reconciliation can
+    run before the new event is visible. Saying "nothing was posted" and
+    inviting a re-run is how the duplicate review this state machine prevents
+    gets created, so the honest answer is unknown plus a delayed state check.
+    """
+    detail = (exc.detail or "").strip() or "no detail from GitHub"
+    return {
+        "status": "review_request_uncertain",
+        "posted": None,
+        "outcome": "unknown",
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "reason": exc.reason,
+        "http_status": exc.http_status,
+        "retryable": exc.retryable,
+        "requested_at": exc.requested_at,
+        "message": (
+            f"The review request for `{reviewer}` returned no HTTP status ({detail}), "
+            "and no matching request was visible on the PR timeline yet, so whether "
+            "GitHub accepted it is unknown. Do not request again immediately: the "
+            "timeline can lag by seconds. Re-read the PR state in a minute and "
+            "request again only if no review request from this agent appears."
+        ),
+    }
+
+
 def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
+    if exc.reason == "uncertain":
+        return uncertain_payload(repo, pr, reviewer, exc)
     detail = (exc.detail or "").strip() or "no detail from GitHub"
     hints = {
         "permission": "Check that `gh` is authenticated as a user with write access to the PR.",
@@ -206,7 +231,6 @@ def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestReject
         "not_found": "Check the repository and PR number, and that the token can see the repository.",
         "rate_limited": "GitHub rate limit; retry in a few minutes.",
         "transient": "GitHub-side error; retry.",
-        "uncertain": "The request may or may not have reached GitHub; it was not found on the PR timeline. Re-run — the state check prevents a duplicate.",
     }
     return {
         "status": "review_request_rejected",
@@ -308,14 +332,22 @@ def resolve_reviewer_login(
     reviewer_login: str | None,
     reviewer_mention: str | None,
 ) -> str | None:
-    """Which reviewer this run is about: explicit login, else persisted, else the mention."""
+    """Which reviewer this run is about: explicit login, else the explicit
+    mention, else persisted state.
+
+    An explicit mention outranks persisted state, the same precedence
+    ``resolve_review_trigger()`` uses. Reading persisted state first made the
+    dispatch ignore the override in both directions: persisted Copilot plus
+    ``--review-trigger-mention @codex`` requested a Copilot review, and
+    persisted Codex plus ``@copilot`` posted a comment Copilot never reads.
+    """
     if reviewer_login:
         return reviewer_login
+    if reviewer_mention:
+        return reviewer_mention.lstrip("@")
     persisted = read_persisted_reviewer(repo, pr)
     if persisted:
         return str(persisted["login"])
-    if reviewer_mention:
-        return reviewer_mention.lstrip("@")
     return None
 
 
@@ -491,6 +523,45 @@ def _gh_json(cmd: list[str], runner: Any) -> Any:
         return None
 
 
+def _review_author(review: Any) -> str | None:
+    """The review's author login, from either API shape."""
+    if not isinstance(review, dict):
+        return None
+    author = review.get("user") or review.get("author") or {}
+    return author.get("login") if isinstance(author, dict) else None
+
+
+def _review_commit(review: dict[str, Any]) -> str:
+    """The sha the review was submitted against, from either API shape."""
+    commit = review.get("commit")
+    if isinstance(commit, dict):
+        return commit.get("oid") or ""
+    return review.get("commit_id") or ""
+
+
+def _review_submitted_at(review: dict[str, Any]) -> str:
+    return review.get("submittedAt") or review.get("submitted_at") or ""
+
+
+def _all_reviews(repo: str, pr: int, runner: Any) -> list[dict[str, Any]] | None:
+    """Every submitted review on the PR, paginated; None when unreadable.
+
+    GraphQL's ``reviews(last:100)`` can omit the vendor's first review (which
+    moves the cap's cycle-0 boundary forward, making earlier agent requests
+    look free) and its review of the current head (which allows a redundant
+    request). The REST list paginates, so neither guarantee depends on a PR
+    having fewer than 100 reviews.
+    """
+    owner, repo_name = parse_repo(repo)
+    reviews = _gh_json(
+        ["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/pulls/{pr}/reviews"],
+        runner,
+    )
+    if not isinstance(reviews, list):
+        return None
+    return [review for review in reviews if isinstance(review, dict)]
+
+
 def request_state(
     repo: str,
     pr: int,
@@ -524,14 +595,20 @@ def request_state(
     if not head:
         return None
 
-    reviews = (pull.get("reviews") or {}).get("nodes") or []
+    reviews = _all_reviews(repo, pr, runner)
+    raw_events = _timeline_events(repo, pr, runner)
+    if reviews is None or raw_events is None:
+        # Either read failing leaves the cycle-0 boundary or the head check
+        # unknown. Reporting ABSENT on a partial read would post a duplicate
+        # request or treat a capped request as free, so refuse instead.
+        return None
+
     vendor_reviews = [
         review for review in reviews
-        if isinstance(review, dict)
-        and review_vendors.vendor_for((review.get("author") or {}).get("login")) is vendor
+        if review_vendors.vendor_for(_review_author(review)) is vendor
     ]
     completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
-    completed_head = any((review.get("commit") or {}).get("oid") == head for review in completed)
+    completed_head = any(_review_commit(review) == head for review in completed)
 
     requests = (pull.get("reviewRequests") or {}).get("nodes") or []
     pending = any(
@@ -540,16 +617,13 @@ def request_state(
         for node in requests
     ) or any(review.get("state") == "PENDING" for review in vendor_reviews)
 
-    events = [
-        reviewer_resolver.normalize_request_event(node)
-        for node in (pull.get("timelineItems") or {}).get("nodes") or []
-    ]
+    events = [reviewer_resolver.normalize_request_event(node) for node in raw_events]
     vendor_events = sorted(
         (event for event in events
          if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor),
         key=lambda event: event["created_at"],
     )
-    completed_times = [review.get("submittedAt") or "" for review in completed]
+    completed_times = [_review_submitted_at(review) for review in completed]
     pending_since = None
     if vendor_events:
         newest = vendor_events[-1]["created_at"]

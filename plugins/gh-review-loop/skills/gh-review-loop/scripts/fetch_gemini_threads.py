@@ -1541,9 +1541,12 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
     Vendor facts are re-derived from the login rather than trusted from the
     record, so selections persisted before a vendor was known (Codex records
     written with ``review_trigger: null``) heal instead of permanently
-    disabling re-review requests for that PR.
+    disabling re-review requests for that PR. The login itself is canonicalized
+    for the same reason: a record holding an alias (``@copilot``) would request
+    the right reviewer and then never match its review, because review and
+    thread filtering compare authors exactly against this value.
     """
-    login = record["login"]
+    login = reviewer_resolver.canonical_login(record["login"])
     known_display_name = reviewer_resolver.display_name_for(login)
     display_name = record.get("display_name") or known_display_name
     if review_vendors.vendor_for(login):

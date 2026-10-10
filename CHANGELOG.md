@@ -6,6 +6,38 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Copilot aliases canonicalize before any filtering.** `--reviewer copilot`,
+  `@copilot`, `Copilot` or `copilot-pull-request-reviewer[bot]` kept that
+  spelling in the persisted record and in the loop's selection state, while
+  GraphQL reports `copilot-pull-request-reviewer`. The loop requested the right
+  reviewer and then matched none of its reviews or threads, timing out or
+  reporting no feedback. `reviewer_resolver.canonical_login()` now resolves a
+  known vendor's alias to its GraphQL login on both the persist and the project
+  path; unknown logins pass through untouched.
+
+- **The re-review cap and head dedupe no longer depend on one GraphQL page.**
+  `request_state()` read `reviews(last:100)`, which on a PR with more than 100
+  reviews can omit the vendor's first completed review (moving the cycle-0
+  boundary forward, so capped requests look free) and its review of the current
+  head (allowing a redundant request). Reviews and review-request events now
+  come from the paginated REST APIs, and an unreadable read refuses instead of
+  reporting `ABSENT`.
+
+- **An explicit mention outranks the persisted reviewer.**
+  `resolve_reviewer_login()` preferred persisted state, so persisted Copilot
+  plus `--review-trigger-mention @codex` sent a Copilot review request, and
+  persisted Codex plus `@copilot` posted a comment Copilot never reads. The
+  precedence is now explicit login, explicit mention, then persisted state —
+  matching `resolve_review_trigger()`.
+
+- **An uncertain review request is reported as unknown, not as unposted.** When
+  `gh` loses its connection after GitHub accepts the POST, and the timeline
+  reconciliation runs before the event is visible, the result ended in "Nothing
+  was posted" and told the caller to re-run — creating the duplicate review the
+  state machine exists to prevent. That case is now
+  `review_request_uncertain` (`posted: null`, `outcome: "unknown"`) and advises
+  a delayed state check.
+
 - **State directory renamed to `~/.config/gh-review-loop`, with automatic
   migration.** `~/.config/gh-gemini-review-loop` was the last remnant of the old
   plugin name, hardcoded independently in six modules and the three hooks.json

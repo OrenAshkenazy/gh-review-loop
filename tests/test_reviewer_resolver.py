@@ -362,3 +362,45 @@ def test_discovery_without_reviews_or_requests_keys_still_works():
 
     assert [c.login for c in candidates] == ["gemini-code-assist"]
     assert candidates[0].source == "thread"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("alias", [
+    "copilot",
+    "@copilot",
+    "Copilot",
+    "copilot-pull-request-reviewer[bot]",
+    "copilot-pull-request-reviewer",
+])
+def test_a_reviewer_record_persists_the_canonical_vendor_login(alias):
+    """Downstream review and thread filters compare authors exactly against
+    this login, and GraphQL returns `copilot-pull-request-reviewer`. A record
+    that keeps an alias asks Copilot successfully and then never matches its
+    review (PR #116 review)."""
+    record = reviewer_resolver.make_reviewer_record(alias, source="explicit")
+
+    assert record["login"] == "copilot-pull-request-reviewer"
+    assert record["display_name"] == "Copilot"
+    assert record["trigger_kind"] == "review_request"
+    assert record["request_login"] == "copilot-pull-request-reviewer[bot]"
+
+
+@pytest.mark.parametrize("alias, login", [
+    ("@codex", "chatgpt-codex-connector"),
+    ("codex", "chatgpt-codex-connector"),
+    ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector"),
+    ("@gemini-code-assist", "gemini-code-assist"),
+])
+def test_comment_vendor_aliases_canonicalize_too(alias, login):
+    record = reviewer_resolver.make_reviewer_record(alias, source="explicit")
+
+    assert record["login"] == login
+    assert record["review_trigger"] == reviewer_resolver.trigger_for(login)
+
+
+def test_an_unknown_reviewer_login_is_left_exactly_as_given():
+    record = reviewer_resolver.make_reviewer_record("some-new-bot[bot]", source="explicit")
+
+    assert record["login"] == "some-new-bot[bot]"

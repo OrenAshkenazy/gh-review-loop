@@ -855,28 +855,59 @@ def _completed(cmd, payload, rc=0, stderr=""):
     )
 
 
-def _gql_pr(head, reviews=(), pending=(), events=()):
+def _gql_pr(head, pending=()):
+    """The GraphQL half of the state read: head sha and pending bot requests.
+
+    Reviews and review-request events are read from the paginated REST APIs,
+    because a GraphQL page can silently omit the two facts the state machine
+    depends on (PR #116 review).
+    """
     return {"data": {"repository": {"pullRequest": {
         "headRefOid": head,
-        "reviews": {"nodes": [
-            {"author": {"login": a}, "state": s, "submittedAt": t, "commit": {"oid": c}}
-            for (a, s, t, c) in reviews
-        ]},
         "reviewRequests": {"nodes": [
             {"requestedReviewer": {"__typename": "Bot", "login": login}} for login in pending
-        ]},
-        "timelineItems": {"nodes": [
-            {"__typename": "ReviewRequestedEvent", "createdAt": t, "actor": {"login": a},
-             "requestedReviewer": {"__typename": "Bot", "login": COPILOT_LOGIN}}
-            for (a, t) in events
         ]},
     }}}}
 
 
-def _gql_runner(payload, rc=0):
+def _rest_reviews(reviews):
+    return [
+        {"user": {"login": a}, "state": s, "submitted_at": t, "commit_id": c}
+        for (a, s, t, c) in reviews
+    ]
+
+
+def _rest_request_events(events, reviewer="Copilot"):
+    return [
+        {"event": "review_requested", "actor": {"login": a}, "created_at": t,
+         "requested_reviewer": {"login": reviewer, "type": "Bot"}}
+        for (a, t) in events
+    ]
+
+
+def _state_runner(payload, reviews=(), events=(), rc=0, reviews_rc=0, timeline_rc=0,
+                  review_pages=None):
+    """Serve the three reads request_state makes, by command shape.
+
+    ``review_pages`` passes pre-split REST pages verbatim, so a test can place
+    a review beyond the first page.
+    """
     def runner(cmd, **kwargs):
-        assert cmd[:3] == ["gh", "api", "graphql"], cmd
-        return _completed(cmd, payload if rc == 0 else None, rc=rc, stderr="boom" if rc else "")
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _completed(cmd, payload if rc == 0 else None, rc=rc, stderr="boom" if rc else "")
+        assert cmd[:3] == ["gh", "api", "--paginate"], cmd
+        if cmd[3].endswith("/reviews"):
+            if reviews_rc:
+                return _completed(cmd, None, rc=reviews_rc, stderr="boom")
+            pages = review_pages if review_pages is not None else [_rest_reviews(reviews)]
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="\n".join(json.dumps(page) for page in pages), stderr="",
+            )
+        assert cmd[3].endswith("/timeline"), cmd
+        if timeline_rc:
+            return _completed(cmd, None, rc=timeline_rc, stderr="boom")
+        return _completed(cmd, _rest_request_events(events))
     return runner
 
 
@@ -889,58 +920,69 @@ OLD_REVIEW = (COPILOT_LOGIN, "COMMENTED", T_FIRST_REVIEW, "f4a55e3000")
 
 class TestRequestState:
     def test_request_state_completed_head(self):
-        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")])
-
-        state = request_rereview.request_state("acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(payload))
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")],
+            ),
+        )
 
         assert state["state"] == "COMPLETED_HEAD"
         assert state["head"] == "d7efa49000"
         assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
     def test_request_state_pending_fresh(self):
-        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN],
-                          events=[("a-human", "2026-10-07T15:42:27Z"), ("agent", T_REQUEST)])
-
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
-            runner=_gql_runner(payload), now=_at("2026-10-07T16:23:05Z"),
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]), reviews=[OLD_REVIEW],
+                events=[("a-human", "2026-10-07T15:42:27Z"), ("agent", T_REQUEST)],
+            ),
+            now=_at("2026-10-07T16:23:05Z"),
         )
 
         assert state["state"] == "PENDING"
         assert state["pending_since"] == T_REQUEST
 
     def test_request_state_pending_with_unknown_age_stays_pending(self):
-        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN], events=[])
-
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
-            runner=_gql_runner(payload), now=_at("2026-10-08T16:23:05Z"),
+            runner=_state_runner(_gql_pr("d7efa49000", pending=[COPILOT_LOGIN]), reviews=[OLD_REVIEW]),
+            now=_at("2026-10-08T16:23:05Z"),
         )
 
         assert state["state"] == "PENDING"
         assert state["pending_since"] is None
 
     def test_request_state_stale_pending(self):
-        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN], events=[("agent", T_REQUEST)])
-
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
-            runner=_gql_runner(payload), now=_at("2026-10-07T16:45:05Z"),
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]), reviews=[OLD_REVIEW],
+                events=[("agent", T_REQUEST)],
+            ),
+            now=_at("2026-10-07T16:45:05Z"),
         )
 
         assert state["state"] == "STALE_PENDING"
 
     def test_request_state_absent_with_stale_review(self):
-        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], events=[("a-human", "2026-10-07T15:42:27Z")])
-
-        state = request_rereview.request_state("acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(payload))
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"), reviews=[OLD_REVIEW],
+                events=[("a-human", "2026-10-07T15:42:27Z")],
+            ),
+        )
 
         assert state["state"] == "ABSENT"
         assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
     def test_request_state_absent_on_a_never_reviewed_pr(self):
         state = request_rereview.request_state(
-            "acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(_gql_pr("f4a55e3000"))
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(_gql_pr("f4a55e3000")),
         )
 
         assert state["state"] == "ABSENT"
@@ -948,8 +990,48 @@ class TestRequestState:
 
     def test_request_state_none_when_query_fails(self):
         assert request_rereview.request_state(
-            "acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(None, rc=1)
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(None, rc=1),
         ) is None
+
+    def test_request_state_none_when_reviews_cannot_be_read(self):
+        """An unreadable review history leaves both the cap boundary and the
+        head check unknown; the caller must stop, not assume ABSENT."""
+        assert request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(_gql_pr("d7efa49000"), reviews_rc=1),
+        ) is None
+
+    def test_request_state_none_when_the_timeline_cannot_be_read(self):
+        assert request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(_gql_pr("d7efa49000"), reviews=[OLD_REVIEW], timeline_rc=1),
+        ) is None
+
+    def test_reviews_beyond_one_page_still_bound_the_cap_and_the_head_check(self):
+        """On a PR with more than 100 reviews, a single GraphQL page can omit
+        Copilot's first review (moving the cycle-0 boundary forward and making
+        earlier agent requests look free) and its review of the current head
+        (allowing a redundant request). The REST review list is paginated, so
+        both facts survive (PR #116 review)."""
+        filler = [
+            ("a-human", "COMMENTED", f"2026-10-07T15:{minute:02d}:00Z", "f4a55e3000")
+            for minute in range(0, 60)
+        ]
+        page1 = _rest_reviews([OLD_REVIEW, *filler])
+        page2 = _rest_reviews([
+            *filler,
+            (COPILOT_LOGIN, "COMMENTED", "2026-10-07T17:02:00Z", "d7efa49000"),
+        ])
+
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(_gql_pr("d7efa49000"), review_pages=[page1, page2]),
+        )
+
+        assert len(page1) + len(page2) > 100
+        assert state["state"] == "COMPLETED_HEAD"
+        assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
 
 class TestReviewRequestHelpers:
@@ -1060,10 +1142,15 @@ class TestReviewRequestHelpers:
             "acme/widget", 159, review_vendors.COPILOT, "someone-else", T_REQUEST, runner=runner
         ) is False
 
-    def test_resolve_reviewer_login_prefers_explicit_then_persisted_then_mention(self, monkeypatch):
+    def test_resolve_reviewer_login_prefers_explicit_login_then_mention_then_persisted(self, monkeypatch):
+        """An explicit mention is a per-run override and outranks persisted
+        state, matching resolve_review_trigger(). Otherwise a persisted Copilot
+        plus `--review-trigger-mention @codex` dispatches to the review-request
+        path and silently ignores the override (PR #116 review)."""
         monkeypatch.setattr(request_rereview, "read_persisted_reviewer", lambda repo, pr: {"login": "persisted-bot"})
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login="explicit-bot", reviewer_mention="@m") == "explicit-bot"
-        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "persisted-bot"
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "m"
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) == "persisted-bot"
         monkeypatch.setattr(request_rereview, "read_persisted_reviewer", lambda repo, pr: None)
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "m"
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) is None
@@ -1257,9 +1344,16 @@ class TestReviewRequestMain:
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
         payload = json.loads(capsys.readouterr().out)
-        assert payload["status"] == "review_request_rejected"
+        assert payload["status"] == "review_request_uncertain"
         assert payload["reason"] == "uncertain"
         assert payload["retryable"] is False
+        # The POST may have landed before the connection died: claiming
+        # nothing was posted invites the duplicate request this state machine
+        # exists to prevent (PR #116 review).
+        assert payload["posted"] is None
+        assert payload["outcome"] == "unknown"
+        assert "Nothing was posted" not in payload["message"]
+        assert "unknown" in payload["message"].lower()
         assert self._stamped(tmp_path) == 0
 
     def test_cap_applies_to_review_requests_too(self, monkeypatch, capsys):
@@ -1322,3 +1416,95 @@ class TestReviewRequestMain:
 
         out = capsys.readouterr().out
         assert "[loop]" in out and "Copilot" in out and CREATED_AT in out
+
+
+class TestExplicitMentionOverridesPersistedVendor:
+    """An explicit mention is a per-run override; persisted state must not win.
+
+    Both directions were broken: persisted Copilot ignored `@codex` and sent a
+    review request, and persisted Codex answered `@copilot` with a comment
+    Copilot never reads (PR #116 review).
+    """
+
+    @staticmethod
+    def _persist(tmp_path, monkeypatch, login):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.state_path().write_text(
+            json.dumps({"acme/widget#159": {"reviewer": {"login": login}}}), encoding="utf-8"
+        )
+
+    def test_codex_mention_beats_persisted_copilot_and_posts_a_comment(self, monkeypatch, capsys, tmp_path):
+        self._persist(tmp_path, monkeypatch, COPILOT_LOGIN)
+        posted = {}
+
+        def fake_post(repo, pr, phrase, **kwargs):
+            posted["phrase"] = phrase
+            return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
+
+        monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
+        monkeypatch.setattr(
+            request_rereview, "request_review",
+            lambda *a, **k: pytest.fail("an explicit @codex mention must not request a Copilot review"),
+        )
+
+        rc = request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--review-trigger-mention", "@codex", "--json",
+        ])
+
+        assert rc == 0
+        assert posted["phrase"] == review_vendors.CODEX.rereview_phrase
+        assert json.loads(capsys.readouterr().out)["created_at"] == CREATED_AT
+
+    def test_copilot_mention_beats_persisted_codex_and_requests_a_review(self, monkeypatch, capsys, tmp_path):
+        self._persist(tmp_path, monkeypatch, review_vendors.CODEX.login)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: {
+            "state": "ABSENT", "head": "abc1234def", "pending_since": None,
+            "first_completed_review_at": T_FIRST_REVIEW,
+        })
+        monkeypatch.setattr(
+            request_rereview, "post_rereview",
+            lambda *a, **k: pytest.fail("an explicit @copilot mention must not post a comment"),
+        )
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
+            requested.update(login=login)
+            or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
+                "reviewer": login, "posted": True}
+        ))
+
+        rc = request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--review-trigger-mention", "@copilot", "--json",
+        ])
+
+        assert rc == 0
+        assert requested["login"] == COPILOT_REQUEST
+        assert json.loads(capsys.readouterr().out)["kind"] == "review_request"
+
+
+class TestUncertainPayload:
+    def test_an_uncertain_outcome_is_reported_as_unknown_not_unposted(self):
+        exc = request_rereview.ReviewRequestRejected(
+            "connection reset by peer", reason="uncertain", requested_at=T_REQUEST
+        )
+
+        payload = request_rereview.rejected_payload("acme/widget", 159, COPILOT_REQUEST, exc)
+
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["posted"] is None
+        assert payload["outcome"] == "unknown"
+        assert payload["requested_at"] == T_REQUEST
+        assert "Nothing was posted" not in payload["message"]
+        assert "unknown" in payload["message"].lower()
+
+    def test_a_definite_rejection_still_says_nothing_was_posted(self):
+        exc = request_rereview.ReviewRequestRejected(
+            "Copilot code review is not enabled", reason="validation", http_status=422
+        )
+
+        payload = request_rereview.rejected_payload("acme/widget", 159, COPILOT_REQUEST, exc)
+
+        assert payload["status"] == "review_request_rejected"
+        assert payload["posted"] is False
+        assert "Nothing was posted" in payload["message"]
