@@ -178,3 +178,19 @@ def test_the_logging_template_passes_the_title_by_file():
 
     assert "--project-file" in text
     assert "--project \"<title>\"" not in text
+
+
+def test_the_scratch_directory_is_not_in_a_world_writable_tmp():
+    """A derived path under /tmp can be pre-created (or symlinked) by another
+    local account before the first run: mkdir -p then succeeds and email bodies
+    carrying _session tokens get written there (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    scratch_lines = [line for line in text.splitlines() if "GLGQ_WORK=" in line]
+    assert scratch_lines
+    for line in scratch_lines:
+        assert "TMPDIR" not in line and "/tmp" not in line, line
+    # The parent must be the user's own, and the path checked before use.
+    assert "XDG_RUNTIME_DIR" in text or "$HOME" in text
+    assert "-L " in text  # refuse a symlink
+    assert "-O " in text  # refuse a directory owned by someone else

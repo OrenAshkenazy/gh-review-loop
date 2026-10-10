@@ -326,3 +326,48 @@ def test_handled_lists_projects_already_submitted_or_declined(tmp_path, monkeypa
 def test_handled_is_empty_without_a_log(tmp_path, monkeypatch):
     monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
     assert bank.handled() == []
+
+
+def test_handled_keys_by_consultation_id_when_present(tmp_path, monkeypatch):
+    """Two consultations can share a project title. Keying by title made the
+    newer one hide the older, and triage — told to match by title — could mark
+    a never-handled consultation as done (PR #116 review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.log_submission(project="Observability Platforms", cpid="111", action="submitted")
+    bank.log_submission(project="Observability Platforms", cpid="222", action="declined")
+    bank.log_submission(project="Observability Platforms", cpid="111", action="submitted")
+
+    handled = bank.handled()
+
+    by_cpid = {entry["cpid"]: entry["action"] for entry in handled}
+    assert by_cpid == {"111": "submitted", "222": "declined"}
+
+
+def test_handled_falls_back_to_the_title_without_an_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.log_submission(project="Cloud Security", cpid=None, action="declined")
+    bank.log_submission(project="Cloud Security", cpid=None, action="submitted")
+
+    handled = bank.handled()
+
+    assert len(handled) == 1
+    assert handled[0]["project"] == "Cloud Security"
+    assert handled[0]["action"] == "submitted"
+
+
+def test_a_truncated_bank_line_does_not_hide_the_valid_ones(tmp_path, monkeypatch, capsys):
+    """The bank is append-only and the file is documented, so an interrupted
+    write or a hand edit can leave one bad line. That must not make every
+    earlier answer unreadable (PR #116 review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.add_entry("Which observability vendors have you evaluated?", ["Datadog"])
+    with bank.answers_path().open("a", encoding="utf-8") as handle:
+        handle.write('{"question": "truncated", "value":\n')
+        handle.write('"a bare string, not an object"\n')
+
+    entries = bank.load_entries()
+
+    assert [entry["value"] for entry in entries] == [["Datadog"]]
+    assert "skipped" in capsys.readouterr().err.lower()
+    # And lookup still works over the surviving records.
+    assert bank.lookup("Which observability vendors have you evaluated?")

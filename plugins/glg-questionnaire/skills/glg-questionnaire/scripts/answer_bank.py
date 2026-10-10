@@ -133,13 +133,36 @@ def normalize(question: str) -> str:
 
 
 def load_entries() -> list[dict[str, Any]]:
+    """Every stored answer, skipping any line that is not a JSON object.
+
+    The file is append-only and documented, so an interrupted write or a hand
+    edit can leave one malformed or non-object line at the tail. Raising there
+    would make every earlier answer unreachable — the member's own record,
+    lost to one bad byte — so the line is reported and skipped instead.
+    """
     path = answers_path()
     if not path.exists():
         return []
     entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            entries.append(json.loads(line))
+    skipped = 0
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(record, dict) or "normalized" not in record:
+            skipped += 1
+            continue
+        entries.append(record)
+    if skipped:
+        print(
+            f"warning: skipped {skipped} unreadable line(s) in {path}; "
+            "the remaining answers are intact",
+            file=sys.stderr,
+        )
     return entries
 
 
@@ -325,8 +348,12 @@ def handled() -> list[dict[str, Any]]:
             continue
         if not isinstance(record, dict):
             continue
-        key = (record.get("project") or record.get("cpid") or "").strip()
-        if not key:
+        # The consultation id identifies the work; a title can repeat across
+        # consultations, and keying on it let a newer row hide an older one and
+        # let triage mark a never-handled consultation as done.
+        cpid = (record.get("cpid") or "").strip()
+        key = f"cpid:{cpid}" if cpid else f"title:{(record.get('project') or '').strip()}"
+        if key in {"cpid:", "title:"}:
             continue
         rows[key] = {
             "project": record.get("project"),

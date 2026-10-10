@@ -42,9 +42,16 @@ GLGQ_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(
     -type d -path "*/skills/glg-questionnaire" 2>/dev/null \
     | sort -rV | head -1 | sed 's|/skills/glg-questionnaire$||'
 )}"
-# 2. Scratch space: one owner-only directory per user, outside any checkout.
-#    The path is derived, not remembered, so every call finds the same one.
-GLGQ_WORK="${TMPDIR:-/tmp}/glgq-$(id -u)"; mkdir -p "$GLGQ_WORK"; chmod 700 "$GLGQ_WORK"
+# 2. Scratch space. The path must be stable (every call derives it, nothing is
+#    remembered) AND unguessable-by-others, so it lives under a directory only
+#    this account can write: never /tmp, where another local account could
+#    pre-create or symlink it and collect the _session tokens in the bodies.
+GLGQ_WORK="${XDG_RUNTIME_DIR:-$HOME/.cache}/glgq"
+mkdir -p "$GLGQ_WORK" || exit 1
+# Refuse a symlink or a directory this account does not own, then lock it down.
+[ -L "$GLGQ_WORK" ] && { echo "refusing: $GLGQ_WORK is a symlink" >&2; exit 1; }
+[ -O "$GLGQ_WORK" ] || { echo "refusing: $GLGQ_WORK is not owned by me" >&2; exit 1; }
+chmod 700 "$GLGQ_WORK" || exit 1
 ```
 
 `GLGQ_PLUGIN_ROOT` empty after that means the plugin is not installed where either runtime can see it: say so and stop, rather than running a path that expands to `/skills/...`.
@@ -52,7 +59,7 @@ GLGQ_WORK="${TMPDIR:-/tmp}/glgq-$(id -u)"; mkdir -p "$GLGQ_WORK"; chmod 700 "$GL
 Email bodies carry `_session` bearer tokens, and subjects, questions and parsed answers are the member's data, so they live in `$GLGQ_WORK` and never in the working directory — mode `0644` there on a shared machine, committable by accident, and `body.txt` may clobber a project file. At the end of the session remove it with its own explicit command (no trap: a trap would delete it the moment the setup call returned):
 
 ```bash
-rm -rf "${TMPDIR:-/tmp}/glgq-$(id -u)"
+rm -rf "${XDG_RUNTIME_DIR:-$HOME/.cache}/glgq"
 ```
 
 ## Workflow
