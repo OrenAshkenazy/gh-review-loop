@@ -56,8 +56,10 @@ Everything in the profile is a `PROFILE` source on the answer sheet. If a questi
 Search Gmail for `from:glgroup.com subject:"Accept Confirmation"`, fetch each thread as plain text, parse the first message, save the JSON and seed:
 
 ```bash
-python3 .../scripts/parse_glg_email.py --subject "<subject>" --file body.txt > parsed.json
-python3 .../scripts/answer_bank.py seed --from-parsed parsed.json
+# In $GLGQ_WORK (see SKILL.md): owner-only, outside the repo, removed after use.
+python3 .../scripts/parse_glg_email.py \
+  --subject-file "$GLGQ_WORK/subject.txt" --file "$GLGQ_WORK/body.txt" > "$GLGQ_WORK/parsed.json"
+python3 .../scripts/answer_bank.py seed --from-parsed "$GLGQ_WORK/parsed.json"
 ```
 
 Seeding dedupes on normalized question plus value, so re-running is safe. Do this once on first run and again whenever a new confirmation arrives.

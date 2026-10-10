@@ -607,6 +607,25 @@ def _all_reviews(repo: str, pr: int, runner: Any) -> list[dict[str, Any]] | None
     return [review for review in reviews if isinstance(review, dict)]
 
 
+def current_head(repo: str, pr: int, runner: Any = None) -> str | None:
+    """The PR's head sha on GitHub, or None when it cannot be read.
+
+    One cheap read so `--expect-head` means the same thing on both paths: a
+    ping that lands before the push is visible buys a review of the previous
+    commit, which the loop then reads as this cycle's verdict.
+    """
+    if runner is None:
+        runner = subprocess.run
+    owner, repo_name = parse_repo(repo)
+    head = _gh_json(
+        ["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}", "--jq", ".head.sha"],
+        runner,
+    )
+    if isinstance(head, str) and head.strip():
+        return head.strip()
+    return None
+
+
 def request_state(
     repo: str,
     pr: int,
@@ -1174,8 +1193,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-head",
         default=None,
         help=(
-            "Review-request vendors only: the commit sha the PR head must be at "
-            "(your pushed HEAD). A mismatch means the push has not landed; nothing is posted."
+            "The commit sha the PR head must be at (your pushed HEAD). A mismatch "
+            "means the push has not landed; nothing is posted. Honored on both the "
+            "review-request and the comment path."
         ),
     )
     parser.add_argument(
@@ -1233,6 +1253,19 @@ def main(argv: list[str] | None = None) -> int:
     vendor = review_vendors.vendor_for(reviewer_login)
     if vendor is not None and vendor.trigger_kind == "review_request":
         return run_review_request(args, vendor)
+
+    # The comment path honors --expect-head too: the ping is what buys the
+    # review, so it must not be posted against a head GitHub has not seen yet.
+    if args.expect_head:
+        head = current_head(args.repo, args.pr)
+        if head is None:
+            _emit(state_unreadable_payload(args.repo, args.pr, reviewer_login or "the reviewer"),
+                  json_output=args.json_output)
+            return 0
+        if head != args.expect_head:
+            _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, head),
+                  json_output=args.json_output)
+            return 0
 
     try:
         trigger = None

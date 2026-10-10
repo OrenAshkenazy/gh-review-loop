@@ -22,6 +22,43 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The seeding example passes its subject by file too.** The earlier shell
+  fix covered SKILL.md but left `references/answer-bank.md` instructing the
+  agent to substitute `<subject>` inside a double-quoted argument.
+
+- **Prior-project questions are refused in either word order.** The filter
+  matched "other GLG" and "GLG project(s)" only, so "Which previous projects
+  have you completed through GLG?" was stored and could come back as a `BANK`
+  suggestion for a question GLG's confidentiality section sends to the member
+  every time.
+
+- **A survey or payment subject outranks a quoted link.** A paid-survey email
+  that quotes an earlier GLG thread carries that thread's follow-up URL, and
+  routing on the link sent a survey into questionnaire automation instead of
+  the mandatory `survey (manual)` row.
+
+- **GLG scratch files are owner-only, outside any checkout, and removed.**
+  SKILL.md had the agent write `subject.txt`, `question.txt`, `body.txt` and
+  parsed JSON into the working directory — mode `0644` under the usual umask,
+  committable by accident, and able to clobber same-named project files. They
+  now live in a per-session `mktemp -d` directory created under `umask 077` and
+  removed on exit.
+
+- **The fetch-side cap count admits when it is a lower bound.**
+  `review_request_count_complete()` checked only the timeline page, while the
+  free-cycle boundary comes from the reviews page: a full page can hide the
+  vendor's first completed review, making later requests look free and letting
+  the loop run another fix/push cycle before the request script refuses the
+  write. Both pages are now checked.
+
+- **`--expect-head` is honored on the comment path, and documented in the
+  canonical command.** It guarded only the review-request path, so a Codex ping
+  could land before GitHub saw the push and buy a review of the previous
+  commit, which the loop would read as this cycle's verdict. The comment path
+  now reads the head and posts nothing on a mismatch (`head_mismatch`) or an
+  unreadable head (`uncountable_state`), and workflow step 8 passes
+  `$(git rev-parse HEAD)`.
+
 - **Every compliance class in the reference is refused by the bank.** The
   attestation predicate covered employer, conflict, recording and blinded-client
   questions but not government or public-sector roles, pending trials and

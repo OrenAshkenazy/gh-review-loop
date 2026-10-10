@@ -110,8 +110,14 @@ ATTESTATION_PATTERNS = [
     re.compile(r"\bpublic company\b[^.?]*\b(employ|work|officer|board)", re.IGNORECASE),
     re.compile(r"\b(six|6) months\b[^.?]*\b(employ|work|left|depart)", re.IGNORECASE),
     re.compile(r"\b(employ|work|left|depart)[^.?]*\b(six|6) months\b", re.IGNORECASE),
-    # Other GLG projects.
-    re.compile(r"\bother GLG\b|\bGLG projects?\b", re.IGNORECASE),
+    # Other GLG projects, in either word order: "which other GLG projects",
+    # "projects completed through GLG", "consultations with GLG".
+    re.compile(r"\bother GLG\b|\bGLG (projects?|consultations?|engagements?)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(project|consultation|engagement|call)s?\b[^.?]*\b(through|via|with|for|at) GLG\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(through|via|with|for) GLG\b[^.?]*\b(project|consultation|engagement)", re.IGNORECASE),
 ]
 
 

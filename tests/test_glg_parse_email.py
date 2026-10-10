@@ -281,3 +281,32 @@ class TestRobustKindAndExpiry:
 
         assert parsed["kind"] == "accept_confirmation"
         assert parsed["recorded_answers"]
+
+
+class TestSurveyPrecedence:
+    def test_a_survey_subject_outranks_a_quoted_followup_link(self):
+        """A survey email quoting an earlier GLG thread carries a follow-up
+        URL. Routing on that link sends a paid survey into questionnaire
+        automation, which hard rule 4 forbids (PR #116 review)."""
+        body = (
+            "Take our paid survey.\n\n"
+            "> Earlier: https://members.glgresearch.com/cm-accept-followup/abc?cpid=5\n"
+        )
+
+        parsed = pge.parse(body, "GLG: Paid survey on Observability Platforms")
+
+        assert parsed["kind"] == "survey"
+
+    def test_a_payment_subject_outranks_a_quoted_followup_link(self):
+        body = "> https://members.glgresearch.com/cm-accept-followup/abc?cpid=5\n"
+
+        parsed = pge.parse(body, "GLG: Payment for your consultation")
+
+        assert parsed["kind"] == "payment"
+
+    def test_a_real_followup_is_still_a_followup(self):
+        body = "Please answer: https://members.glgresearch.com/cm-accept-followup/abc?cpid=5\n"
+
+        parsed = pge.parse(body, "GLG: Follow up on your acceptance for Observability")
+
+        assert parsed["kind"] == "followup"

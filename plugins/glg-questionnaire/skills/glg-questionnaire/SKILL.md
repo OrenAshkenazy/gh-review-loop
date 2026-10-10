@@ -48,6 +48,18 @@ export GLGQ_PLUGIN_ROOT
 
 Empty after that means the plugin is not installed where either runtime can see it: say so and stop, rather than running a path that expands to `/skills/...`.
 
+## Scratch files
+
+Email bodies carry `_session` bearer tokens, and subjects, questions and parsed answers are the member's data. They never go in the working directory — mode `0644` there on a shared machine, committable by accident, and `body.txt` may clobber a project file. Make one owner-only directory per session, outside any checkout, and remove it when done:
+
+```bash
+umask 077
+GLGQ_WORK="$(mktemp -d "${TMPDIR:-/tmp}/glgq.XXXXXX")"
+trap 'rm -rf "$GLGQ_WORK"' EXIT   # or remove it yourself at the end of the session
+```
+
+Every command below reads and writes inside `$GLGQ_WORK`.
+
 ## Workflow
 
 ### 1. Triage the inbox
@@ -57,10 +69,10 @@ Search Gmail for `from:glgroup.com newer_than:14d` (widen on request). Fetch eac
 ```bash
 # Subjects and questions are text the member did not write. Never paste one
 # into a command line: a shell expands $(...) and backticks inside double
-# quotes too. Write it to a file first, always.
-printf '%s' "$SUBJECT" > subject.txt   # or save it from the connector directly
+# quotes too. Write it to a file in $GLGQ_WORK first, always.
+printf '%s' "$SUBJECT" > "$GLGQ_WORK/subject.txt"
 python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/parse_glg_email.py" \
-  --subject-file subject.txt --file body.txt
+  --subject-file "$GLGQ_WORK/subject.txt" --file "$GLGQ_WORK/body.txt"
 ```
 
 Group by `cpid`, but only when it is non-empty: surveys, payments, call reminders and digests parse with no `cpid`, and keying on it would collapse them into one row and hide projects the hard rules require reporting. Messages without a `cpid` stay separate — key them by Gmail thread, falling back to the project ID. Judge fit by comparing `project_title`, `description_bullets` and `client_type` against the profile's expertise and decline lists. Print one table: project, kind, rate, client type, link expiry, fit, suggested action (`accept`, `decline`, `ask`, `survey (manual)`). Then ask which to work. Emails of kind `followup` are already-accepted projects with new questions: list them first, they are the fastest win.
@@ -70,9 +82,9 @@ Group by `cpid`, but only when it is non-empty: surveys, payments, call reminder
 For the chosen project, before touching the browser, look up what the member answered before:
 
 ```bash
-printf '%s' "$QUESTION" > question.txt
+printf '%s' "$QUESTION" > "$GLGQ_WORK/question.txt"
 python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/answer_bank.py" \
-  lookup --question-file question.txt
+  lookup --question-file "$GLGQ_WORK/question.txt"
 ```
 
 You do not know the exact questions until the page is open, so start with the profile (vendors, roles, org facts) and the bank entries closest to the project topic, and finish the sheet in step 3 once the real questions are visible.

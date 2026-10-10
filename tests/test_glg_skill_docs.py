@@ -109,3 +109,25 @@ def test_triage_does_not_group_messages_without_a_consultation_id():
     assert "without a cpid" in lowered or "no cpid" in lowered
     assert "non-empty" in lowered or "nonempty" in lowered
     assert "thread" in lowered
+
+
+def test_scratch_files_are_private_and_cleaned_up():
+    """subject.txt / question.txt / body.txt hold project subjects, session-
+    bearing email bodies and questionnaire text. Written into the cwd under the
+    usual 022 umask they are world-readable, can be committed by accident, and
+    can clobber same-named project files (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    assert "umask 077" in text
+    assert "mktemp -d" in text
+    # No bare redirect into the working directory.
+    for line in text.splitlines():
+        if ">" in line and (".txt" in line or ".json" in line):
+            assert "$GLGQ_WORK" in line or "umask" in line, line
+
+
+def test_the_seeding_example_also_passes_the_subject_by_file():
+    text = (REFERENCES / "answer-bank.md").read_text(encoding="utf-8")
+
+    assert '--subject "' not in text
+    assert "--subject-file" in text
