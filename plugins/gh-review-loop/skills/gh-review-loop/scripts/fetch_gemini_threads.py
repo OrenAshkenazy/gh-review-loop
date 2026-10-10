@@ -1231,12 +1231,21 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
     login = record["login"]
     known_display_name = reviewer_resolver.display_name_for(login)
     display_name = record.get("display_name") or known_display_name
-    if reviewer_resolver.trigger_for(login):
+    if review_vendors.vendor_for(login):
         display_name = known_display_name
+    trigger_kind = reviewer_resolver.trigger_kind_for(login)
+    # A record saved before the vendor was known may carry a mention for a
+    # vendor that is re-reviewed by request; a comment never triggers it, so
+    # the mention is dropped rather than advertised.
+    review_trigger = None
+    if trigger_kind == "comment":
+        review_trigger = record.get("review_trigger") or reviewer_resolver.trigger_for(login)
     return {
         "login": login,
         "display_name": display_name,
-        "review_trigger": record.get("review_trigger") or reviewer_resolver.trigger_for(login),
+        "review_trigger": review_trigger,
+        "trigger_kind": trigger_kind,
+        "request_login": reviewer_resolver.request_login_for(login),
         "auto_reviews": reviewer_resolver.auto_reviews(login),
         "source": source,
         "confirmation_required": source in {"default_unconfirmed", "none_configured"},

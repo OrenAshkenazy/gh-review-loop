@@ -25,12 +25,19 @@ class Candidate:
     login: str
     display_name: str
     review_trigger: str | None
+    trigger_kind: str = "comment"
+    # Where discovery saw this reviewer: "thread" (inline review comment),
+    # "review" (a submitted review with no inline comments), or "requested"
+    # (a pending review request that has not produced a review yet).
+    source: str = "thread"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "login": self.login,
             "display_name": self.display_name,
             "review_trigger": self.review_trigger,
+            "trigger_kind": self.trigger_kind,
+            "source": self.source,
         }
 
 
@@ -49,8 +56,15 @@ def display_name_for(login: str) -> str:
 
 
 def trigger_for(login: str) -> str | None:
+    """The @mention that re-reviews this vendor, or None when there is none.
+
+    A review_request vendor has a handle (``@copilot``) but no comment the loop
+    could post to trigger it, so it has no trigger here.
+    """
     vendor = review_vendors.vendor_for(login)
-    return vendor.mention if vendor else None
+    if vendor is None or vendor.trigger_kind != "comment":
+        return None
+    return vendor.mention
 
 
 def phrase_for(login: str) -> str | None:
@@ -58,10 +72,27 @@ def phrase_for(login: str) -> str | None:
 
     Vendors differ: Gemini reads any sentence that mentions it, Codex matches
     ``@codex review`` exactly. Unknown reviewers have no phrase, so callers
-    fall back to the generic mention-plus-sentence form.
+    fall back to the generic mention-plus-sentence form. Review-request
+    vendors have no phrase at all.
     """
     vendor = review_vendors.vendor_for(login)
-    return vendor.rereview_phrase if vendor else None
+    if vendor is None or vendor.trigger_kind != "comment":
+        return None
+    return vendor.rereview_phrase
+
+
+def trigger_kind_for(login: str) -> str:
+    """"comment" (post an @mention) or "review_request" (requested-reviewers API)."""
+    vendor = review_vendors.vendor_for(login)
+    return vendor.trigger_kind if vendor else "comment"
+
+
+def request_login_for(login: str) -> str | None:
+    """The login to pass to the requested-reviewers API, for review_request vendors."""
+    vendor = review_vendors.vendor_for(login)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return None
+    return vendor.request_login
 
 
 def auto_reviews(login: str) -> bool:
@@ -86,6 +117,8 @@ def make_reviewer_record(
         "login": login,
         "display_name": display_name or display_name_for(login),
         "review_trigger": review_trigger if review_trigger is not None else trigger_for(login),
+        "trigger_kind": trigger_kind_for(login),
+        "request_login": request_login_for(login),
         "auto_reviews": auto_reviews(login),
         "source": source,
         "selected_at": selected_at or now_iso(),
