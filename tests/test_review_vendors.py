@@ -64,3 +64,36 @@ def test_gemini_remains_a_fully_supported_reviewer():
     assert gemini.rereview_phrase
     assert gemini.auto_reviews is True
     assert review_vendors.vendor_for("@gemini-code-assist") is gemini
+
+
+def test_copilot_vendor_resolves_from_every_login_spelling():
+    """GraphQL says copilot-pull-request-reviewer, REST reviews say ...[bot],
+    the REST timeline says Copilot, and the handle is @copilot."""
+    for name in (
+        "copilot-pull-request-reviewer",
+        "copilot-pull-request-reviewer[bot]",
+        "Copilot",
+        "copilot",
+        "@copilot",
+    ):
+        assert review_vendors.vendor_for(name) is review_vendors.COPILOT, name
+
+
+def test_copilot_is_re_reviewed_by_request_not_by_comment():
+    copilot = review_vendors.COPILOT
+
+    assert copilot.display_name == "Copilot"
+    assert copilot.trigger_kind == "review_request"
+    assert copilot.request_login == "copilot-pull-request-reviewer[bot]"
+    assert copilot.rereview_phrase == ""
+    assert copilot.auto_reviews is False
+
+
+def test_comment_vendors_default_to_the_comment_trigger_kind():
+    assert review_vendors.CODEX.trigger_kind == "comment"
+    assert review_vendors.GEMINI.trigger_kind == "comment"
+    assert review_vendors.CODEX.request_login == ""
+
+
+def test_adding_copilot_did_not_change_the_suggested_vendor():
+    assert review_vendors.SUGGESTED_VENDOR is review_vendors.CODEX
