@@ -4165,3 +4165,96 @@ class TestReviewRequestSelectionState:
         assert state["review_trigger"] == "@codex"
         assert state["trigger_kind"] == "comment"
         assert state["request_login"] is None
+
+
+import fetch_gemini_threads as _fgt  # noqa: E402
+
+
+class TestReviewRequestCounting:
+    """For a review_request vendor the cap counts timeline events, not mentions,
+    and only those after the vendor's first completed review."""
+
+    COPILOT = "copilot-pull-request-reviewer"
+    FIRST_REVIEW = "2026-10-07T15:46:14Z"
+
+    def _pr(self, *events, reviews=None, timeline_size=None):
+        nodes = [
+            {
+                "__typename": "ReviewRequestedEvent",
+                "createdAt": created_at,
+                "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": login},
+            }
+            for actor, login, created_at in events
+        ]
+        if timeline_size is not None:
+            nodes = nodes + [
+                {
+                    "__typename": "ReviewRequestedEvent",
+                    "createdAt": f"2026-10-08T00:{i % 60:02d}:{i // 60:02d}Z",
+                    "actor": {"login": "agent"},
+                    "requestedReviewer": {"__typename": "Bot", "login": self.COPILOT},
+                }
+                for i in range(timeline_size - len(nodes))
+            ]
+        if reviews is None:
+            reviews = [{"author": {"login": self.COPILOT}, "state": "COMMENTED",
+                        "submittedAt": self.FIRST_REVIEW, "commit": {"oid": "f4a55e3"}}]
+        return {
+            "comments": {"nodes": []},
+            "reviews": {"nodes": reviews},
+            "timelineItems": {"nodes": nodes},
+        }
+
+    def test_copilot_requests_by_the_agent_after_the_first_review_count(self):
+        pr = self._pr(
+            ("agent", self.COPILOT, "2026-10-07T15:42:27Z"),   # initial: free
+            ("agent", self.COPILOT, "2026-10-07T16:20:05Z"),   # counts
+            ("human", self.COPILOT, "2026-10-07T16:30:00Z"),   # human: never
+            ("agent", "some-user", "2026-10-07T16:40:00Z"),    # other reviewer
+        )
+
+        requests = rereview_requests(pr, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT)
+
+        assert [r["created_at"] for r in requests] == ["2026-10-07T16:20:05Z"]
+
+    def test_without_an_agent_login_every_post_review_copilot_request_counts(self):
+        pr = self._pr(
+            ("agent", self.COPILOT, "2026-10-07T15:42:27Z"),
+            ("agent", self.COPILOT, "2026-10-07T16:20:05Z"),
+            ("human", self.COPILOT, "2026-10-07T16:30:00Z"),
+        )
+
+        assert len(rereview_requests(pr, None, review_trigger_mention=None, reviewer_login=self.COPILOT)) == 2
+
+    def test_nothing_counts_before_the_first_completed_review(self):
+        pr = self._pr(("agent", self.COPILOT, "2026-10-07T15:42:27Z"), reviews=[])
+
+        assert rereview_requests(pr, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT) == []
+
+    def test_comment_vendors_still_count_mentions_not_events(self):
+        pr = self._pr(("agent", self.COPILOT, "2026-10-07T16:20:05Z"))
+        pr["comments"]["nodes"] = [{"author": {"login": "agent"}, "body": "@codex review"}]
+
+        requests = rereview_requests(pr, "agent", review_trigger_mention="@codex", reviewer_login="chatgpt-codex-connector")
+
+        assert len(requests) == 1
+        assert requests[0]["body"] == "@codex review"
+
+    def test_missing_timeline_is_zero_not_an_error(self):
+        assert rereview_requests(
+            {"comments": {"nodes": []}}, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT
+        ) == []
+
+    def test_full_timeline_page_marks_the_count_incomplete(self):
+        full = self._pr(timeline_size=_fgt.PAGE_LIMIT_TIMELINE)
+        partial = self._pr(("agent", self.COPILOT, "2026-10-07T16:20:05Z"))
+
+        assert _fgt.review_request_count_complete(full) is False
+        assert _fgt.review_request_count_complete(partial) is True
+        assert _fgt.review_request_count_complete({"comments": {"nodes": []}}) is True
+
+    def test_the_fetch_query_asks_for_review_requested_events_and_review_commits(self):
+        assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT])" in _fgt.QUERY
+        assert "... on ReviewRequestedEvent" in _fgt.QUERY
+        assert "commit { oid }" in _fgt.QUERY

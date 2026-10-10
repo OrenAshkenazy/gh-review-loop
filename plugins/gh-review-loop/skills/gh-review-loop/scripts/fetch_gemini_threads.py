@@ -95,6 +95,7 @@ PAGE_LIMIT_REVIEW_THREADS = 100
 PAGE_LIMIT_REVIEWS = 100
 PAGE_LIMIT_PR_COMMENTS = 100
 PAGE_LIMIT_THREAD_COMMENTS = 50
+PAGE_LIMIT_TIMELINE = 100
 
 # Minimum reply length to count a non-bot comment as a substantive reply.
 # Filters out token acks like "ok", "ack", "thanks", "👍".
@@ -225,6 +226,21 @@ query($owner:String!, $repo:String!, $number:Int!) {
           state
           submittedAt
           url
+          commit { oid }
+        }
+      }
+      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT]) {
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent {
+            createdAt
+            actor { login }
+            requestedReviewer {
+              __typename
+              ... on Bot { login }
+              ... on User { login }
+            }
+          }
         }
       }
       reviewThreads(first:100) {
@@ -756,6 +772,11 @@ def pagination_warnings(pull_request: dict[str, Any]) -> list[str]:
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
     reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
+    if not review_request_count_complete(pull_request):
+        warnings.append(
+            f"review-request events hit page limit ({PAGE_LIMIT_TIMELINE}); "
+            "the re-review count is a lower bound."
+        )
     if len(pr_comments) >= PAGE_LIMIT_PR_COMMENTS:
         warnings.append(
             f"PR comments hit page limit ({PAGE_LIMIT_PR_COMMENTS}); older comments may be missing."
@@ -969,17 +990,38 @@ def review_body_findings(
     return findings
 
 
+def review_request_count_complete(pull_request: dict[str, Any]) -> bool:
+    """False when the timeline page is full, so the review-request count is a lower bound."""
+    nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
+    return len(nodes) < PAGE_LIMIT_TIMELINE
+
+
 def rereview_requests(
     pull_request: dict[str, Any],
     agent_login: str | None = None,
     *,
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
+    reviewer_login: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Count comments that ping the configured reviewer for a re-review.
+    """The re-review requests the loop cap counts.
 
-    When agent_login is provided, only comments authored by that login count.
-    This prevents arbitrary humans pinging Gemini from consuming the loop cap.
+    Comment vendors (Gemini, Codex): comments that mention the reviewer with
+    the word "review". Review-request vendors (Copilot): ReviewRequestedEvents
+    for that vendor made after its first completed review — the shared rule in
+    ``reviewer_resolver.counted_review_requests``, so this count can never
+    disagree with request_rereview.py's. When agent_login is provided, only
+    the agent's own requests count, so arbitrary humans cannot consume the cap.
     """
+    vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        return reviewer_resolver.counted_review_requests(
+            (pull_request.get("timelineItems") or {}).get("nodes") or [],
+            agent_login=agent_login,
+            vendor=vendor,
+            first_completed_review_at=reviewer_resolver.first_completed_review_at(
+                (pull_request.get("reviews") or {}).get("nodes") or [], vendor
+            ),
+        )
     if not review_trigger_mention:
         return []
     out = []
@@ -2810,7 +2852,9 @@ def render_markdown(
     full: bool = False,
 ) -> str:
     reviews = filter_reviews(pr, author)
-    rereviews = rereview_requests(pr, review_trigger_mention=review_trigger_mention)
+    rereviews = rereview_requests(
+        pr, review_trigger_mention=review_trigger_mention, reviewer_login=author
+    )
     outdated = outdated_unresolved_threads(pr, author)
     deferred = addressed_by_reply_threads(pr, author)
     lines = [
@@ -3551,6 +3595,7 @@ def main() -> int:
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
+            reviewer_login=args.author,
         )
         _limit_reached = len(rereviews) >= args.max_rereview_requests
         if args.resolve_outdated:
@@ -3736,6 +3781,7 @@ def main() -> int:
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
+            reviewer_login=args.author,
         )
         if len(rereviews) >= args.max_rereview_requests:
             print(
@@ -4112,6 +4158,9 @@ def main() -> int:
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
                         "limitReached": len(rereviews) >= args.max_rereview_requests,
+                        # False when the timeline page was full: the count
+                        # above is then a lower bound (review-request vendors).
+                        "reReviewCountComplete": review_request_count_complete(pull_request),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
                         "addressedByReplyThreads": len(addressed_by_reply_threads(pull_request, args.author)),
