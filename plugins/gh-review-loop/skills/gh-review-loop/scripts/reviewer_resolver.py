@@ -105,6 +105,95 @@ def auto_reviews(login: str) -> bool:
     return vendor.auto_reviews if vendor else True
 
 
+def normalize_request_event(event: Any) -> dict[str, Any] | None:
+    """One shape for a review-request event from either GitHub API.
+
+    Accepts a GraphQL ``ReviewRequestedEvent`` node (``createdAt``,
+    ``actor.login``, ``requestedReviewer.login``) or a REST timeline event
+    (``event == "review_requested"``, ``created_at``, ``actor.login``,
+    ``requested_reviewer.login``). Team requests, other event types, and
+    non-dicts normalize to None.
+    """
+    if not isinstance(event, dict):
+        return None
+    if "event" in event or "requested_reviewer" in event or "requested_team" in event:
+        if event.get("event") != "review_requested":
+            return None
+        requested = event.get("requested_reviewer")
+        if not isinstance(requested, dict):
+            return None
+        return {
+            "created_at": event.get("created_at") or "",
+            "actor_login": (event.get("actor") or {}).get("login") or "",
+            "reviewer_login": requested.get("login") or "",
+        }
+    if event.get("__typename") not in (None, "ReviewRequestedEvent"):
+        return None
+    requested = event.get("requestedReviewer")
+    if not isinstance(requested, dict):
+        return None
+    return {
+        "created_at": event.get("createdAt") or "",
+        "actor_login": (event.get("actor") or {}).get("login") or "",
+        "reviewer_login": requested.get("login") or "",
+    }
+
+
+def first_completed_review_at(
+    reviews: Any, vendor: review_vendors.ReviewVendor
+) -> str | None:
+    """Earliest submitted, non-PENDING review by ``vendor``; None when there is none.
+
+    Accepts GraphQL review nodes (``author.login``, ``submittedAt``) or REST
+    reviews (``user.login``, ``submitted_at``). This is the cycle-0 boundary:
+    a review request made before it is the initial request and is free.
+    """
+    earliest: str | None = None
+    for review in reviews or []:
+        if not isinstance(review, dict) or review.get("state") == "PENDING":
+            continue
+        author = review.get("author") or review.get("user") or {}
+        if review_vendors.vendor_for(author.get("login")) is not vendor:
+            continue
+        submitted = review.get("submittedAt") or review.get("submitted_at") or ""
+        if submitted and (earliest is None or submitted < earliest):
+            earliest = submitted
+    return earliest
+
+
+def counted_review_requests(
+    events: Any,
+    *,
+    agent_login: str | None,
+    vendor: review_vendors.ReviewVendor,
+    first_completed_review_at: str | None,
+) -> list[dict[str, Any]]:
+    """The review requests that consume the loop cap, in timeline order.
+
+    An event counts when it asks ``vendor``, was made by ``agent_login`` (any
+    actor when None), and came after the vendor's first completed review. So
+    the initial request, a human's click, a failed POST (no event) and a
+    deduplicated request (no POST) all cost nothing. This is the single
+    counting rule shared by the fetch (GraphQL nodes) and the request script
+    (REST events).
+    """
+    if not first_completed_review_at:
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in events or []:
+        event = normalize_request_event(raw)
+        if event is None:
+            continue
+        if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
+            continue
+        if agent_login is not None and event["actor_login"] != agent_login:
+            continue
+        if event["created_at"] <= first_completed_review_at:
+            continue
+        out.append(event)
+    return out
+
+
 def make_reviewer_record(
     login: str,
     *,

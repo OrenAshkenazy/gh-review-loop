@@ -228,3 +228,88 @@ def test_candidate_dict_carries_kind_and_source():
         "trigger_kind": "review_request",
         "source": "requested",
     }
+
+
+import review_vendors  # noqa: E402
+
+
+def _gql_event(actor, created_at, reviewer=COPILOT):
+    return {
+        "__typename": "ReviewRequestedEvent",
+        "createdAt": created_at,
+        "actor": {"login": actor},
+        "requestedReviewer": {"__typename": "Bot", "login": reviewer},
+    }
+
+
+def _rest_event(actor, created_at, reviewer="Copilot"):
+    return {
+        "event": "review_requested",
+        "created_at": created_at,
+        "actor": {"login": actor},
+        "requested_reviewer": {"login": reviewer, "type": "Bot"},
+    }
+
+
+def test_normalize_request_event_accepts_graphql_and_rest_shapes():
+    assert reviewer_resolver.normalize_request_event(_gql_event("agent", "2026-10-07T16:20:05Z")) == {
+        "created_at": "2026-10-07T16:20:05Z", "actor_login": "agent", "reviewer_login": COPILOT,
+    }
+    assert reviewer_resolver.normalize_request_event(_rest_event("agent", "2026-10-07T16:20:05Z")) == {
+        "created_at": "2026-10-07T16:20:05Z", "actor_login": "agent", "reviewer_login": "Copilot",
+    }
+
+
+def test_normalize_request_event_rejects_team_requests_and_other_events():
+    assert reviewer_resolver.normalize_request_event(
+        {"event": "review_requested", "actor": {"login": "a"}, "requested_team": {"slug": "core"},
+         "created_at": "2026-10-07T16:20:05Z"}
+    ) is None
+    assert reviewer_resolver.normalize_request_event({"event": "commented", "actor": {"login": "a"}}) is None
+    assert reviewer_resolver.normalize_request_event({"__typename": "IssueComment"}) is None
+    assert reviewer_resolver.normalize_request_event("nope") is None
+    assert reviewer_resolver.normalize_request_event(None) is None
+
+
+def test_first_completed_review_at_ignores_pending_and_other_authors():
+    reviews = [
+        {"author": {"login": "alice"}, "state": "APPROVED", "submittedAt": "2026-10-07T15:00:00Z"},
+        {"author": {"login": COPILOT}, "state": "PENDING", "submittedAt": "2026-10-07T15:10:00Z"},
+        {"author": {"login": COPILOT}, "state": "COMMENTED", "submittedAt": "2026-10-07T15:46:14Z"},
+        {"user": {"login": "copilot-pull-request-reviewer[bot]"}, "state": "COMMENTED",
+         "submitted_at": "2026-10-07T15:30:00Z"},
+    ]
+
+    assert reviewer_resolver.first_completed_review_at(reviews, review_vendors.COPILOT) == "2026-10-07T15:30:00Z"
+    assert reviewer_resolver.first_completed_review_at(reviews[:2], review_vendors.COPILOT) is None
+    assert reviewer_resolver.first_completed_review_at([], review_vendors.COPILOT) is None
+
+
+def test_counted_requests_exclude_initial_human_and_other_vendor():
+    events = [
+        _gql_event("agent", "2026-10-07T15:42:27Z"),          # initial request: before the first review
+        _rest_event("agent", "2026-10-07T16:20:05Z"),         # re-request: counts (REST spelling)
+        _gql_event("a-human", "2026-10-07T16:30:00Z"),        # human: never counts
+        _gql_event("agent", "2026-10-07T16:40:00Z", reviewer="gemini-code-assist"),  # other vendor
+        _gql_event("agent", "2026-10-07T17:00:00Z"),          # counts
+    ]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+    )
+
+    assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:05Z", "2026-10-07T17:00:00Z"]
+    everyone = reviewer_resolver.counted_review_requests(
+        events, agent_login=None, vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+    )
+    assert len(everyone) == 3
+
+
+def test_counted_requests_is_empty_before_any_completed_review():
+    events = [_gql_event("agent", "2026-10-07T15:42:27Z"), _gql_event("agent", "2026-10-07T15:50:00Z")]
+
+    assert reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT, first_completed_review_at=None,
+    ) == []

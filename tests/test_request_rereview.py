@@ -836,3 +836,489 @@ class TestStateKeyCasing:
         state = json.loads((tmp_path / "state.json").read_text())
         assert list(state) == ["OrenAshkenazy/gh-review-loop#7"]
         assert state["OrenAshkenazy/gh-review-loop#7"]["run"]["rereviews_posted"] == 1
+
+
+import datetime as _dt  # noqa: E402
+import re  # noqa: E402
+
+
+COPILOT_LOGIN = "copilot-pull-request-reviewer"
+COPILOT_REQUEST = "copilot-pull-request-reviewer[bot]"
+T_FIRST_REVIEW = "2026-10-07T15:46:14Z"
+T_REQUEST = "2026-10-07T16:20:05Z"
+
+
+def _completed(cmd, payload, rc=0, stderr=""):
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=rc,
+        stdout=json.dumps(payload) if payload is not None else "", stderr=stderr,
+    )
+
+
+def _gql_pr(head, reviews=(), pending=(), events=()):
+    return {"data": {"repository": {"pullRequest": {
+        "headRefOid": head,
+        "reviews": {"nodes": [
+            {"author": {"login": a}, "state": s, "submittedAt": t, "commit": {"oid": c}}
+            for (a, s, t, c) in reviews
+        ]},
+        "reviewRequests": {"nodes": [
+            {"requestedReviewer": {"__typename": "Bot", "login": login}} for login in pending
+        ]},
+        "timelineItems": {"nodes": [
+            {"__typename": "ReviewRequestedEvent", "createdAt": t, "actor": {"login": a},
+             "requestedReviewer": {"__typename": "Bot", "login": COPILOT_LOGIN}}
+            for (a, t) in events
+        ]},
+    }}}}
+
+
+def _gql_runner(payload, rc=0):
+    def runner(cmd, **kwargs):
+        assert cmd[:3] == ["gh", "api", "graphql"], cmd
+        return _completed(cmd, payload if rc == 0 else None, rc=rc, stderr="boom" if rc else "")
+    return runner
+
+
+def _at(iso):
+    return _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+
+
+OLD_REVIEW = (COPILOT_LOGIN, "COMMENTED", T_FIRST_REVIEW, "f4a55e3000")
+
+
+class TestRequestState:
+    def test_request_state_completed_head(self):
+        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")])
+
+        state = request_rereview.request_state("acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(payload))
+
+        assert state["state"] == "COMPLETED_HEAD"
+        assert state["head"] == "d7efa49000"
+        assert state["first_completed_review_at"] == T_FIRST_REVIEW
+
+    def test_request_state_pending_fresh(self):
+        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN],
+                          events=[("a-human", "2026-10-07T15:42:27Z"), ("agent", T_REQUEST)])
+
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_gql_runner(payload), now=_at("2026-10-07T16:23:05Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] == T_REQUEST
+
+    def test_request_state_pending_with_unknown_age_stays_pending(self):
+        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN], events=[])
+
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_gql_runner(payload), now=_at("2026-10-08T16:23:05Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] is None
+
+    def test_request_state_stale_pending(self):
+        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], pending=[COPILOT_LOGIN], events=[("agent", T_REQUEST)])
+
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_gql_runner(payload), now=_at("2026-10-07T16:45:05Z"),
+        )
+
+        assert state["state"] == "STALE_PENDING"
+
+    def test_request_state_absent_with_stale_review(self):
+        payload = _gql_pr("d7efa49000", reviews=[OLD_REVIEW], events=[("a-human", "2026-10-07T15:42:27Z")])
+
+        state = request_rereview.request_state("acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(payload))
+
+        assert state["state"] == "ABSENT"
+        assert state["first_completed_review_at"] == T_FIRST_REVIEW
+
+    def test_request_state_absent_on_a_never_reviewed_pr(self):
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(_gql_pr("f4a55e3000"))
+        )
+
+        assert state["state"] == "ABSENT"
+        assert state["first_completed_review_at"] is None
+
+    def test_request_state_none_when_query_fails(self):
+        assert request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT, runner=_gql_runner(None, rc=1)
+        ) is None
+
+
+class TestReviewRequestHelpers:
+    def test_count_agent_review_requests_paginated_rest(self):
+        page1 = [
+            {"event": "review_requested", "actor": {"login": "agent"}, "created_at": "2026-10-07T15:42:27Z",
+             "requested_reviewer": {"login": "Copilot", "type": "Bot"}},
+            {"event": "review_requested", "actor": {"login": "agent"}, "created_at": T_REQUEST,
+             "requested_reviewer": {"login": "Copilot", "type": "Bot"}},
+            {"event": "review_requested", "actor": {"login": "a-human"}, "created_at": "2026-10-07T16:30:00Z",
+             "requested_reviewer": {"login": "Copilot", "type": "Bot"}},
+            {"event": "commented", "actor": {"login": "agent"}},
+        ]
+        page2 = [
+            {"event": "review_requested", "actor": {"login": "agent"}, "created_at": "2026-10-07T17:00:00Z",
+             "requested_reviewer": {"login": "Copilot", "type": "Bot"}},
+            {"event": "review_requested", "actor": {"login": "agent"}, "created_at": "2026-10-07T17:05:00Z",
+             "requested_team": {"slug": "core"}},
+        ]
+
+        def runner(cmd, **kwargs):
+            assert cmd[:3] == ["gh", "api", "--paginate"]
+            assert cmd[3] == "repos/acme/widget/issues/159/timeline"
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=json.dumps(page1) + "\n" + json.dumps(page2), stderr="")
+
+        used = request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        )
+
+        assert used == 2
+
+    def test_count_agent_review_requests_is_none_when_unknowable(self):
+        failing = lambda cmd, **kwargs: _completed(cmd, None, rc=1, stderr="boom")  # noqa: E731
+        assert request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=failing
+        ) is None
+        assert request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW, runner=failing
+        ) is None
+
+    @pytest.mark.parametrize("stderr, expected", [
+        ('gh: Bad credentials (HTTP 401)', ("permission", 401, False)),
+        ('gh: Resource not accessible by integration (HTTP 403)', ("permission", 403, False)),
+        ('gh: Not Found (HTTP 404)', ("not_found", 404, False)),
+        ('{"message":"Reviews may only be requested from collaborators."}\ngh: Validation Failed (HTTP 422)', ("validation", 422, False)),
+        ('gh: You have exceeded a secondary rate limit. (HTTP 403)', ("rate_limited", 403, True)),
+        ('gh: API rate limit exceeded (HTTP 429)', ("rate_limited", 429, True)),
+        ('gh: Server Error (HTTP 502)', ("transient", 502, True)),
+        ('read tcp: connection reset by peer', ("uncertain", None, False)),
+        ('', ("uncertain", None, False)),
+    ])
+    def test_classify_gh_failure_table(self, stderr, expected):
+        assert request_rereview.classify_gh_failure(stderr) == expected
+
+    def test_request_review_posts_to_requested_reviewers(self):
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return _completed(cmd, {"requested_reviewers": [{"login": COPILOT_REQUEST}]})
+
+        result = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner)
+
+        assert captured["cmd"] == [
+            "gh", "api", "repos/acme/widget/pulls/159/requested_reviewers",
+            "--method", "POST", "--raw-field", f"reviewers[]={COPILOT_REQUEST}",
+        ]
+        assert captured["kwargs"].get("shell") is not True
+        assert result["kind"] == "review_request"
+        assert result["reviewer"] == COPILOT_REQUEST
+        assert result["posted"] is True
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", result["created_at"])
+
+    def test_request_review_rejection_carries_reason(self):
+        def runner(cmd, **kwargs):
+            return _completed(cmd, None, rc=1, stderr='{"message":"Reviews may only be requested from collaborators."}\ngh: Validation Failed (HTTP 422)')
+
+        with pytest.raises(request_rereview.ReviewRequestRejected) as info:
+            request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner)
+
+        assert info.value.reason == "validation"
+        assert info.value.http_status == 422
+        assert info.value.retryable is False
+        assert "collaborators" in info.value.detail
+
+    def test_request_review_dry_run_calls_nothing(self):
+        def runner(cmd, **kwargs):
+            raise AssertionError("gh must not run on a dry run")
+
+        result = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True)
+
+        assert result["dry_run"] is True and result["posted"] is False
+        assert result["reviewer"] == COPILOT_REQUEST
+
+    def test_confirm_posted_after_uncertain_same_second_counts(self):
+        events = [{"event": "review_requested", "actor": {"login": "agent"}, "created_at": T_REQUEST,
+                   "requested_reviewer": {"login": "Copilot", "type": "Bot"}}]
+        runner = lambda cmd, **kwargs: _completed(cmd, events)  # noqa: E731
+
+        assert request_rereview.confirm_posted_after_uncertain(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_REQUEST, runner=runner
+        ) is True
+        assert request_rereview.confirm_posted_after_uncertain(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:06Z", runner=runner
+        ) is False
+        assert request_rereview.confirm_posted_after_uncertain(
+            "acme/widget", 159, review_vendors.COPILOT, "someone-else", T_REQUEST, runner=runner
+        ) is False
+
+    def test_resolve_reviewer_login_prefers_explicit_then_persisted_then_mention(self, monkeypatch):
+        monkeypatch.setattr(request_rereview, "read_persisted_reviewer", lambda repo, pr: {"login": "persisted-bot"})
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login="explicit-bot", reviewer_mention="@m") == "explicit-bot"
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "persisted-bot"
+        monkeypatch.setattr(request_rereview, "read_persisted_reviewer", lambda repo, pr: None)
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "m"
+        assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) is None
+
+
+class TestReviewRequestMain:
+    """main() routes a review_request vendor away from the comment path."""
+
+    @staticmethod
+    def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def", pending_since=None):
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: used)
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: None if state is None else {
+                "state": state, "head": head, "pending_since": pending_since,
+                "first_completed_review_at": T_FIRST_REVIEW,
+            },
+        )
+        monkeypatch.setattr(
+            request_rereview, "post_rereview",
+            lambda *a, **k: pytest.fail("a review_request vendor must never get a comment"),
+        )
+
+    @staticmethod
+    def _fake_request(sink):
+        def fake(repo, pr, request_login, **kwargs):
+            sink["login"] = request_login
+            sink["calls"] = sink.get("calls", 0) + 1
+            if kwargs.get("dry_run"):
+                return {"created_at": None, "repo": repo, "pr": pr, "kind": "review_request",
+                        "reviewer": request_login, "dry_run": True, "posted": False}
+            return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
+                    "reviewer": request_login, "posted": True}
+        return fake
+
+    @staticmethod
+    def _run(args):
+        return request_rereview.main(["--repo", "acme/widget", "--pr", "159", *args])
+
+    @staticmethod
+    def _stamped(tmp_path):
+        path = request_rereview.state_path()
+        if not path.exists():
+            return 0
+        return json.loads(path.read_text(encoding="utf-8")).get("acme/widget#159", {}).get("run", {}).get("rereviews_posted", 0)
+
+    def test_copilot_login_requests_a_review_instead_of_commenting(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request(requested))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert requested["login"] == COPILOT_REQUEST
+        assert payload["kind"] == "review_request"
+        assert payload["created_at"] == CREATED_AT
+        assert payload["state"] == "ABSENT"
+        assert payload["replaced_stale_request"] is False
+
+    def test_persisted_copilot_with_a_stale_mention_trigger_still_requests_a_review(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.state_path().write_text(json.dumps({
+            "acme/widget#159": {"reviewer": {"login": COPILOT_LOGIN, "review_trigger": "@copilot"}}
+        }), encoding="utf-8")
+        self._stub_reads(monkeypatch)
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request(requested))
+
+        assert self._run(["--json"]) == 0
+
+        assert requested["login"] == COPILOT_REQUEST
+        assert json.loads(capsys.readouterr().out)["kind"] == "review_request"
+
+    def test_pending_state_posts_nothing_and_skips_the_cap(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: pytest.fail("no cap read when nothing is posted"))
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("pending: must not request"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_pending"
+        assert payload["posted"] is False
+        assert payload["pending_since"] == T_REQUEST
+
+    def test_already_reviewed_head_posts_nothing(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, state="COMPLETED_HEAD")
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("head already reviewed"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "already_reviewed_head"
+        assert payload["posted"] is False
+        assert "abc1234" in payload["message"]
+
+    def test_head_mismatch_posts_nothing(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("head mismatch: must not request"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--expect-head", "zzz9999", "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "head_mismatch"
+        assert payload["posted"] is False
+        assert payload["expected_head"] == "zzz9999" and payload["head"] == "abc1234def"
+
+    def test_stale_pending_reposts_and_flags_it(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request(requested))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert requested["calls"] == 1
+        assert payload["state"] == "STALE_PENDING"
+        assert payload["replaced_stale_request"] is True
+
+    def test_unknown_state_refuses_to_post(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, state=None)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("unknown state: must not request"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "uncountable_count"
+
+    def test_rejected_422_is_validation_and_not_stamped(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+
+        def rejecting(*a, **k):
+            raise request_rereview.ReviewRequestRejected("Copilot code review is not enabled", reason="validation", http_status=422, retryable=False)
+
+        monkeypatch.setattr(request_rereview, "request_review", rejecting)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_rejected"
+        assert payload["reason"] == "validation"
+        assert payload["http_status"] == 422
+        assert payload["retryable"] is False
+        assert payload["posted"] is False
+        assert "not enabled" in payload["message"]
+        assert self._stamped(tmp_path) == 0
+
+    def test_rate_limit_is_retryable(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+
+        def rejecting(*a, **k):
+            raise request_rereview.ReviewRequestRejected("secondary rate limit", reason="rate_limited", http_status=403, retryable=True)
+
+        monkeypatch.setattr(request_rereview, "request_review", rejecting)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["reason"] == "rate_limited" and payload["retryable"] is True
+
+    def test_uncertain_failure_confirmed_by_timeline_is_a_success_and_stamped_once(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+
+        def rejecting(*a, **k):
+            raise request_rereview.ReviewRequestRejected("connection reset", reason="uncertain", http_status=None, retryable=False, requested_at=CREATED_AT)
+
+        monkeypatch.setattr(request_rereview, "request_review", rejecting)
+        monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["kind"] == "review_request"
+        assert payload["confirmed_after_uncertain"] is True
+        assert payload["created_at"] == CREATED_AT
+        assert self._stamped(tmp_path) == 1
+
+    def test_uncertain_failure_without_event_is_not_retryable_and_not_stamped(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+
+        def rejecting(*a, **k):
+            raise request_rereview.ReviewRequestRejected("connection reset", reason="uncertain", http_status=None, retryable=False, requested_at=CREATED_AT)
+
+        monkeypatch.setattr(request_rereview, "request_review", rejecting)
+        monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: False)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_rejected"
+        assert payload["reason"] == "uncertain"
+        assert payload["retryable"] is False
+        assert self._stamped(tmp_path) == 0
+
+    def test_cap_applies_to_review_requests_too(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, used=3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "capped" and payload["rereviews_used"] == 3
+
+    def test_uncountable_review_requests_refuse_to_post(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch, used=None)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("uncountable"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "uncountable_count"
+
+    def test_mention_passed_for_copilot_is_ignored_with_a_warning(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+        requested = {}
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request(requested))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--review-trigger-mention", "@copilot", "--json"]) == 0
+
+        out = capsys.readouterr()
+        assert "ignoring" in out.err
+        assert json.loads(out.out)["kind"] == "review_request"
+        assert requested["login"] == COPILOT_REQUEST
+
+    def test_dry_run_previews_and_stamps_nothing(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dry_run"] is True and payload["posted"] is False
+        assert payload["would_post"] is True and payload["state"] == "ABSENT"
+        assert self._stamped(tmp_path) == 0
+
+    def test_review_request_stamps_the_cycle_transition(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert self._stamped(tmp_path) == 1
+
+    def test_human_mode_names_the_reviewer_and_the_timestamp(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN]) == 0
+
+        out = capsys.readouterr().out
+        assert "[loop]" in out and "Copilot" in out and CREATED_AT in out
