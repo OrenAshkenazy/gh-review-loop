@@ -310,3 +310,32 @@ class TestSurveyPrecedence:
         parsed = pge.parse(body, "GLG: Follow up on your acceptance for Observability")
 
         assert parsed["kind"] == "followup"
+
+
+class TestExpiryMatchesTheDetectedKind:
+    def test_a_followup_reports_its_own_token_expiry(self):
+        """A follow-up that quotes the earlier accept URL carries two tokens
+        with different lifetimes; reporting the accept token's expiry can show
+        a deadline that has passed for work that is still open (PR #116
+        review)."""
+        accept_exp = fake_jwt(1700000000)      # 2023, long gone
+        followup_exp = fake_jwt(EXP)           # 2026-10-21
+        body = (
+            f"Please answer: https://members.glgresearch.com/cm-accept-followup/abc?cpid=5&_session={followup_exp}\n"
+            f"> Earlier: https://members.glgresearch.com/accept/accept?cpid=5&_session={accept_exp}\n"
+        )
+
+        parsed = pge.parse(body, "GLG: Follow up on your acceptance for Observability")
+
+        assert parsed["kind"] == "followup"
+        assert parsed["accept_link_expires_at"] == "2026-10-21T10:30:03+00:00"
+
+    def test_an_invitation_reports_the_accept_token_expiry(self):
+        body = (
+            f"Review Project Now: https://members.glgresearch.com/accept/accept?cpid=9&_session={fake_jwt(EXP)}\n"
+        )
+
+        parsed = pge.parse(body, "Developer Observability consultation - GLG")
+
+        assert parsed["kind"] == "invitation"
+        assert parsed["accept_link_expires_at"] == "2026-10-21T10:30:03+00:00"

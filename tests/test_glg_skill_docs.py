@@ -160,3 +160,21 @@ def test_profile_sourcing_excludes_attestations():
     lowered = text.lower()
     assert "attestation" in lowered
     assert "triage" in lowered
+
+
+def test_triage_reads_the_submission_history_from_the_script():
+    """Step 5 writes submissions.jsonl for reuse, but triage never read it, so
+    a project finished in an earlier session was offered again — and an accept
+    confirmation often has no cpid to tie it back (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    assert "answer_bank.py\" handled" in text or "answer_bank.py handled" in text
+    assert "--project \"" not in text
+    assert "--detail \"" not in text
+
+
+def test_the_logging_template_passes_the_title_by_file():
+    text = (REFERENCES / "answer-bank.md").read_text(encoding="utf-8")
+
+    assert "--project-file" in text
+    assert "--project \"<title>\"" not in text

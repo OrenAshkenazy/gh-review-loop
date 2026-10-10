@@ -280,3 +280,49 @@ def test_an_overlapping_entity_still_matches(tmp_path, monkeypatch):
     hits = bank.lookup("How familiar are you with Datadog?")
 
     assert hits and hits[0]["value"] == ["both"]
+
+
+def test_log_submission_accepts_its_text_from_files(tmp_path, monkeypatch, capsys):
+    """Project titles come from email subjects, so `--project "<title>"` is the
+    same shell-interpolation sink as the subject and question ones (PR #116
+    review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    project = tmp_path / "project.txt"
+    project.write_text('Observability $(whoami) `id`\n', encoding="utf-8")
+    detail = tmp_path / "detail.txt"
+    detail.write_text("4 rows, 1 NEEDS MEMBER\n", encoding="utf-8")
+
+    rc = bank.main([
+        "log", "--project-file", str(project), "--detail-file", str(detail),
+        "--cpid", "123", "--action", "submitted",
+    ])
+
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["project"] == "Observability $(whoami) `id`"
+    assert record["detail"] == "4 rows, 1 NEEDS MEMBER"
+
+
+def test_handled_lists_projects_already_submitted_or_declined(tmp_path, monkeypatch):
+    """Triage must be able to ask what it already did: an accept confirmation
+    often has no cpid, so grouping mail by cpid cannot associate it with the
+    earlier invitation and the same project gets offered again (PR #116
+    review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.log_submission(project="Observability Platforms", cpid="111", action="submitted")
+    bank.log_submission(project="Cloud Security", cpid="222", action="declined")
+    bank.log_submission(project="Observability Platforms", cpid="111", action="submitted")
+
+    handled = bank.handled()
+
+    assert {entry["project"] for entry in handled} == {"Observability Platforms", "Cloud Security"}
+    by_cpid = {entry["cpid"]: entry for entry in handled}
+    assert by_cpid["111"]["action"] == "submitted"
+    assert by_cpid["222"]["action"] == "declined"
+    # One row per project, newest wins, so triage can match on either key.
+    assert len(handled) == 2
+
+
+def test_handled_is_empty_without_a_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    assert bank.handled() == []

@@ -303,6 +303,40 @@ def read_text_arg(value: str | None, path: Path | None) -> str:
     return value
 
 
+def handled() -> list[dict[str, Any]]:
+    """One row per project this member already accepted, declined or submitted.
+
+    Triage needs this before it offers anything: an accept confirmation often
+    carries no `cpid`, so grouping mail by `cpid` cannot tie it back to the
+    invitation, and the same finished project would be offered again. Newest
+    outcome per project wins; the `cpid` is kept so triage can match on either
+    key.
+    """
+    path = log_path()
+    if not path.exists():
+        return []
+    rows: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        key = (record.get("project") or record.get("cpid") or "").strip()
+        if not key:
+            continue
+        rows[key] = {
+            "project": record.get("project"),
+            "cpid": record.get("cpid"),
+            "action": record.get("action"),
+            "at": record.get("at"),
+        }
+    return list(rows.values())
+
+
 def _parse_value(raw: str) -> Any:
     try:
         return json.loads(raw)
@@ -334,10 +368,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="print every stored answer")
 
     log = sub.add_parser("log", help="record an accept, decline or submit")
-    log.add_argument("--project", required=True)
+    log.add_argument("--project")
+    log.add_argument("--project-file", type=Path, help="read the project title from a file, or - for stdin")
     log.add_argument("--cpid")
     log.add_argument("--action", required=True, choices=["accepted", "declined", "submitted", "skipped"])
     log.add_argument("--detail", default="")
+    log.add_argument("--detail-file", type=Path, help="read the detail text from a file, or - for stdin")
+
+    sub.add_parser("handled", help="projects already accepted, declined or submitted")
 
     args = parser.parse_args(argv)
 
@@ -364,8 +402,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "list":
         result = load_entries()
+    elif args.command == "handled":
+        result = handled()
     else:
-        result = log_submission(args.project, args.cpid, args.action, args.detail)
+        result = log_submission(
+            read_text_arg(args.project, args.project_file),
+            args.cpid,
+            args.action,
+            read_text_arg(args.detail, args.detail_file) if (args.detail or args.detail_file) else "",
+        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
