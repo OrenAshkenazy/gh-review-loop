@@ -34,10 +34,28 @@ STOPWORDS = {
 }
 
 
+# The bank holds employment, customer-relationship and conflict answers, so
+# the directory and its files are the member's alone: 0700 / 0600 regardless of
+# the process umask, and an existing looser mode is repaired on use. mkdir's
+# mode argument is masked by the umask, so the chmod is the actual guarantee.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+
+def _restrict(path: Path, mode: int) -> None:
+    """Best-effort owner-only permissions; never fail the operation over it."""
+    try:
+        if (path.stat().st_mode & 0o777) != mode:
+            path.chmod(mode)
+    except OSError:
+        pass
+
+
 def state_dir() -> Path:
     override = os.environ.get("GLGQ_STATE_DIR")
     base = Path(override) if override else Path.home() / ".config" / "glg-questionnaire"
     base.mkdir(parents=True, exist_ok=True)
+    _restrict(base, DIR_MODE)
     return base
 
 
@@ -66,6 +84,11 @@ def load_entries() -> list[dict[str, Any]]:
 
 
 def _append(path: Path, record: dict[str, Any]) -> None:
+    # Created owner-only before the first byte is written, so an answer is
+    # never world-readable even briefly.
+    if not path.exists():
+        path.touch(mode=FILE_MODE)
+    _restrict(path, FILE_MODE)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 

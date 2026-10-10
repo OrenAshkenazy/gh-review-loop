@@ -1,10 +1,12 @@
 # Privacy and Data Handling
 
-**Last updated: 2026-06-04**
+**Last updated: 2026-10-10**
 
 ## Summary
 
 `gh-review-loop` is a Claude Code plugin that runs locally on your machine.
+
+This policy covers both plugins published from this repository: `gh-review-loop` and `glg-questionnaire`. Everything below describes `gh-review-loop` unless a section names `glg-questionnaire`, which reads different data and writes to a separate directory — see "The glg-questionnaire plugin".
 
 The plugin author does not operate a backend service, does not receive your PR data, and does not collect telemetry, analytics, crash reports, prompts, repository names, usernames, or usage data.
 
@@ -146,6 +148,48 @@ To disable or uninstall the plugin, use Claude Code's plugin manager:
 ```
 
 Then use the Installed tab to disable or uninstall `gh-review-loop`.
+
+## The glg-questionnaire plugin
+
+`glg-questionnaire` also runs entirely locally. The plugin author does not operate a backend service for it, receives none of its data, and collects no telemetry from it.
+
+### Data it may read
+
+With the user's Gmail connector, it searches for and reads messages from GLG (`from:glgroup.com`): subject, body, project title and identifier, hourly rate, client description, research-manager address, link expiry, and the question-and-answer pairs GLG records in an acceptance confirmation.
+
+Through the browser the user is already signed in to at `members.glgresearch.com`, it reads the questionnaire page — its questions, options and the answers filled in — and takes screenshots of the filled form to show the user before anything is submitted. It submits only what the user explicitly approves.
+
+Neither the email contents nor the questionnaire contents are sent to the plugin author, and nothing is sent to any third party by the plugin itself. The Gmail and browser connectors are the user's own, operated under their own terms; this plugin adds no destination of its own.
+
+### Local files it writes
+
+Under `~/.config/glg-questionnaire` (overridable with `GLGQ_STATE_DIR`), created with owner-only permissions (directory `0700`, files `0600`):
+
+`profile.md` holds the standing facts the member wrote themselves: employment status and current employer, standing hourly rate, areas of expertise, vendor relationships, procurement roles, organisation facts, and the topics they always decline.
+
+`answers.jsonl` is an append-only record of answers the member authored — either typed by them or seeded from what GLG recorded them saying on a previous project — with the question, a normalized form of it, the value, an optional note, the project it came from, and timestamps. Per-project attestations (current employer, conflicts, recording consent, blinded-client acknowledgements) are deliberately never stored.
+
+`submissions.jsonl` is an append-only log of outcomes: project title, consultation identifier, action taken (submitted, declined, accepted) and the time.
+
+These files can contain employment, customer-relationship and conflict information. They are local, are never transmitted by the plugin, and should not be committed to a repository.
+
+### Controls
+
+To review what is stored:
+
+```bash
+python3 .../scripts/answer_bank.py list
+```
+
+To remove a single kind of record, or all of it:
+
+```bash
+rm ~/.config/glg-questionnaire/answers.jsonl
+rm ~/.config/glg-questionnaire/submissions.jsonl
+rm -rf ~/.config/glg-questionnaire
+```
+
+To disable or uninstall the plugin, use `/plugin` and the Installed tab, as above, selecting `glg-questionnaire`.
 
 ## Contact
 

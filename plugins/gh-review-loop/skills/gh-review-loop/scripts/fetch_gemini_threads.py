@@ -1260,11 +1260,18 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
-    if (overview.get("open_findings") or 0) > 0:
+    open_findings = overview.get("open_findings") or 0
+    if open_findings > 0:
         if known_thread_ids is None or overview.get("unlinked_findings"):
             return "overview_reports_open_findings"
         linked = overview.get("finding_ids") or []
-        if not linked or any(fid not in known_thread_ids for fid in linked):
+        # `open_findings` is the authoritative count; `finding_ids` is only what
+        # the parser could recognize. Fewer links than findings means one is
+        # unaccounted for — a markup change that drops a severity icon must not
+        # read as clean just because the links that did parse are known.
+        if len(linked) < open_findings:
+            return "overview_reports_open_findings"
+        if any(fid not in known_thread_ids for fid in linked):
             return "overview_reports_open_findings"
     return None
 

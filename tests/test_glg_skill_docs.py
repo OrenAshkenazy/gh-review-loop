@@ -51,3 +51,35 @@ def test_hard_rules_survive():
 def test_compliance_reference_quotes_the_ai_clause():
     text = (REFERENCES / "compliance.md").read_text(encoding="utf-8")
     assert "may not use or rely upon AI-generated content" in text
+
+
+def test_script_commands_resolve_the_plugin_root_for_both_runtimes():
+    """The plugin ships a .codex-plugin manifest, and Codex does not set
+    CLAUDE_PLUGIN_ROOT. A bare ${CLAUDE_PLUGIN_ROOT} expands to nothing there
+    and the command fails before triage begins (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    assert "GLGQ_PLUGIN_ROOT" in text
+    # The resolver must offer a non-Claude path: the Codex install location.
+    assert ".codex/plugins" in text
+    for line in text.splitlines():
+        if "scripts/parse_glg_email.py" in line or "scripts/answer_bank.py" in line:
+            assert "CLAUDE_PLUGIN_ROOT" not in line, line
+            assert "GLGQ_PLUGIN_ROOT" in line, line
+
+
+def test_privacy_policy_covers_this_plugin():
+    """The Codex manifest links the repo policy; that policy must actually
+    disclose what this plugin reads and stores (PR #116 review)."""
+    import json as _json
+
+    manifest = _json.loads(
+        (SKILL_DIR.parent.parent / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    url = _json.dumps(manifest)
+    assert "PRIVACY" in url
+
+    policy = (REPO_ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+    assert "glg-questionnaire" in policy
+    for needle in ("Gmail", "~/.config/glg-questionnaire", "answers.jsonl", "submissions.jsonl"):
+        assert needle in policy, needle

@@ -109,3 +109,32 @@ def test_cli_seed(tmp_path, capsys):
     }))
     assert bank.main(["seed", "--from-parsed", str(parsed)]) == 0
     assert len(json.loads(capsys.readouterr().out)["added"]) == 1
+
+
+def test_state_dir_and_data_files_are_owner_only(tmp_path, monkeypatch):
+    """The bank holds employment, customer and conflict answers. On a shared
+    box with the usual 022 umask these landed as 0644 in a 0755 directory,
+    readable by every local user (PR #116 review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr("os.umask", lambda mask: 0o022)
+
+    bank.add_entry("Role in procurement", "Key Decision Maker")
+    bank.log_submission(project="P", cpid="1", action="submitted")
+
+    assert bank.state_dir().stat().st_mode & 0o777 == 0o700
+    assert bank.answers_path().stat().st_mode & 0o777 == 0o600
+    assert bank.log_path().stat().st_mode & 0o777 == 0o600
+
+
+def test_existing_loose_permissions_are_tightened(tmp_path, monkeypatch):
+    base = tmp_path / "state"
+    base.mkdir(mode=0o755)
+    answers = base / "answers.jsonl"
+    answers.write_text("", encoding="utf-8")
+    answers.chmod(0o644)
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(base))
+
+    bank.add_entry("Vendors evaluated", "Datadog")
+
+    assert base.stat().st_mode & 0o777 == 0o700
+    assert answers.stat().st_mode & 0o777 == 0o600

@@ -911,6 +911,60 @@ def request_review(
     }
 
 
+def cancel_review_request(
+    repo: str,
+    pr: int,
+    request_login: str,
+    runner: Any = None,
+) -> bool:
+    """Withdraw an open review request for ``request_login``; True on success.
+
+    A request that has been pending past ``STALE_REQUEST_SECONDS`` is probably
+    abandoned, but age cannot prove it: GraphQL still lists it, and GitHub does
+    not dedupe, so posting a second request while the first is live produces
+    two reviews (spec §3, LV-4). Replacing it means withdrawing it first. Never
+    raises — the caller must be able to refuse to post when this fails.
+    """
+    if runner is None:
+        runner = subprocess.run
+    owner, repo_name = parse_repo(repo)
+    if not request_login:
+        return False
+    cmd = [
+        "gh",
+        "api",
+        f"repos/{owner}/{repo_name}/pulls/{pr}/requested_reviewers",
+        "--method",
+        "DELETE",
+        "--raw-field",
+        f"reviewers[]={request_login}",
+    ]
+    try:
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def stale_not_replaced_payload(repo: str, pr: int, reviewer: str, pending_since: str | None) -> dict[str, Any]:
+    since = f" since {pending_since}" if pending_since else ""
+    return {
+        "status": "stale_request_not_replaced",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "pending_since": pending_since,
+        "message": (
+            f"A review request for `{reviewer}` has been pending{since} and could not "
+            "be withdrawn, so no second request was posted (two live requests produce "
+            "two reviews). Wait for the pending review, or remove the reviewer on the "
+            "PR and run this again."
+        ),
+    }
+
+
 def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -954,6 +1008,15 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
             return 0
         if used >= cap:
             _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
+            return 0
+    # The open request is withdrawn only once the cap has cleared, so a refusal
+    # never leaves the PR with nothing pending. A dry run withdraws nothing.
+    if state["state"] == "STALE_PENDING" and not args.dry_run:
+        if not cancel_review_request(args.repo, args.pr, reviewer):
+            _emit(
+                stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"]),
+                json_output=json_output,
+            )
             return 0
     try:
         payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)

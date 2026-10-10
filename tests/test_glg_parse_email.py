@@ -185,3 +185,29 @@ class TestLinkHostTrust:
 
     def test_opportunities_without_consultation_ids_is_not_a_decline(self):
         assert pge.classify_link("https://members.glgresearch.com/opportunities") == "members"
+
+
+class TestMalformedUrls:
+    """One malformed URL must not take the whole email down.
+
+    The link regex hands every URL in the body to classify_link, so a single
+    `https://[foo` would raise ValueError out of urlsplit and abort triage for
+    an email that also carries a valid accept link (PR #116 review).
+    """
+
+    @pytest.mark.parametrize("url", [
+        "https://[foo",
+        "https://members.glgresearch.com:99999/accept/accept",
+        "http://[::1zz]/accept/accept",
+    ])
+    def test_malformed_urls_classify_as_other(self, url):
+        assert pge.classify_link(url) == "other"
+
+    def test_a_valid_link_survives_a_malformed_one_in_the_same_email(self):
+        good = "https://members.glgresearch.com/accept/accept?cpid=198515470"
+        body = f"Broken: https://[foo\nReview Project Now: {good}\n"
+
+        links = pge.extract_links(body)
+
+        assert [link["role"] for link in links] == ["accept"]
+        assert links[0]["url"] == good

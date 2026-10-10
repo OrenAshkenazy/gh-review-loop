@@ -1260,17 +1260,58 @@ class TestReviewRequestMain:
         assert payload["posted"] is False
         assert payload["expected_head"] == "zzz9999" and payload["head"] == "abc1234def"
 
-    def test_stale_pending_reposts_and_flags_it(self, monkeypatch, capsys):
+    def test_stale_pending_cancels_the_open_request_before_reposting(self, monkeypatch, capsys):
+        """GraphQL still lists the request, and the design evidence records
+        that posting while one is pending produces two reviews. Age alone does
+        not prove abandonment, so the open request is explicitly cancelled
+        first — never left live alongside a second one (PR #116 review)."""
         self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        cancelled = {}
+        monkeypatch.setattr(
+            request_rereview, "cancel_review_request",
+            lambda repo, pr, login, **kw: cancelled.update(login=login, calls=cancelled.get("calls", 0) + 1) or True,
+        )
         requested = {}
         monkeypatch.setattr(request_rereview, "request_review", self._fake_request(requested))
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
         payload = json.loads(capsys.readouterr().out)
+        assert cancelled == {"login": COPILOT_REQUEST, "calls": 1}
         assert requested["calls"] == 1
         assert payload["state"] == "STALE_PENDING"
         assert payload["replaced_stale_request"] is True
+
+    def test_stale_pending_posts_nothing_when_the_request_cannot_be_cancelled(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        monkeypatch.setattr(request_rereview, "cancel_review_request", lambda *a, **k: False)
+        monkeypatch.setattr(
+            request_rereview, "request_review",
+            lambda *a, **k: pytest.fail("a still-pending request must not be doubled"),
+        )
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "stale_request_not_replaced"
+        assert payload["posted"] is False
+        assert self._stamped(tmp_path) == 0
+
+    def test_stale_pending_dry_run_cancels_nothing(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        monkeypatch.setattr(
+            request_rereview, "cancel_review_request",
+            lambda *a, **k: pytest.fail("a dry run must not cancel a real review request"),
+        )
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dry_run"] is True and payload["would_post"] is True
+        assert self._stamped(tmp_path) == 0
 
     def test_unknown_state_refuses_to_post(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, state=None)
@@ -1508,3 +1549,27 @@ class TestUncertainPayload:
         assert payload["status"] == "review_request_rejected"
         assert payload["posted"] is False
         assert "Nothing was posted" in payload["message"]
+
+
+class TestCancelReviewRequest:
+    def test_cancel_uses_the_delete_endpoint(self):
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _completed(cmd, {"number": 159})
+
+        assert request_rereview.cancel_review_request(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner
+        ) is True
+        assert captured["cmd"] == [
+            "gh", "api", "repos/acme/widget/pulls/159/requested_reviewers",
+            "--method", "DELETE", "--raw-field", f"reviewers[]={COPILOT_REQUEST}",
+        ]
+
+    def test_cancel_reports_failure_instead_of_raising(self):
+        failing = lambda cmd, **kwargs: _completed(cmd, None, rc=1, stderr="gh: Not Found (HTTP 404)")  # noqa: E731
+
+        assert request_rereview.cancel_review_request(
+            "acme/widget", 159, COPILOT_REQUEST, runner=failing
+        ) is False

@@ -22,6 +22,53 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **A still-pending Copilot request is never doubled.** `STALE_PENDING` fell
+  through to a second POST while GraphQL still listed the first request as
+  pending, and the design evidence records that producing two reviews. Age
+  alone cannot prove abandonment, so the open request is now explicitly
+  withdrawn (`cancel_review_request()`) after the cap clears and before the
+  repost; a withdrawal that fails posts nothing and reports
+  `stale_request_not_replaced`. A dry run withdraws nothing.
+
+- **`glg-questionnaire` resolves its plugin root on both runtimes.** The skill
+  addressed its scripts through `${CLAUDE_PLUGIN_ROOT}`, which is unset under
+  Codex, where the plugin is also published — the command expanded to
+  `/skills/glg-questionnaire/...` and failed before triage. It now resolves
+  `GLGQ_PLUGIN_ROOT` from the Codex and Claude install locations, like the
+  other dual-runtime plugin.
+
+- **The loop's workflow routes `review_request_uncertain`.** Step 8 said every
+  status means nothing was posted and then captured `created_at`, which the
+  uncertain payload deliberately lacks — an agent following it would build a
+  broken wait or re-request a review GitHub may have accepted. The uncertain
+  status now routes to the delayed state re-read, and `created_at` is captured
+  only from a posted result.
+
+- **A malformed URL no longer aborts GLG triage.** `urlsplit()` raises
+  `ValueError` on input like `https://[foo` or an out-of-range port, so one
+  broken link in a forwarded email took down parsing of a message that also
+  carried a valid invitation. Such URLs classify as `other`.
+
+- **The clean gate blocks when the overview count exceeds the parsed links.**
+  `open_findings` is authoritative and `finding_ids` is only what the parser
+  recognized; two reported findings with one parsed link read as clean once
+  that link was known. Fewer links than findings now keeps
+  `overview_reports_open_findings`.
+
+- **Questionnaire answers are stored owner-only.** `answers.jsonl` and
+  `submissions.jsonl` were created `0644` in a `0755` directory under the usual
+  `022` umask, readable by every local account on a shared machine, and they
+  hold employment, customer and conflict answers. The directory is now `0700`
+  and the files `0600`, a looser existing mode is repaired, and the reference
+  tells the agent to create `profile.md` the same way.
+
+- **The marketplace privacy policy covers `glg-questionnaire`.** The Codex
+  manifest linked a policy describing only `gh-review-loop`, GitHub data and
+  `~/.config/gh-review-loop`. PRIVACY.md now discloses what the GLG plugin
+  reads (Gmail messages from GLG, the questionnaire page in the member's own
+  browser) and what it stores under `~/.config/glg-questionnaire`, with its own
+  removal controls. Existing text was added to, not rewritten.
+
 - **GLG action links are trusted by host, not by substring.** `classify_link()`
   matched `members.glgresearch.com` anywhere in the URL, so a crafted or
   forwarded email could present
