@@ -169,6 +169,29 @@ The loop may call a Copilot PR clean only when **all** hold:
 investigate", never as DONE. If the overview says `0 open findings` but actionable
 threads exist, threads win (the overview is never a reason to drop a thread).
 
+**Amendment (final review, 2026-10-10).** Rule 3 as written deadlocked two
+ordinary situations, so it is narrowed:
+
+- *Dispositioned findings.* The overview is a snapshot at review time; thread
+  state is live. When the head overview reports `open_findings > 0` but every
+  finding it links to has a thread on the PR (any state: resolved, outdated,
+  addressed-by-reply, or filtered by `--min-severity`), the normal thread
+  classification has already decided the PR and the count does not block.
+  `overview_reports_open_findings` is emitted only when a reported finding has
+  no thread link, or links to a thread the fetch cannot see (page limit,
+  deleted thread). Without a push the loop can now end at "clean" the way it
+  does for Gemini and Codex.
+- *Unreadable head review.* The newest vendor review **of the head commit** is
+  the overview record even when its body does not parse: `covers_head: true`,
+  `complete: false`, `cleanBlockedBy: overview_unparseable`. `no_review_for_head`
+  is reserved for the case where no vendor review carries the head's
+  `commit.oid`, which is the only case where waiting or requesting can help.
+- `reviewerOverview` gains `finding_ids` (linked discussion ids) and
+  `unlinked_findings` so the gate's decision is auditable from the JSON.
+- `request_rereview.py` statuses are routing, not all stops: `review_pending` →
+  wait; `already_reviewed_head` → fetch; `head_mismatch` → confirm the push and
+  retry once; everything else stops.
+
 ### 5.4 Severity from the overview (requirement 6)
 
 - `parse_copilot_overview(body)` → `None` when the `<!-- ccr-overview` marker is

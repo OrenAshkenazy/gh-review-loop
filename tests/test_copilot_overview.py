@@ -10,6 +10,7 @@ from fetch_gemini_threads import (
     annotate_reviewer_severity,
     clean_blocked_by,
     copilot_overview_severities,
+    discussion_ids_on_pr,
     finding_fingerprint,
     latest_reviewer_overview,
     parse_copilot_overview,
@@ -227,9 +228,61 @@ def test_latest_reviewer_overview_reports_covers_head():
         "commit": "6f03c25000",
         "submitted_at": "2026-10-07T16:20:00Z",
         "url": PR_URL + "#pullrequestreview-2",
+        "finding_ids": [],
+        "unlinked_findings": 0,
     }
     stale = latest_reviewer_overview({**pr, "headRefOid": "9999999000"}, COPILOT)
     assert stale["covers_head"] is False
+
+
+def test_a_head_review_that_is_not_a_readable_overview_is_still_the_head_review():
+    # Copilot reviewed the head but the body has no overview we can parse
+    # (markup changed, or an empty body). That is "unparseable", not "no
+    # review for head": the waiter is already satisfied, so saying "wait"
+    # would send the loop into a dead end.
+    pr = _pr(
+        _review(OVERVIEW, "2026-10-07T15:46:14Z"),
+        _review("Looks fine.", "2026-10-07T16:20:00Z", commit="6f03c25000", url=PR_URL + "#pullrequestreview-2"),
+        head="6f03c25000",
+    )
+
+    overview = latest_reviewer_overview(pr, COPILOT)
+
+    assert overview["covers_head"] is True
+    assert overview["complete"] is False
+    assert overview["open_findings"] is None
+    assert overview["url"] == PR_URL + "#pullrequestreview-2"
+    assert overview["commit"] == "6f03c25000"
+    assert clean_blocked_by([], overview, review_request_vendor=True) == "overview_unparseable"
+
+
+def test_discussion_ids_on_pr_cover_every_thread_regardless_of_state():
+    pr = {"reviewThreads": {"nodes": [
+        {**_thread("T1", "11"), "isResolved": True},
+        {**_thread("T2", "22"), "isResolved": False, "isOutdated": True},
+        {"id": "T3", "comments": {"nodes": [{"url": PR_URL + "#discussion_r33"}]}},
+        {"id": "T4", "comments": {"nodes": [{"url": None}]}},
+    ]}}
+
+    assert discussion_ids_on_pr(pr) == {"11", "22", "33"}
+    assert discussion_ids_on_pr({}) == set()
+
+
+def test_open_findings_whose_threads_exist_on_the_pr_do_not_block_clean():
+    # The overview is a snapshot at review time; thread state is live. When
+    # every finding it links to has a thread on the PR (resolved, outdated,
+    # addressed, or filtered), the normal thread classification decided the
+    # PR's state and the snapshot count must not deadlock the loop.
+    head = {"approving": False, "open_findings": 2, "complete": True, "covers_head": True,
+            "finding_ids": ["11", "22"], "unlinked_findings": 0}
+
+    assert clean_blocked_by([], head, review_request_vendor=True, known_thread_ids={"11", "22", "99"}) is None
+    # A linked finding the fetch never saw (page cap, deleted thread): block.
+    assert clean_blocked_by([], head, review_request_vendor=True, known_thread_ids={"11"}) == "overview_reports_open_findings"
+    # A finding with no thread link at all cannot be dispositioned: block.
+    assert clean_blocked_by([], {**head, "unlinked_findings": 1}, review_request_vendor=True, known_thread_ids={"11", "22"}) == "overview_reports_open_findings"
+    # Without thread knowledge the gate stays conservative.
+    assert clean_blocked_by([], head, review_request_vendor=True) == "overview_reports_open_findings"
 
 
 def test_clean_blocked_by_table():
