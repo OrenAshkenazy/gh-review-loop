@@ -89,6 +89,33 @@ CODEX_PRIORITY_TO_SEVERITY = {
 }
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
+# Copilot puts severities in its review *overview* (the review body), one list
+# item per finding, each with an icon whose alt text is the severity and a
+# link to the inline thread's discussion anchor. The inline comments carry no
+# marker. Example item (picture sources elided):
+#   - <picture>…<img … alt="High severity" …></picture> [Title](#discussion_r4208919854) · New
+COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
+COPILOT_FINDING_RE = re.compile(
+    r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
+    r"\[(?P<title>[^\]\n]*)\]\(#discussion_r(?P<id>\d+)\)",
+    re.IGNORECASE,
+)
+COPILOT_SEVERITY_ICON_RE = re.compile(
+    r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
+)
+COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
+# "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
+COPILOT_OPEN_FINDINGS_RE = re.compile(
+    r"(?:<strong>|\*\*)(\d+) open findings?(?:</strong>|\*\*)", re.IGNORECASE
+)
+# Match approval phrasing only; enumerating every way Copilot can decline would
+# miss one, and an unrecognized decline read as approval dismisses a review.
+# Informational either way: the clean gate reads open_findings, not this.
+COPILOT_APPROVING_RE = re.compile(
+    r"^(ready to approve|approval recommended|approved?|lgtm|looks good)\b", re.IGNORECASE
+)
+DISCUSSION_ANCHOR_RE = re.compile(r"#discussion_r(\d+)$")
+
 # Page sizes embedded in QUERY below. Used by the pagination guard to detect
 # when we may be silently dropping data.
 PAGE_LIMIT_REVIEW_THREADS = 100
@@ -618,9 +645,14 @@ def _iter_comments(thread: dict[str, Any]) -> list[dict[str, Any]]:
 def thread_severity(thread: dict[str, Any]) -> str:
     """Return reviewer-assigned severity (critical/high/medium/low) or 'unknown'.
 
-    Gemini marks severity with a priority image; Codex uses a P0-P3 badge.
-    Both are unambiguous, so both are read regardless of selected reviewer.
+    A severity annotated onto the thread from the reviewer's overview (Copilot,
+    see ``annotate_reviewer_severity``) wins. Otherwise Gemini's priority image
+    or Codex's P0-P3 badge in a comment body decides; both are unambiguous, so
+    both are read regardless of selected reviewer.
     """
+    annotated = thread.get("reviewerSeverity")
+    if isinstance(annotated, str) and annotated in SEVERITY_ORDER and annotated != "unknown":
+        return annotated
     for comment in _iter_comments(thread):
         body = comment.get("body") or ""
         match = SEVERITY_RE.search(body)
@@ -994,6 +1026,151 @@ def review_request_count_complete(pull_request: dict[str, Any]) -> bool:
     """False when the timeline page is full, so the review-request count is a lower bound."""
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
     return len(nodes) < PAGE_LIMIT_TIMELINE
+
+
+def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
+    """Parse a Copilot review overview; None when ``body`` is not one.
+
+    ``complete`` is False when neither a heading nor an open-findings count
+    could be read; ``open_findings`` is then None so the clean gate cannot
+    treat the review as a confirmed zero.
+    """
+    if not isinstance(body, str) or COPILOT_OVERVIEW_MARKER not in body:
+        return None
+    heading = COPILOT_ASSESSMENT_RE.search(body)
+    assessment = ""
+    if heading:
+        # The heading opens with a status emoji ("🟡 Changes recommended").
+        assessment = re.sub(r"^\W+", "", heading.group("assessment")).strip()
+    findings = [
+        {
+            "severity": match.group("severity").lower(),
+            "discussion_id": match.group("id"),
+            "title": match.group("title").strip(),
+        }
+        for match in COPILOT_FINDING_RE.finditer(body)
+    ]
+    icon_count = len(COPILOT_SEVERITY_ICON_RE.findall(body))
+    open_match = COPILOT_OPEN_FINDINGS_RE.search(body)
+    open_findings = int(open_match.group(1)) if open_match else None
+    return {
+        "assessment": assessment,
+        "approving": bool(COPILOT_APPROVING_RE.match(assessment)),
+        "open_findings": open_findings,
+        "findings": findings,
+        "unlinked_findings": max(icon_count - len(findings), 0),
+        "complete": bool(assessment) and open_findings is not None,
+    }
+
+
+def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dict[str, Any]]:
+    return sorted(
+        filter_reviews(pull_request, author),
+        key=lambda review: review.get("submittedAt") or "",
+    )
+
+
+def copilot_overview_severities(
+    pull_request: dict[str, Any], author: str
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """discussion_id → {severity, review_url, commit} across ``author``'s overviews, newest wins.
+
+    Every overview is read, not only the newest: an open thread from cycle 1
+    that cycle 2's overview no longer lists would otherwise lose its grade.
+    Thread identity is the discussion id, which is stable across heads, so the
+    provenance (which review, which commit) travels with the grade. Findings an
+    overview lists without a discussion link have no thread to annotate; they
+    are reported as warnings so nothing is silently dropped.
+    """
+    severities: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for review in _reviews_oldest_first(pull_request, author):
+        parsed = parse_copilot_overview(review.get("body"))
+        if parsed is None:
+            continue
+        for finding in parsed["findings"]:
+            severities[finding["discussion_id"]] = {
+                "severity": finding["severity"],
+                "review_url": review.get("url"),
+                "commit": (review.get("commit") or {}).get("oid"),
+            }
+        if parsed["unlinked_findings"]:
+            warnings.append(
+                f"{parsed['unlinked_findings']} finding(s) in the {author} review "
+                f"overview at {review.get('url')} have no inline thread and are not "
+                "listed below."
+            )
+    return severities, warnings
+
+
+def annotate_reviewer_severity(
+    threads: list[dict[str, Any]], severities: dict[str, dict[str, Any]]
+) -> None:
+    """Attach overview severities (and their provenance) to threads by discussion anchor.
+
+    Additive only: a thread the overview does not grade is left exactly as it
+    was, so a parsing failure can never drop or demote a thread.
+    """
+    if not severities:
+        return
+    for thread in threads:
+        for comment in _iter_comments(thread):
+            match = DISCUSSION_ANCHOR_RE.search(comment.get("url") or "")
+            if match and match.group(1) in severities:
+                graded = severities[match.group(1)]
+                thread["reviewerSeverity"] = graded["severity"]
+                thread["reviewerSeveritySource"] = {
+                    "review_url": graded["review_url"],
+                    "commit": graded["commit"],
+                }
+                break
+
+
+def latest_reviewer_overview(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    """The newest overview by ``author`` with whether it covers the PR head, or None."""
+    head = pull_request.get("headRefOid") or ""
+    for review in reversed(_reviews_oldest_first(pull_request, author)):
+        parsed = parse_copilot_overview(review.get("body"))
+        if parsed is None:
+            continue
+        commit = (review.get("commit") or {}).get("oid")
+        return {
+            "assessment": parsed["assessment"],
+            "approving": parsed["approving"],
+            "open_findings": parsed["open_findings"],
+            "complete": parsed["complete"],
+            "covers_head": bool(commit) and commit == head,
+            "commit": commit,
+            "submitted_at": review.get("submittedAt"),
+            "url": review.get("url"),
+        }
+    return None
+
+
+def clean_blocked_by(
+    threads: list[dict[str, Any]],
+    overview: dict[str, Any] | None,
+    *,
+    review_request_vendor: bool,
+) -> str | None:
+    """Why zero actionable threads is *not yet* clean for a review-request vendor.
+
+    Threads always win: with any actionable thread the gate does not apply,
+    and the overview is never a reason to drop one. With none, a Copilot PR
+    is clean only when a complete overview on the current head reports zero
+    open findings (spec §5.3). Comment vendors have no overview gate.
+    """
+    if threads or not review_request_vendor:
+        return None
+    if overview is None or not overview.get("covers_head"):
+        return "no_review_for_head"
+    if not overview.get("complete") or overview.get("open_findings") is None:
+        return "overview_unparseable"
+    if (overview.get("open_findings") or 0) > 0:
+        return "overview_reports_open_findings"
+    return None
 
 
 def rereview_requests(
@@ -3668,6 +3845,21 @@ def main() -> int:
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
         threads.extend(review_body_findings(pull_request, args.author))
+        # Copilot grades findings in its overview, not inline; annotate before
+        # sorting so severity ordering and filters see the grade. Additive:
+        # an unparseable overview leaves every thread listed as `unknown`.
+        overview_severities, overview_warnings = copilot_overview_severities(
+            pull_request, args.author
+        )
+        annotate_reviewer_severity(threads, overview_severities)
+        reviewer_overview = latest_reviewer_overview(pull_request, args.author)
+        if reviewer_overview is not None:
+            reviewer_overview["warnings"] = overview_warnings
+        for warning in overview_warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        review_request_vendor = (
+            reviewer_resolver.trigger_kind_for(args.author) == "review_request"
+        )
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:
@@ -4187,7 +4379,18 @@ def main() -> int:
                         "advisory": clustering_advisory,
                     },
                     "reviewerSelection": reviewer_selection,
+                    # The selected vendor's newest review overview (Copilot),
+                    # with whether it covers the current head. Corroboration
+                    # for a clean PR, never a reason to drop a thread.
+                    "reviewerOverview": reviewer_overview,
                     "loopStatus": {
+                        # Set only for review-request vendors with zero
+                        # actionable threads whose overview cannot confirm
+                        # clean (spec §5.3); null means no block from here.
+                        "cleanBlockedBy": clean_blocked_by(
+                            threads, reviewer_overview,
+                            review_request_vendor=review_request_vendor,
+                        ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
                         "sessionCycle": _safe_int(
@@ -4249,6 +4452,35 @@ def main() -> int:
             ),
             end="",
         )
+        if reviewer_overview is not None:
+            count = reviewer_overview["open_findings"]
+            if count is None:
+                count_text, coverage = "? open findings", "unparsed"
+            else:
+                count_text = f"{count} open finding{'' if count == 1 else 's'}"
+                coverage = (
+                    "covers head" if reviewer_overview["covers_head"]
+                    else f"stale: {(reviewer_overview['commit'] or '')[:7]}"
+                )
+            print(
+                color_loop_block(
+                    f"[loop] reviewer overview: "
+                    f"{reviewer_overview['assessment'] or '(no assessment)'} — "
+                    f"{count_text} ({coverage})",
+                    enabled=color_enabled,
+                )
+            )
+        blocked = clean_blocked_by(
+            threads, reviewer_overview, review_request_vendor=review_request_vendor
+        )
+        if blocked:
+            print(
+                color_loop_block(
+                    f"[loop] not clean: {blocked} — wait for a {args.reviewer_name} "
+                    "review of the current head before calling this PR clean.",
+                    enabled=color_enabled,
+                )
+            )
         # The clustering warning is an ordering guard, so show it on the
         # initial fetch while the agent is deciding what to fix. Summary-mode
         # output repeats it later as an audit trail.
