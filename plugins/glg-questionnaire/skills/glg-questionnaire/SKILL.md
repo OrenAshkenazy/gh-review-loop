@@ -30,35 +30,30 @@ Requires: `python3` (3.10+); Gmail access (the Gmail connector) or an email the 
 | `references/browser-flow.md` | Opening the link, reading the form, filling, screenshotting, submitting, verifying |
 | `references/compliance.md` | Any employer, conflict, recording, blinded-client or non-public-information question; declining |
 
-## Script root
+## Prelude: paths and scratch space
 
-Both scripts are addressed through one runtime-neutral variable. `CLAUDE_PLUGIN_ROOT` is unset under Codex, where this plugin is also installed, so resolve it once per session as its own call:
-
-```bash
-GLGQ_PLUGIN_ROOT="${GLGQ_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
-if [ -z "$GLGQ_PLUGIN_ROOT" ]; then
-  GLGQ_PLUGIN_ROOT=$(
-    find ~/.codex/plugins ~/.codex/plugins/cache ~/.claude/plugins/cache \
-      -type d -path "*/skills/glg-questionnaire" 2>/dev/null \
-      | sort -rV | head -1 | sed 's|/skills/glg-questionnaire$||'
-  )
-fi
-export GLGQ_PLUGIN_ROOT
-```
-
-Empty after that means the plugin is not installed where either runtime can see it: say so and stop, rather than running a path that expands to `/skills/...`.
-
-## Scratch files
-
-Email bodies carry `_session` bearer tokens, and subjects, questions and parsed answers are the member's data. They never go in the working directory — mode `0644` there on a shared machine, committable by accident, and `body.txt` may clobber a project file. Make one owner-only directory per session, outside any checkout, and remove it when done:
+Each shell call is its own process: an exported variable **does not persist** to the next call, and an `EXIT` trap fires when that one call ends. So nothing here is set up "once" — put this prelude at the top of **every** command block below. Both lines are idempotent and cheap.
 
 ```bash
-umask 077
-GLGQ_WORK="$(mktemp -d "${TMPDIR:-/tmp}/glgq.XXXXXX")"
-trap 'rm -rf "$GLGQ_WORK"' EXIT   # or remove it yourself at the end of the session
+# 1. The scripts. CLAUDE_PLUGIN_ROOT is unset under Codex, where this plugin
+#    is also published, so fall back to the install locations.
+GLGQ_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(
+  find ~/.codex/plugins ~/.codex/plugins/cache ~/.claude/plugins/cache \
+    -type d -path "*/skills/glg-questionnaire" 2>/dev/null \
+    | sort -rV | head -1 | sed 's|/skills/glg-questionnaire$||'
+)}"
+# 2. Scratch space: one owner-only directory per user, outside any checkout.
+#    The path is derived, not remembered, so every call finds the same one.
+GLGQ_WORK="${TMPDIR:-/tmp}/glgq-$(id -u)"; mkdir -p "$GLGQ_WORK"; chmod 700 "$GLGQ_WORK"
 ```
 
-Every command below reads and writes inside `$GLGQ_WORK`.
+`GLGQ_PLUGIN_ROOT` empty after that means the plugin is not installed where either runtime can see it: say so and stop, rather than running a path that expands to `/skills/...`.
+
+Email bodies carry `_session` bearer tokens, and subjects, questions and parsed answers are the member's data, so they live in `$GLGQ_WORK` and never in the working directory — mode `0644` there on a shared machine, committable by accident, and `body.txt` may clobber a project file. At the end of the session remove it with its own explicit command (no trap: a trap would delete it the moment the setup call returned):
+
+```bash
+rm -rf "${TMPDIR:-/tmp}/glgq-$(id -u)"
+```
 
 ## Workflow
 

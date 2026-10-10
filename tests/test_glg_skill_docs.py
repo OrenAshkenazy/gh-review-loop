@@ -118,12 +118,12 @@ def test_scratch_files_are_private_and_cleaned_up():
     can clobber same-named project files (PR #116 review)."""
     text = SKILL_MD.read_text(encoding="utf-8")
 
-    assert "umask 077" in text
-    assert "mktemp -d" in text
+    assert "chmod 700" in text
+    assert "$GLGQ_WORK" in text
     # No bare redirect into the working directory.
     for line in text.splitlines():
         if ">" in line and (".txt" in line or ".json" in line):
-            assert "$GLGQ_WORK" in line or "umask" in line, line
+            assert "$GLGQ_WORK" in line, line
 
 
 def test_the_seeding_example_also_passes_the_subject_by_file():
@@ -131,3 +131,32 @@ def test_the_seeding_example_also_passes_the_subject_by_file():
 
     assert '--subject "' not in text
     assert "--subject-file" in text
+
+
+def test_the_docs_do_not_rely_on_shell_state_between_tool_calls():
+    """Each agent shell call is its own process: an exported variable does not
+    reach the next call, and an EXIT trap deletes the scratch directory the
+    moment its own call ends (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    lowered = text.lower()
+    assert "does not persist" in lowered or "not survive" in lowered
+    # Prose may explain why a trap is wrong here; no command may install one.
+    for line in text.splitlines():
+        assert not re.match(r"\s*trap\s+['\"]", line), line
+    # An explicit, separate cleanup command instead.
+    assert "rm -rf" in text
+    # The prelude belongs to every command block, not to one setup call.
+    assert "every" in lowered and "prelude" in lowered
+
+
+def test_profile_sourcing_excludes_attestations():
+    """"Everything in the profile is a PROFILE source" let the stored employer
+    answer a current-employer screen, which hard rule 3 sends to the member
+    every time (PR #116 review)."""
+    text = (REFERENCES / "answer-bank.md").read_text(encoding="utf-8")
+
+    assert "PROFILE" in text
+    lowered = text.lower()
+    assert "attestation" in lowered
+    assert "triage" in lowered

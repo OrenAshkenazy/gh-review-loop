@@ -256,3 +256,27 @@ def test_prior_project_questions_are_refused_in_either_word_order(question, tmp_
     assert bank.is_attestation(question), question
     with pytest.raises(bank.NotReusable):
         bank.add_entry(question, "None")
+
+
+def test_a_fuzzy_match_needs_the_same_entity(tmp_path, monkeypatch):
+    """Boilerplate dominates the similarity score: "current paying customer of
+    Datadog" vs "... of Splunk" scores ~0.79, well over the 0.55 threshold, so
+    an answer about one vendor was offered as BANK data for another (PR #116
+    review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.add_entry("Are you a current paying customer of Datadog?", "Yes")
+
+    assert bank.lookup("Are you a current paying customer of Splunk?") == []
+    assert bank.lookup("Are you currently using Azure?") == []
+
+    hits = bank.lookup("Are you a current paying customer of Datadog?")
+    assert hits and hits[0]["value"] == "Yes"
+
+
+def test_an_overlapping_entity_still_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    bank.add_entry("How familiar are you with Datadog and Grafana?", ["both"])
+
+    hits = bank.lookup("How familiar are you with Datadog?")
+
+    assert hits and hits[0]["value"] == ["both"]

@@ -22,6 +22,26 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The GLG docs no longer rely on shell state between tool calls.** Each
+  agent shell call is its own process, so the "resolve it once" plugin-root
+  block left `GLGQ_PLUGIN_ROOT` unset for every later command, and the scratch
+  directory's `EXIT` trap deleted it the moment the setup call returned. Both
+  are now a two-line prelude at the top of every command block, with a derived
+  per-user scratch path (`$TMPDIR/glgq-$(id -u)`, `chmod 700`) and an explicit
+  `rm -rf` at the end of the session.
+
+- **Attestations are excluded from `PROFILE` sourcing too.** "Everything in
+  the profile is a `PROFILE` source" let the stored employer answer a
+  current-employer screen that hard rule 3 sends to the member every time; if
+  employment changed since bootstrap that is a false compliance answer. Those
+  profile fields are for triage only, and such rows are `NEEDS MEMBER`.
+
+- **A fuzzy bank match must agree on the subject.** Boilerplate dominates the
+  similarity score — "current paying customer of Datadog" against "... of
+  Splunk" scores about 0.79, well over the 0.55 threshold — so `lookup()`
+  offered one vendor's answer for another. Decisive (non-boilerplate) tokens
+  must now overlap.
+
 - **The seeding example passes its subject by file too.** The earlier shell
   fix covered SKILL.md but left `references/answer-bank.md` instructing the
   agent to substitute `<subject>` inside a double-quoted argument.
