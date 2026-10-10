@@ -4350,7 +4350,7 @@ class TestHeadAnchoredWait:
         assert second["status"] == "ready"
 
 
-class TestReviewerDiscoveryFetch:
+class TestReviewerDiscoverySources:
     def test_single_page_discovery_keeps_reviews_and_pending_requests(self, monkeypatch):
         payload = {"data": {"repository": {"pullRequest": {
             "number": 1,
