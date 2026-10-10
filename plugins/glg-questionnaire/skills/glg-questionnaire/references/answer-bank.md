@@ -35,7 +35,7 @@ Headcount band, industry, region, last RFP dates, other vendors evaluated.
 Topics, client types or conditions the member always declines (e.g. "recorded calls: ask me", "single-blinded: decline", "anything about <current employer>").
 ```
 
-Everything in the profile is a `PROFILE` source on the answer sheet. If a question needs a fact the profile lacks, ask, then offer to add it to the profile.
+Everything in the profile is a `PROFILE` source on the answer sheet **except the attestation classes** — current employer, conflicts, recording consent, blinded clients, pending trials, government roles, public-company employment within six months, other GLG projects. Those profile fields exist for triage (judging fit, applying the decline rules) and never fill a questionnaire row: employment changes, and a stale answer there is a false compliance attestation. On the sheet they are `NEEDS MEMBER` every time, exactly as if the profile did not hold them. If a question needs a fact the profile lacks, ask, then offer to add it to the profile.
 
 ## answers.jsonl (append-only, one JSON object per line)
 

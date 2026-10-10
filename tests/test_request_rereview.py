@@ -1607,7 +1607,13 @@ class TestRequestProvenance:
         # A comment vendor's pings are recorded against that vendor only.
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.CODEX) == []
 
-    def test_manual_requests_do_not_consume_the_cap(self, monkeypatch, tmp_path):
+    def test_requests_with_no_local_record_are_uncountable_not_free(self, monkeypatch, tmp_path):
+        """Requests exist under this login but the loop has no record of
+        posting them: they may be the member's clicks or the loop's own after a
+        cleared state dir. Charging them to the loop stops a first run as
+        capped; calling them zero lets every pushed head post another request
+        past the cap. Neither is a guess worth making, so the count is unknown
+        and the caller refuses to post (PR #116 review)."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         manual = _rest_request_events([
             ("agent", "2026-10-07T16:00:00Z"),
@@ -1619,11 +1625,19 @@ class TestRequestProvenance:
             assert cmd[3].endswith("/timeline")
             return _completed(cmd, manual)
 
-        used = request_rereview.count_agent_review_requests(
+        assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
-        )
+        ) is None
 
-        assert used == 0
+    def test_no_record_and_no_requests_is_a_verified_zero(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, _rest_request_events([("a-human", "2026-10-07T16:30:00Z")]))
+
+        assert request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        ) == 0
 
     def test_a_recorded_loop_request_is_counted(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
@@ -1831,3 +1845,81 @@ class TestCurrentHead:
     def test_a_failed_call_is_none(self):
         failing = lambda cmd, **kwargs: _completed(cmd, None, rc=1, stderr="boom")  # noqa: E731
         assert request_rereview.current_head("acme/widget", 159, runner=failing) is None
+
+
+class TestProvenanceFailsClosed:
+    """An empty provenance list is authoritative to the counter, so a missing
+    or unwritable record must read as *unknown* (None) and fall back to the
+    actor filter — otherwise every pushed head could post another request past
+    the hard cap (PR #116 review)."""
+
+    def test_no_state_file_is_unknown_not_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) is None
+
+    def test_a_pr_entry_without_the_key_is_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.state_path().write_text(
+            json.dumps({"acme/widget#159": {"run": {"session_cycle": 2}}}), encoding="utf-8"
+        )
+
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) is None
+
+    def test_a_recorded_history_with_no_match_for_this_vendor_is_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=review_vendors.CODEX.login, requested_at=T_REQUEST
+        )
+
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) == []
+
+    def test_a_failed_state_write_marks_the_history_unusable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        )
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) == [T_REQUEST]
+
+        # The next POST lands, but the write that would record it fails. The
+        # follow-up marker write succeeds, which is the realistic transient
+        # case (a full disk clearing, a lock released).
+        real_write = request_rereview.Path.write_text
+        calls = {"n": 0}
+
+        def flaky_write(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("read-only file system")
+            return real_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(request_rereview.Path, "write_text", flaky_write)
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T17:00:00Z"
+        )
+        monkeypatch.setattr(request_rereview.Path, "write_text", real_write)
+
+        # One request is now unrecorded, so the history can no longer be
+        # trusted as complete: unknown, not "one request".
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) is None
+
+    def test_unknown_provenance_with_candidate_events_refuses_to_count(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        events = _rest_request_events([("agent", T_REQUEST), ("a-human", "2026-10-07T16:30:00Z")])
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, events)
+
+        assert request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        ) is None

@@ -179,6 +179,53 @@ def add_entry(
     return record
 
 
+# Questionnaire boilerplate. These words carry the sentence, not its subject,
+# so they are excluded when deciding whether two questions are about the same
+# thing. Everything else — vendor names, product names, technologies — is
+# treated as decisive.
+GENERIC_TOKENS = {
+    "are", "as", "ask", "available", "been", "before", "below", "best", "can",
+    "company", "companies", "consider", "considered", "current", "currently",
+    "customer", "customers", "decision", "describe", "do", "does", "evaluate",
+    "evaluated", "evaluating", "experience", "familiar", "familiarity",
+    "following", "former", "have", "highlight", "how", "influence", "involved",
+    "list", "maker", "many", "much", "offering", "offerings", "organisation",
+    "organization", "paying", "platform", "platforms", "previous", "prior",
+    "product", "products", "provider", "providers", "purchase", "rate",
+    "recent", "role", "select", "service", "services", "solution", "solutions",
+    "status", "tool", "tools", "use", "used", "using", "vendor", "vendors",
+    "was", "were", "what", "which", "who", "why", "with", "would", "years",
+}
+
+
+def entity_tokens(question: str) -> set[str]:
+    """The tokens that decide what a question is *about*.
+
+    Whole-string similarity is dominated by boilerplate: "current paying
+    customer of Datadog" and "... of Splunk" score about 0.79, far above the
+    default threshold, so a fuzzy match alone would offer one vendor's answer
+    for another. The subject tokens must agree as well.
+    """
+    return {
+        token for token in normalize(question).split()
+        if token not in GENERIC_TOKENS and not token.isdigit()
+    }
+
+
+def entities_agree(question: str, entry: dict[str, Any]) -> bool:
+    """True when both questions name the same subject, or neither names one.
+
+    Disjoint subject sets mean different questions however similar the wording.
+    An overlap is enough: a grid asked about three vendors still answers for
+    one of them.
+    """
+    asked = entity_tokens(question)
+    stored = entity_tokens(entry.get("question") or "")
+    if not asked or not stored:
+        return True
+    return bool(asked & stored)
+
+
 def score(question: str, entry: dict[str, Any]) -> float:
     return difflib.SequenceMatcher(None, normalize(question), entry["normalized"]).ratio()
 
@@ -188,7 +235,10 @@ def lookup(question: str, limit: int = 3, min_score: float = 0.55) -> list[dict[
         (score(question, entry), index, entry)
         for index, entry in enumerate(load_entries())
     ]
-    scored = [item for item in scored if item[0] >= min_score]
+    scored = [
+        item for item in scored
+        if item[0] >= min_score and entities_agree(question, item[2])
+    ]
     # Best match first; on a tie the newest line (appended last) wins.
     scored.sort(key=lambda item: (-item[0], -item[1]))
     return [{"score": round(s, 3), **entry} for s, _, entry in scored[:limit]]
