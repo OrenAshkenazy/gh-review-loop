@@ -1737,3 +1737,67 @@ class TestFreeInitialRequest:
             "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
         ]) == 0
         assert json.loads(capsys.readouterr().out)["status"] == "capped"
+
+
+class TestExpectHeadOnTheCommentPath:
+    """`--expect-head` guarded only the review-request path, so a Codex ping
+    could land before the push was visible and buy a review of the previous
+    head (sibling of the PR #116 --expect-head finding)."""
+
+    def test_a_stale_head_posts_no_comment(self, monkeypatch, capsys):
+        monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: "oldhead000")
+        monkeypatch.setattr(
+            request_rereview, "post_rereview",
+            lambda *a, **k: pytest.fail("the push has not landed; nothing may be posted"),
+        )
+
+        rc = request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159",
+            "--reviewer-mention", "@codex", "--expect-head", "newhead111", "--json",
+        ])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["status"] == "head_mismatch"
+        assert payload["posted"] is False
+
+    def test_the_matching_head_posts_normally(self, monkeypatch, capsys):
+        monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: "newhead111")
+        posted = {}
+        monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
+            posted.update(phrase=phrase)
+            or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
+        ))
+
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159",
+            "--reviewer-mention", "@codex", "--expect-head", "newhead111", "--json",
+        ]) == 0
+        assert posted["phrase"] == review_vendors.CODEX.rereview_phrase
+
+    def test_an_unreadable_head_posts_nothing_rather_than_guessing(self, monkeypatch, capsys):
+        monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: None)
+        monkeypatch.setattr(
+            request_rereview, "post_rereview",
+            lambda *a, **k: pytest.fail("an unverifiable head must not post"),
+        )
+
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159",
+            "--reviewer-mention", "@codex", "--expect-head", "newhead111", "--json",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "uncountable_state"
+
+    def test_without_expect_head_no_extra_read_happens(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            request_rereview, "current_head",
+            lambda *a, **k: pytest.fail("no head read when --expect-head is absent"),
+        )
+        monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: {
+            "created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase,
+        })
+
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--reviewer-mention", "@codex", "--json",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out)["created_at"] == CREATED_AT

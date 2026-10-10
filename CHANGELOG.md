@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The fetch-side cap count admits when it is a lower bound.**
+  `review_request_count_complete()` checked only the timeline page, while the
+  free-cycle boundary comes from the reviews page: a full page can hide the
+  vendor's first completed review, making later requests look free and letting
+  the loop run another fix/push cycle before the request script refuses the
+  write. Both pages are now checked.
+
+- **`--expect-head` is honored on the comment path, and documented in the
+  canonical command.** It guarded only the review-request path, so a Codex ping
+  could land before GitHub saw the push and buy a review of the previous
+  commit, which the loop would read as this cycle's verdict. The comment path
+  now reads the head and posts nothing on a mismatch (`head_mismatch`) or an
+  unreadable head (`uncountable_state`), and workflow step 8 passes
+  `$(git rev-parse HEAD)`.
+
 - **The free initial Copilot request is not gated on the cap.** With
   `max_rereview_requests: 0`, or with `gh api user` unresolvable, a PR Copilot
   had never reviewed could not get its first request: the count was correct

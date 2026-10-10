@@ -23,3 +23,5 @@ Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical on
 | `PreToolUse` (`Bash`) | `loop_summary_gate.py` | Blocks `git push` while a loop is active and the summary is stale; exit 2 names the exact `--cycle-summary` to run. |
 | `PreToolUse` (`Edit`/`Write`/`MultiEdit`) | `loop_profile_gate.py` | Blocks edits while a loop is active and no verification profile is saved. Any saved profile — including `Skip` — clears it. |
 | `Stop` | `loop_summary_hook.py` | If a loop advanced this turn without a summary, emits the authoritative `--cycle-summary`. Dedup-aware; read-only. |
+
+`--expect-head <sha>` is honored on both re-review paths: the script reads the PR's head and posts nothing when it differs (`head_mismatch`) or cannot be read (`uncountable_state`). Pass your pushed HEAD, because a trigger that lands before GitHub sees the push buys a review of the previous commit, which the loop then reads as this cycle's verdict.

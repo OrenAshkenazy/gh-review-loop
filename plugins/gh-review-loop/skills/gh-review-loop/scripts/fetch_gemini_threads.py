@@ -1073,7 +1073,13 @@ def review_body_findings(
 def review_request_count_complete(
     pull_request: dict[str, Any], *, review_request_vendor: bool = True
 ) -> bool:
-    """False when the timeline page is full, so the review-request count is a lower bound.
+    """False when either page the count rests on is full, so it is a lower bound.
+
+    Two pages matter. The timeline page holds the request events themselves.
+    The reviews page fixes the free-cycle boundary — the vendor's first
+    completed review — and a full page can hide it, which makes later requests
+    look free and lets the loop run another fix/push cycle before
+    request_rereview.py (which paginates) refuses the write.
 
     Only review-request vendors count timeline events; a comment vendor's
     count comes from PR comments, so for it this is always True.
@@ -1081,7 +1087,8 @@ def review_request_count_complete(
     if not review_request_vendor:
         return True
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
-    return len(nodes) < PAGE_LIMIT_TIMELINE
+    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
+    return len(nodes) < PAGE_LIMIT_TIMELINE and len(reviews) < PAGE_LIMIT_REVIEWS
 
 
 def parse_copilot_overview(body: Any) -> dict[str, Any] | None:

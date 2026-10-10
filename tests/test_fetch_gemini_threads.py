@@ -4435,3 +4435,32 @@ class TestSelectionCanonicalizesAliases:
         state = reviewer_selection_state({"login": "some-new-bot"}, source="persisted")
 
         assert state["login"] == "some-new-bot"
+
+
+class TestFetchSideCapCompleteness:
+    """The fetch's cap count derives the free-cycle boundary from the reviews
+    page. A full page may hide the vendor's first completed review, which makes
+    later requests look free and lets the loop run another fix/push cycle
+    before the request script refuses the write (PR #116 review)."""
+
+    @staticmethod
+    def _pr(review_count):
+        return {
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer"}, "state": "COMMENTED",
+                 "submittedAt": f"2026-10-07T15:{index % 60:02d}:00Z", "commit": {"oid": "a"}}
+                for index in range(review_count)
+            ]},
+            "timelineItems": {"nodes": []},
+        }
+
+    def test_a_full_reviews_page_marks_the_count_incomplete(self):
+        assert _fgt.review_request_count_complete(self._pr(100)) is False
+
+    def test_a_partial_reviews_page_keeps_the_count_complete(self):
+        assert _fgt.review_request_count_complete(self._pr(3)) is True
+
+    def test_a_comment_vendor_is_unaffected(self):
+        assert _fgt.review_request_count_complete(
+            self._pr(100), review_request_vendor=False
+        ) is True
