@@ -22,6 +22,27 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Every compliance class in the reference is refused by the bank.** The
+  attestation predicate covered employer, conflict, recording and blinded-client
+  questions but not government or public-sector roles, pending trials and
+  litigation, public-company employment within six months, or "which other GLG
+  projects have you done" — all four listed in `references/compliance.md` as
+  questions that always go to the member. A reused answer there is a false
+  compliance attestation, so the predicate now mirrors that list class for
+  class, with a test that ordinary project questions are not swept up.
+
+- **An invalid JWT expiry no longer aborts parsing.** An out-of-range `exp`
+  made `datetime.fromtimestamp()` raise `OverflowError` (`OSError` on some
+  platforms) after URL validation, taking down an email that may also carry a
+  valid invitation. The link is kept with an unknown expiry.
+
+- **Actionable signals outrank quoted Q/A text.** A reply that quotes an
+  earlier confirmation carries `Q:`/`A:` lines, and `detect_kind()` returned
+  `accept_confirmation` on sight of them — seeding stale answers and hiding an
+  open follow-up or a `survey (manual)` row. A follow-up link, an explicit
+  survey/payment/confirmation subject and a live accept link are all checked
+  first.
+
 - **Untrusted text never reaches a shell word.** The GLG skill's documented
   commands interpolated an email subject and a questionnaire question into
   `--subject "<subject>"` / `--question "<question text>"`; double quotes do
