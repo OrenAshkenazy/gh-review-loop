@@ -313,3 +313,52 @@ def test_counted_requests_is_empty_before_any_completed_review():
     assert reviewer_resolver.counted_review_requests(
         events, agent_login="agent", vendor=review_vendors.COPILOT, first_completed_review_at=None,
     ) == []
+
+
+def test_review_authors_and_pending_requests_are_candidates_too():
+    """A Copilot review with zero findings has no thread comments, and a
+    just-requested Copilot has nothing at all yet; both must be discoverable."""
+    pull_request = _pr(_thread(_comment("coderabbitai")))
+    pull_request["reviews"] = {"nodes": [
+        {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+        {"author": {"login": "alice", "__typename": "User"}},
+    ]}
+    pull_request["reviewRequests"] = {"nodes": [
+        {"requestedReviewer": {"__typename": "Bot", "login": "sourcery-ai"}},
+        {"requestedReviewer": {"__typename": "User", "login": "bob"}},
+        {"requestedReviewer": None},
+    ]}
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login="codex-agent")
+
+    assert [(c.login, c.source) for c in candidates] == [
+        ("coderabbitai", "thread"),
+        ("copilot-pull-request-reviewer", "review"),
+        ("sourcery-ai", "requested"),
+    ]
+    assert candidates[1].display_name == "Copilot"
+    assert candidates[1].trigger_kind == "review_request"
+    assert candidates[1].review_trigger is None
+
+
+def test_a_login_seen_in_a_thread_is_not_duplicated_from_reviews_or_requests():
+    pull_request = _pr(_thread(_comment("copilot-pull-request-reviewer")))
+    pull_request["reviews"] = {"nodes": [
+        {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+    ]}
+    pull_request["reviewRequests"] = {"nodes": [
+        {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+    ]}
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login=None)
+
+    assert [(c.login, c.source) for c in candidates] == [("copilot-pull-request-reviewer", "thread")]
+
+
+def test_discovery_without_reviews_or_requests_keys_still_works():
+    pull_request = _pr(_thread(_comment("gemini-code-assist")))
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login=None)
+
+    assert [c.login for c in candidates] == ["gemini-code-assist"]
+    assert candidates[0].source == "thread"
