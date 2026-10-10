@@ -1801,3 +1801,33 @@ class TestExpectHeadOnTheCommentPath:
             "--repo", "acme/widget", "--pr", "159", "--reviewer-mention", "@codex", "--json",
         ]) == 0
         assert json.loads(capsys.readouterr().out)["created_at"] == CREATED_AT
+
+
+class TestCurrentHead:
+    """`gh api --jq .head.sha` prints a bare sha, which is not JSON — the first
+    version of this helper fed it to json.loads and always reported the head as
+    unreadable. Found by running it for real, not by the stubbed tests."""
+
+    def test_the_head_is_read_from_the_pr_object(self):
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _completed(cmd, {"number": 159, "head": {"sha": "abc1234def"}})
+
+        assert request_rereview.current_head("acme/widget", 159, runner=runner) == "abc1234def"
+        assert "--jq" not in captured["cmd"]
+        assert captured["cmd"][:3] == ["gh", "api", "repos/acme/widget/pulls/159"]
+
+    def test_an_unreadable_response_is_none(self):
+        for result in (None, {}, {"head": {}}, {"head": {"sha": ""}}, "not json"):
+            def runner(cmd, _result=result, **kwargs):
+                if _result == "not json":
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="abc123\n", stderr="")
+                return _completed(cmd, _result)
+
+            assert request_rereview.current_head("acme/widget", 159, runner=runner) is None
+
+    def test_a_failed_call_is_none(self):
+        failing = lambda cmd, **kwargs: _completed(cmd, None, rc=1, stderr="boom")  # noqa: E731
+        assert request_rereview.current_head("acme/widget", 159, runner=failing) is None
