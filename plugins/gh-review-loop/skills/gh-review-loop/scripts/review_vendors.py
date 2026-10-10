@@ -25,6 +25,12 @@ class ReviewVendor:
     # the tier that no longer works.
     consumer_tier_retired: bool = False
     tier_note: str = ""
+    # How the loop asks this vendor for another look. "comment" vendors read
+    # an @mention posted as a PR comment (``rereview_phrase``). A
+    # "review_request" vendor ignores comments and is re-reviewed through
+    # GitHub's requested-reviewers API using ``request_login``.
+    trigger_kind: str = "comment"
+    request_login: str = ""
 
 
 # Google shut down the *consumer* Gemini Code Assist GitHub app on 2026-07-17;
@@ -58,7 +64,25 @@ CODEX = ReviewVendor(
     auto_reviews=False,
 )
 
-KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX)}
+# Copilot does not react to an @copilot comment. It reviews when it is added
+# as a requested reviewer — the same REST call for the first request and every
+# re-request (GitHub changelog 2026-10-02; behaviour confirmed on public PRs,
+# see docs/superpowers/specs/evidence/2026-10-10-copilot-live-scan.txt). Its
+# login differs by API: GraphQL ``copilot-pull-request-reviewer``, REST reviews
+# ``copilot-pull-request-reviewer[bot]``, REST timeline ``Copilot``. GitHub
+# does not dedupe requests server-side (two requests on one head produce two
+# reviews), so request_rereview.py enforces head/pending dedupe before posting.
+COPILOT = ReviewVendor(
+    login="copilot-pull-request-reviewer",
+    display_name="Copilot",
+    mention="@copilot",
+    rereview_phrase="",
+    auto_reviews=False,
+    trigger_kind="review_request",
+    request_login="copilot-pull-request-reviewer[bot]",
+)
+
+KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX, COPILOT)}
 
 # The loop has no default reviewer: with nothing configured it asks rather than
 # assumes. This is the reviewer it may *offer*. It is a ping-first vendor so
