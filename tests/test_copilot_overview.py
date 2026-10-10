@@ -332,3 +332,23 @@ def test_annotation_leaves_finding_fingerprint_and_pattern_signature_unchanged_b
     assert finding_fingerprint(before) == finding_fingerprint(after)
     assert cluster_findings.pattern_signature(before) == cluster_findings.pattern_signature(after)
     assert thread_render_fingerprint(before) != thread_render_fingerprint(after)
+
+
+def test_fewer_parsed_links_than_the_reported_count_blocks_clean():
+    """`open_findings` is authoritative; `finding_ids` is what the parser could
+    recognize. When Copilot reports two findings and only one link parses (a
+    markup change dropping a severity icon, say), one finding is unaccounted
+    for even though every parsed link is known — the gate must stay closed
+    (PR #116 review)."""
+    head = {"approving": False, "open_findings": 2, "complete": True, "covers_head": True,
+            "finding_ids": ["11"], "unlinked_findings": 0}
+
+    assert clean_blocked_by(
+        [], head, review_request_vendor=True, known_thread_ids={"11", "22"}
+    ) == "overview_reports_open_findings"
+
+    # The count and the links agreeing is still clean.
+    agreed = {**head, "open_findings": 1}
+    assert clean_blocked_by(
+        [], agreed, review_request_vendor=True, known_thread_ids={"11", "22"}
+    ) is None

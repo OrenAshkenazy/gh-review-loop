@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **A still-pending Copilot request is never doubled.** `STALE_PENDING` fell
+  through to a second POST while GraphQL still listed the first request as
+  pending, and the design evidence records that producing two reviews. Age
+  alone cannot prove abandonment, so the open request is now explicitly
+  withdrawn (`cancel_review_request()`) after the cap clears and before the
+  repost; a withdrawal that fails posts nothing and reports
+  `stale_request_not_replaced`. A dry run withdraws nothing.
+
+- **The loop's workflow routes `review_request_uncertain`.** Step 8 said every
+  status means nothing was posted and then captured `created_at`, which the
+  uncertain payload deliberately lacks — an agent following it would build a
+  broken wait or re-request a review GitHub may have accepted. The uncertain
+  status now routes to the delayed state re-read, and `created_at` is captured
+  only from a posted result.
+
+- **The clean gate blocks when the overview count exceeds the parsed links.**
+  `open_findings` is authoritative and `finding_ids` is only what the parser
+  recognized; two reported findings with one parsed link read as clean once
+  that link was known. Fewer links than findings now keeps
+  `overview_reports_open_findings`.
+
 - **Copilot aliases canonicalize before any filtering.** `--reviewer copilot`,
   `@copilot`, `Copilot` or `copilot-pull-request-reviewer[bot]` kept that
   spelling in the persisted record and in the loop's selection state, while
