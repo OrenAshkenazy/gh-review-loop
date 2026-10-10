@@ -150,3 +150,38 @@ class TestCli:
         bad = "hdr." + base64.urlsafe_b64encode(b'{"iat": 1}').decode().rstrip("=") + ".sig"
         assert pge._jwt_expiry(bad) is None
         assert pge._jwt_expiry("not-a-jwt") is None
+
+
+class TestLinkHostTrust:
+    """A link is only actionable when its host *is* GLG.
+
+    The parser's links are opened in the member's browser, so a lookalike host
+    in a forwarded or spoofed email must never be classified as accept,
+    followup or decline (PR #116 review).
+    """
+
+    @pytest.mark.parametrize("url", [
+        "https://members.glgresearch.com.attacker.example/accept/accept?cpid=1",
+        "https://attacker.example/members.glgresearch.com/accept/accept?cpid=1",
+        "https://members.glgresearch.com@attacker.example/accept/accept?cpid=1",
+        "https://members.glgresearch.com.evil.test/cm-accept-followup/x",
+        "https://notmembers.glgresearch.com.co/opportunities?consultationIds=a",
+        "ftp://members.glgresearch.com/accept/accept?cpid=1",
+    ])
+    def test_lookalike_hosts_are_not_actionable(self, url):
+        assert pge.classify_link(url) == "other"
+        assert pge.extract_links(f"Review Project Now: {url}") == []
+
+    @pytest.mark.parametrize("url, role", [
+        ("https://members.glgresearch.com/accept/accept?cpid=1", "accept"),
+        ("https://MEMBERS.GLGRESEARCH.COM/accept/accept?cpid=1", "accept"),
+        ("https://members.glgresearch.com./accept/accept?cpid=1", "accept"),
+        ("https://members.glgresearch.com/cm-accept-followup/abc", "followup"),
+        ("https://members.glgresearch.com/opportunities?consultationIds=abc", "decline"),
+        ("https://members.glgresearch.com/profile", "members"),
+    ])
+    def test_real_glg_links_keep_their_role(self, url, role):
+        assert pge.classify_link(url) == role
+
+    def test_opportunities_without_consultation_ids_is_not_a_decline(self):
+        assert pge.classify_link("https://members.glgresearch.com/opportunities") == "members"

@@ -22,6 +22,15 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **GLG action links are trusted by host, not by substring.** `classify_link()`
+  matched `members.glgresearch.com` anywhere in the URL, so a crafted or
+  forwarded email could present
+  `https://members.glgresearch.com.attacker.example/accept/accept` as a
+  legitimate accept link that the skill then opens in the member's browser. The
+  URL is now parsed and the normalized hostname must equal the GLG host, with an
+  http(s) scheme; `consultationIds` is read from the query string rather than
+  the raw URL.
+
 - **State directory renamed to `~/.config/gh-review-loop`, with automatic
   migration.** `~/.config/gh-gemini-review-loop` was the last remnant of the old
   plugin name, hardcoded independently in six modules and the three hooks.json
