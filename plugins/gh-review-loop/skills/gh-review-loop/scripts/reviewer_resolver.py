@@ -194,6 +194,19 @@ def counted_review_requests(
     return out
 
 
+def canonical_login(login: str) -> str:
+    """The login GraphQL reports for this reviewer, for a known vendor's alias.
+
+    Callers select a reviewer by whatever spelling they have — ``copilot``,
+    ``@copilot``, ``Copilot``, ``copilot-pull-request-reviewer[bot]`` — while
+    review and thread filters compare authors exactly against the stored
+    login. Storing an alias would request the right reviewer and then never
+    match its review. Unknown logins pass through untouched.
+    """
+    vendor = review_vendors.vendor_for(login)
+    return vendor.login if vendor else login
+
+
 def make_reviewer_record(
     login: str,
     *,
@@ -202,6 +215,7 @@ def make_reviewer_record(
     source: str,
     selected_at: str | None = None,
 ) -> dict[str, Any]:
+    login = canonical_login(login)
     return {
         "login": login,
         "display_name": display_name or display_name_for(login),

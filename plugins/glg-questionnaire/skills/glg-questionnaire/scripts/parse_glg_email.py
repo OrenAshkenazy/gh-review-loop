@@ -21,6 +21,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 MEMBERS_HOST = "members.glgresearch.com"
 
@@ -74,14 +75,23 @@ def _jwt_expiry(token: str) -> str | None:
 
 
 def classify_link(url: str) -> str:
-    if MEMBERS_HOST not in url:
+    """The role of one URL, or "other" when it is not a GLG members link.
+
+    The host is parsed and compared whole, never searched for as a substring:
+    the links this parser reports are opened in the member's browser, so
+    ``members.glgresearch.com.attacker.example`` (or an ``@``-userinfo trick,
+    or the host repeated in a path) must not come back as an accept link.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".").lower()
+    if parts.scheme.lower() not in {"http", "https"} or host != MEMBERS_HOST:
         return "other"
-    path = url.split(MEMBERS_HOST, 1)[1].split("?", 1)[0]
+    path = parts.path
     if "/accept/accept" in path:
         return "accept"
     if "cm-accept-followup" in path:
         return "followup"
-    if "/opportunities" in path and "consultationIds=" in url:
+    if "/opportunities" in path and "consultationIds=" in parts.query:
         return "decline"
     return "members"
 
