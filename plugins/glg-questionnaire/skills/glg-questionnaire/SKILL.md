@@ -70,7 +70,13 @@ python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/parse_glg_email.py" 
   --subject-file "$GLGQ_WORK/subject.txt" --file "$GLGQ_WORK/body.txt"
 ```
 
-Group by `cpid`, but only when it is non-empty: surveys, payments, call reminders and digests parse with no `cpid`, and keying on it would collapse them into one row and hide projects the hard rules require reporting. Messages without a `cpid` stay separate — key them by Gmail thread, falling back to the project ID. Judge fit by comparing `project_title`, `description_bullets` and `client_type` against the profile's expertise and decline lists. Print one table: project, kind, rate, client type, link expiry, fit, suggested action (`accept`, `decline`, `ask`, `survey (manual)`). Then ask which to work. Emails of kind `followup` are already-accepted projects with new questions: list them first, they are the fastest win.
+Before offering anything, read what you already did:
+
+```bash
+python3 "$GLGQ_PLUGIN_ROOT/skills/glg-questionnaire/scripts/answer_bank.py" handled
+```
+
+One row per project (newest outcome, with its `cpid`). Match each parsed message against it by `cpid` **and** by project title — an accept confirmation often carries no `cpid` — and mark those rows `done (<action>)` instead of suggesting an action. Then group by `cpid`, but only when it is non-empty: surveys, payments, call reminders and digests parse with no `cpid`, and keying on it would collapse them into one row and hide projects the hard rules require reporting. Messages without a `cpid` stay separate — key them by Gmail thread, falling back to the project ID. Judge fit by comparing `project_title`, `description_bullets` and `client_type` against the profile's expertise and decline lists. Print one table: project, kind, rate, client type, link expiry, fit, suggested action (`accept`, `decline`, `ask`, `survey (manual)`). Then ask which to work. Emails of kind `followup` are already-accepted projects with new questions: list them first, they are the fastest win.
 
 ### 2. Prepare the answer sheet
 
@@ -94,7 +100,7 @@ Present the sheet with the screenshot. Each row is one of `BANK` (prior answer, 
 
 ### 5. Record and close out
 
-Store every `MEMBER` answer with `answer_bank.py add` and log the outcome with `answer_bank.py log --action submitted`. When the "Accept Confirmation" email arrives, seed it: `answer_bank.py seed --from-parsed parsed.json`, which dedupes. Offer to draft (not send) a short reply to the research manager if the project email asked for one.
+Store every `MEMBER` answer with `answer_bank.py add` and log the outcome with `answer_bank.py log --project-file "$GLGQ_WORK/project.txt" --action submitted`. When the "Accept Confirmation" email arrives, seed it: `answer_bank.py seed --from-parsed parsed.json`, which dedupes. Offer to draft (not send) a short reply to the research manager if the project email asked for one.
 
 ## Answer sheet format
 

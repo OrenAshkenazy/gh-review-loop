@@ -70,7 +70,7 @@ Seeding dedupes on normalized question plus value, so re-running is safe. Do thi
 
 ## submissions.jsonl
 
-`answer_bank.py log --project "<title>" --cpid <id> --action submitted|declined|accepted|skipped --detail "..."` appends one line per outcome. Read it at the start of triage so a project already handled in an earlier session is shown as done rather than offered again.
+`answer_bank.py log --project-file "$GLGQ_WORK/project.txt" --cpid <id> --action submitted|declined|accepted|skipped --detail-file "$GLGQ_WORK/detail.txt"` appends one line per outcome. The title comes from an email subject, so it travels by file like every other untrusted value; `--project`/`--detail` still exist for text you typed yourself. `answer_bank.py handled` reads the log back as one row per project (newest outcome, with its `cpid`) — triage calls it before offering anything, so a project finished in an earlier session shows as done instead of being offered again.
 
 ## Per-project attestations are refused, not stored
 

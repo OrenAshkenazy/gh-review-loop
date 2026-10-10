@@ -22,6 +22,33 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Project titles and detail text travel by file.** `log --project
+  "<title>"` was the last shell-interpolation sink: titles come from email
+  subjects, so recording an outcome could execute `$(...)` from one.
+  `--project-file` and `--detail-file` take them from a file (`-` for stdin);
+  the inline flags remain for text the member typed.
+
+- **Triage reads the submission history.** Outcomes were written to
+  `submissions.jsonl` for reuse but never read back, so a project finished in
+  an earlier session was offered again — and an accept confirmation usually has
+  no `cpid` to tie it to the invitation. `answer_bank.py handled` returns one
+  row per project (newest outcome, with its `cpid`) and triage matches on both
+  keys before suggesting anything.
+
+- **A follow-up reports its own deadline.** The top-level
+  `accept_link_expires_at` always preferred the accept link, so a follow-up
+  quoting the earlier accept URL showed that token's expiry — often already
+  passed — for work that was still open. The link matching the detected kind
+  owns the deadline.
+
+- **The fetch propagates unknown request provenance.** The write side already
+  refused to guess; the fetch still treated a missing or incomplete local
+  record as an authoritative empty list, so the loop could display zero cap
+  usage and run another fix/push cycle before the write refused. Unknown
+  provenance now falls back to the actor filter and sets
+  `reReviewCountComplete: false` — unless there is nothing to attribute, where
+  zero is exact.
+
 - **The GLG docs no longer rely on shell state between tool calls.** Each
   agent shell call is its own process, so the "resolve it once" plugin-root
   block left `GLGQ_PLUGIN_ROOT` unset for every later command, and the scratch

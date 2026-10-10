@@ -276,7 +276,13 @@ def parse(body: str, subject: str = "") -> dict[str, Any]:
         "flags": _flags(body, subject),
         "description_bullets": _description_bullets(body),
         "links": links,
-        "accept_link_expires_at": (accept or followup or {}).get("expires_at"),
+        # The link that matches the detected kind owns the deadline: a
+        # follow-up that quotes the earlier accept URL carries two tokens with
+        # different lifetimes, and reporting the accept token's expiry showed a
+        # passed deadline for work that is still open.
+        "accept_link_expires_at": (
+            (followup or accept or {}) if kind == "followup" else (accept or followup or {})
+        ).get("expires_at"),
         "recorded_answers": answers,
     }
 
