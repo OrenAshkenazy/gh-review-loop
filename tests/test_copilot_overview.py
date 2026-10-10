@@ -1,0 +1,281 @@
+"""Copilot writes severities into its review overview, not into the inline
+comments. These tests use the overview markup recorded from live Copilot
+reviews (block/schemabot#1669 and haacked/dotfiles#235, 2026-10-07), with the
+prose shortened."""
+
+from __future__ import annotations
+
+import cluster_findings
+from fetch_gemini_threads import (
+    annotate_reviewer_severity,
+    clean_blocked_by,
+    copilot_overview_severities,
+    finding_fingerprint,
+    latest_reviewer_overview,
+    parse_copilot_overview,
+    thread_render_fingerprint,
+    thread_severity,
+)
+
+
+COPILOT = "copilot-pull-request-reviewer"
+PR_URL = "https://github.com/acme/widget/pull/159"
+
+OVERVIEW = """<!-- ccr-overview-v2 -->
+
+### 🟡 Changes recommended
+
+The integration test exceeds the repository's timeout limit.
+
+<details open>
+<summary><strong>2 open findings</strong></summary>
+
+- <picture><source media="(prefers-color-scheme: dark)" srcset="https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-dark.svg"><source media="(prefers-color-scheme: light)" srcset="https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-light.svg"><img src="https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-light.png" alt="High severity" width="62" height="18" align="texttop"></picture> [Test exceeds 30-second limit](#discussion_r4208919854) · New
+- <picture><img src="https://github.githubassets.com/static/images/icons/copilot-code-review/medium-v2-light.png" alt="Medium severity" width="62" height="18" align="texttop"></picture> [Test bypasses production parser](#discussion_r4208919952) · New
+</details>
+
+<details>
+<summary><strong>What changed in this PR</strong></summary>
+
+Updates the dependency and removes obsolete configuration passthroughs.
+</details>
+
+🧠 **Review effort:** Balanced
+"""
+
+CLEAN_OVERVIEW = """<!-- ccr-overview-v2 -->
+
+### 🟢 Approval recommended
+
+The status logic is consistent across bundled copies.
+
+**0 open findings**
+
+<details>
+<summary><strong>What changed in this PR</strong></summary>
+
+Refactors the status helper.
+</details>
+"""
+
+MARKER_ONLY = "<!-- ccr-overview-v2 -->\n\nSomething unexpected that is neither a heading nor a count.\n"
+
+
+def _review(body, submitted_at, commit="f4a55e3000", url=PR_URL + "#pullrequestreview-1", author=COPILOT):
+    return {
+        "author": {"login": author, "__typename": "Bot"},
+        "body": body,
+        "state": "COMMENTED",
+        "submittedAt": submitted_at,
+        "commit": {"oid": commit},
+        "url": url,
+    }
+
+
+def _pr(*reviews, head="f4a55e3000"):
+    return {"headRefOid": head, "reviews": {"nodes": list(reviews)}}
+
+
+def _thread(thread_id, discussion_id, body="plain prose, no marker", path="src/a.py"):
+    return {
+        "id": thread_id,
+        "path": path,
+        "line": 7,
+        "comments": [{
+            "author": {"login": COPILOT},
+            "body": body,
+            "url": f"{PR_URL}#discussion_r{discussion_id}",
+            "path": path,
+            "line": 7,
+        }],
+    }
+
+
+def test_parses_assessment_findings_and_count():
+    parsed = parse_copilot_overview(OVERVIEW)
+
+    assert parsed["assessment"] == "Changes recommended"
+    assert parsed["approving"] is False
+    assert parsed["open_findings"] == 2
+    assert parsed["complete"] is True
+    assert parsed["findings"] == [
+        {"severity": "high", "discussion_id": "4208919854", "title": "Test exceeds 30-second limit"},
+        {"severity": "medium", "discussion_id": "4208919952", "title": "Test bypasses production parser"},
+    ]
+    assert parsed["unlinked_findings"] == 0
+
+
+def test_clean_overview_is_approving_with_zero_findings():
+    parsed = parse_copilot_overview(CLEAN_OVERVIEW)
+
+    assert parsed["assessment"] == "Approval recommended"
+    assert parsed["approving"] is True
+    assert parsed["open_findings"] == 0
+    assert parsed["complete"] is True
+    assert parsed["findings"] == []
+
+
+def test_non_copilot_bodies_are_not_overviews():
+    assert parse_copilot_overview("![P1 Badge](https://img.shields.io/badge/P1-red) fix this") is None
+    assert parse_copilot_overview("### Looks good\n\n**0 open findings**") is None
+    assert parse_copilot_overview("") is None
+    assert parse_copilot_overview(None) is None
+
+
+def test_marker_without_heading_or_count_is_incomplete():
+    parsed = parse_copilot_overview(MARKER_ONLY)
+
+    assert parsed is not None
+    assert parsed["complete"] is False
+    assert parsed["open_findings"] is None
+    assert parsed["approving"] is False
+    assert parsed["findings"] == []
+
+
+def test_an_unlinked_finding_is_a_warning_not_a_finding():
+    body = OVERVIEW.replace(
+        "[Test bypasses production parser](#discussion_r4208919952)",
+        "Test bypasses production parser",
+    )
+
+    parsed = parse_copilot_overview(body)
+
+    assert len(parsed["findings"]) == 1
+    assert parsed["unlinked_findings"] == 1
+
+
+def test_thread_gets_its_severity_and_source_from_the_overview():
+    pr = _pr(_review(OVERVIEW, "2026-10-07T15:46:14Z"))
+    flagged = _thread("T1", "4208919854")
+    unlisted = _thread("T2", "999")
+
+    severities, warnings = copilot_overview_severities(pr, COPILOT)
+    annotate_reviewer_severity([flagged, unlisted], severities)
+
+    assert thread_severity(flagged) == "high"
+    assert flagged["reviewerSeveritySource"] == {
+        "review_url": PR_URL + "#pullrequestreview-1", "commit": "f4a55e3000",
+    }
+    assert thread_severity(unlisted) == "unknown"
+    assert "reviewerSeverity" not in unlisted
+    assert warnings == []
+
+
+def test_newer_overview_wins_and_records_its_commit():
+    pr = _pr(
+        _review(OVERVIEW, "2026-10-07T15:46:14Z"),
+        _review(
+            OVERVIEW.replace('alt="High severity"', 'alt="Low severity"'),
+            "2026-10-07T16:20:00Z", commit="d7efa49000", url=PR_URL + "#pullrequestreview-2",
+        ),
+        head="d7efa49000",
+    )
+    flagged = _thread("T1", "4208919854")
+
+    severities, _warnings = copilot_overview_severities(pr, COPILOT)
+    annotate_reviewer_severity([flagged], severities)
+
+    assert thread_severity(flagged) == "low"
+    assert flagged["reviewerSeveritySource"]["commit"] == "d7efa49000"
+
+
+def test_unparseable_overview_leaves_threads_listed_as_unknown():
+    pr = _pr(_review(MARKER_ONLY, "2026-10-07T15:46:14Z"))
+    thread = _thread("T1", "4208919854")
+
+    severities, warnings = copilot_overview_severities(pr, COPILOT)
+    annotate_reviewer_severity([thread], severities)
+
+    assert severities == {}
+    assert warnings == []
+    assert thread_severity(thread) == "unknown"
+
+
+def test_unlinked_findings_surface_as_a_warning_naming_the_review():
+    body = OVERVIEW.replace("(#discussion_r4208919952)", "")
+    pr = _pr(_review(body, "2026-10-07T15:46:14Z"))
+
+    _severities, warnings = copilot_overview_severities(pr, COPILOT)
+
+    assert len(warnings) == 1
+    assert "1 finding(s)" in warnings[0]
+    assert "#pullrequestreview-1" in warnings[0]
+
+
+def test_other_authors_overviews_are_ignored():
+    pr = _pr(_review(OVERVIEW, "2026-10-07T15:46:14Z", author="someone-else"))
+
+    assert copilot_overview_severities(pr, COPILOT) == ({}, [])
+    assert latest_reviewer_overview(pr, COPILOT) is None
+
+
+def test_latest_reviewer_overview_reports_covers_head():
+    pr = _pr(
+        _review(OVERVIEW, "2026-10-07T15:46:14Z"),
+        _review(CLEAN_OVERVIEW, "2026-10-07T16:20:00Z", commit="6f03c25000", url=PR_URL + "#pullrequestreview-2"),
+        head="6f03c25000",
+    )
+
+    overview = latest_reviewer_overview(pr, COPILOT)
+
+    assert overview == {
+        "assessment": "Approval recommended",
+        "approving": True,
+        "open_findings": 0,
+        "complete": True,
+        "covers_head": True,
+        "commit": "6f03c25000",
+        "submitted_at": "2026-10-07T16:20:00Z",
+        "url": PR_URL + "#pullrequestreview-2",
+    }
+    stale = latest_reviewer_overview({**pr, "headRefOid": "9999999000"}, COPILOT)
+    assert stale["covers_head"] is False
+
+
+def test_clean_blocked_by_table():
+    approving_head = {"approving": True, "open_findings": 0, "complete": True, "covers_head": True}
+    threads = [_thread("T1", "1")]
+
+    assert clean_blocked_by(threads, approving_head, review_request_vendor=True) is None
+    assert clean_blocked_by([], approving_head, review_request_vendor=True) is None
+    assert clean_blocked_by([], None, review_request_vendor=True) == "no_review_for_head"
+    assert clean_blocked_by([], {**approving_head, "covers_head": False}, review_request_vendor=True) == "no_review_for_head"
+    assert clean_blocked_by([], {**approving_head, "complete": False, "open_findings": None}, review_request_vendor=True) == "overview_unparseable"
+    assert clean_blocked_by([], {**approving_head, "open_findings": 2}, review_request_vendor=True) == "overview_reports_open_findings"
+    # Approval wording alone never matters: a complete head review reporting 0 is clean even if the heading is odd.
+    assert clean_blocked_by([], {**approving_head, "approving": False}, review_request_vendor=True) is None
+    # Comment vendors have no overview gate.
+    assert clean_blocked_by([], None, review_request_vendor=False) is None
+
+
+def test_codex_and_gemini_severity_parsing_is_untouched():
+    gemini = {"comments": [{"body": "![high](https://www.gstatic.com/codereviewagent/high-priority.svg) fix"}]}
+    codex = {"comments": [{"body": "![P2 Badge](https://img.shields.io/badge/P2-yellow) fix"}]}
+
+    assert thread_severity(gemini) == "high"
+    assert thread_severity(codex) == "medium"
+
+
+def test_an_annotated_severity_beats_the_regexes():
+    thread = {
+        "reviewerSeverity": "low",
+        "comments": [{"body": "![high](https://www.gstatic.com/codereviewagent/high-priority.svg)"}],
+    }
+
+    assert thread_severity(thread) == "low"
+
+
+def test_bogus_annotation_is_ignored():
+    assert thread_severity({"reviewerSeverity": "urgent", "comments": []}) == "unknown"
+    assert thread_severity({"reviewerSeverity": "unknown", "comments": []}) == "unknown"
+    assert thread_severity({"reviewerSeverity": 3, "comments": []}) == "unknown"
+
+
+def test_annotation_leaves_finding_fingerprint_and_pattern_signature_unchanged_but_changes_render_fingerprint():
+    before = _thread("T1", "4208919854", body="Avoid shadowing the builtin `id` in this helper.")
+    after = _thread("T1", "4208919854", body="Avoid shadowing the builtin `id` in this helper.")
+    annotate_reviewer_severity([after], {"4208919854": {"severity": "high", "review_url": "u", "commit": "c"}})
+
+    assert finding_fingerprint(before) == finding_fingerprint(after)
+    assert cluster_findings.pattern_signature(before) == cluster_findings.pattern_signature(after)
+    assert thread_render_fingerprint(before) != thread_render_fingerprint(after)
