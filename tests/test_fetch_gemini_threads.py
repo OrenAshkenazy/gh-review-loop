@@ -4258,3 +4258,93 @@ class TestReviewRequestCounting:
         assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT])" in _fgt.QUERY
         assert "... on ReviewRequestedEvent" in _fgt.QUERY
         assert "commit { oid }" in _fgt.QUERY
+
+
+class TestHeadAnchoredWait:
+    """A review_request vendor's wait keys on commit.oid == headRefOid, never on a timestamp."""
+
+    COPILOT = "copilot-pull-request-reviewer"
+    GEMINI = "gemini-code-assist"
+    AFTER = "2026-10-07T16:20:05Z"
+
+    def _pr(self, head, *reviews, author=None):
+        author = author or self.COPILOT
+        return {
+            "headRefOid": head,
+            "comments": {"nodes": []},
+            "reviews": {"nodes": [
+                {"id": f"R{i}", "author": {"login": author}, "state": state, "submittedAt": at,
+                 "commit": {"oid": commit}, "body": "", "url": f"u{i}"}
+                for i, (state, at, commit) in enumerate(reviews)
+            ]},
+            "reviewThreads": {"nodes": []},
+            "timelineItems": {"nodes": []},
+        }
+
+    def test_head_review_is_the_completed_review_on_the_head(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"),
+                      ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R1"
+        assert _fgt.head_review(self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3")), self.COPILOT) is None
+        assert _fgt.head_review(self._pr("d7efa49", ("PENDING", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT) is None
+
+    def test_copilot_wait_is_not_ready_for_a_review_of_the_previous_head(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+
+    def test_copilot_wait_is_ready_on_a_same_second_head_review(self):
+        pr = self._pr("d7efa49", ("COMMENTED", self.AFTER, "d7efa49"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is not None
+
+    def test_copilot_wait_ignores_a_pending_review_object(self):
+        pr = self._pr("d7efa49", ("PENDING", "2026-10-07T16:30:00Z", "d7efa49"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+
+    def test_gemini_wait_fingerprint_is_unchanged(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"), author=self.GEMINI)
+
+        assert _fgt.wait_activity_fingerprint(pr, self.GEMINI, self.AFTER) == _fgt.review_activity_fingerprint(pr, self.GEMINI, after_iso=self.AFTER)
+        assert _fgt.wait_activity_fingerprint(pr, self.GEMINI, self.AFTER) is not None
+
+    def test_copilot_blocking_wait_returns_only_once_the_head_is_reviewed(self, monkeypatch):
+        stale = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+        ready = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"),
+                         ("COMMENTED", "2026-10-07T16:31:00Z", "d7efa49"))
+        seen = {"n": 0}
+
+        def sequence(pr):
+            seen["n"] += 1
+            return stale if seen["n"] < 3 else ready
+
+        monkeypatch.setattr(_fgt, "fetch_threads", sequence)
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+
+        settled = _fgt.wait_for_stable_review(
+            PullRequest(owner="acme", repo="widget", number=159), author=self.COPILOT,
+            timeout_seconds=60, interval_seconds=1, quiet_seconds=0, after_iso=self.AFTER,
+        )
+
+        assert seen["n"] >= 3
+        assert settled["reviews"]["nodes"][-1]["commit"]["oid"] == "d7efa49"
+
+    def test_run_wait_chunk_copilot_waiting_then_ready(self, monkeypatch):
+        pr_ref = PullRequest(owner="acme", repo="widget", number=159)
+        stale = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+        ready = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:31:00Z", "d7efa49"))
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        # The wait budget is measured from the request anchor, so anchor "now".
+        after = _fgt._dt.datetime.now(_fgt._dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        monkeypatch.setattr(_fgt, "fetch_threads", lambda pr: stale)
+        first = _fgt.run_wait_chunk(pr_ref, self.COPILOT, timeout_seconds=600, interval_seconds=1,
+                                    quiet_seconds=0, after_iso=after, chunk_seconds=0)
+        assert first["status"] == "waiting"
+
+        monkeypatch.setattr(_fgt, "fetch_threads", lambda pr: ready)
+        second = _fgt.run_wait_chunk(pr_ref, self.COPILOT, timeout_seconds=600, interval_seconds=1,
+                                     quiet_seconds=0, after_iso=after, chunk_seconds=0)
+        assert second["status"] == "ready"
