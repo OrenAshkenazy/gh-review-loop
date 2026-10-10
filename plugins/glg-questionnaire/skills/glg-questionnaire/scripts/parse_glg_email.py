@@ -230,12 +230,16 @@ def detect_kind(subject: str, links: list[dict[str, Any]], answers: list) -> str
     """
     low = subject.lower()
     roles = {link["role"] for link in links}
+    explicit = next((kind for needle, kind in SUBJECT_KIND_HINTS if needle in low), None)
+    # A survey or payment subject is the message's own statement of what it is,
+    # and it outranks every link: a survey email quoting an earlier GLG thread
+    # carries that thread's follow-up URL, and routing on the link would send a
+    # paid survey into questionnaire automation (hard rule 4).
+    if explicit in {"survey", "payment"}:
+        return explicit
     if "followup" in roles:
         return "followup"
-    explicit = next((kind for needle, kind in SUBJECT_KIND_HINTS if needle in low), None)
-    # The subject naming an acceptance confirmation, a survey or a payment is
-    # the message's own statement of what it is.
-    if explicit in {"survey", "payment", "accept_confirmation", "call_reminder", "call_request"}:
+    if explicit in {"accept_confirmation", "call_reminder", "call_request"}:
         return explicit
     if "accept" in roles:
         return "invitation"

@@ -239,3 +239,20 @@ def test_topical_questions_are_not_swept_up_by_the_compliance_patterns():
         "Please rate your familiarity with these public cloud platforms.",
     ):
         assert not bank.is_attestation(question), question
+
+
+@pytest.mark.parametrize("question", [
+    "Which previous projects have you completed through GLG?",
+    "Have you worked on similar projects via GLG before?",
+    "How many consultations have you completed with GLG this year?",
+    "Please list the prior engagements you have done for GLG.",
+])
+def test_prior_project_questions_are_refused_in_either_word_order(question, tmp_path, monkeypatch):
+    """The first pass only matched "other GLG" and "GLG project(s)". GLG's
+    confidentiality section covers the question however it is phrased (PR #116
+    review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+
+    assert bank.is_attestation(question), question
+    with pytest.raises(bank.NotReusable):
+        bank.add_entry(question, "None")
