@@ -1,0 +1,312 @@
+{
+  "_source": "Field shapes and Copilot overview markup recorded from live Copilot reviews on public GitHub PRs (block/schemabot#1669, haacked/dotfiles#235, 2026-10-07; request/review timing from the 2026-10-10 scan in docs/superpowers/specs/evidence). Repo, paths, and prose are replaced with generic stand-ins; the structure, author logins, overview scaffolding, alt-text severities, discussion anchors, and review commit linkage are verbatim.",
+  "requested_only": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "f4a55e30000000000000000000000000000000f4",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": []},
+    "reviewRequests": {"nodes": [
+      {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "timelineItems": {"nodes": [
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T15:42:27Z",
+       "actor": {"login": "a-human"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "reviewThreads": {"nodes": []}
+  },
+  "initial": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "f4a55e30000000000000000000000000000000f4",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_initial",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\nThe provider test exceeds the repository's timeout limit, and the mapping test bypasses the production parser.\n\n<details open>\n<summary><strong>2 open findings</strong></summary>\n\n- <picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-dark.svg\"><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-light.png\" alt=\"High severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test exceeds 30-second limit](#discussion_r4208919854) · New\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/medium-v2-light.png\" alt=\"Medium severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test bypasses production parser](#discussion_r4208919952) · New\n</details>\n\n<details>\n<summary><strong>What changed in this PR</strong></summary>\n\nTightens the provider mapping and its tests.\n</details>\n\n🧠 **Review effort:** Balanced\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T15:46:14Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
+        "commit": {"oid": "f4a55e30000000000000000000000000000000f4"}
+      }
+    ]},
+    "reviewRequests": {"nodes": []},
+    "timelineItems": {"nodes": [
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T15:42:27Z",
+       "actor": {"login": "a-human"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "reviewThreads": {"nodes": [
+      {
+        "id": "PRRT_t1", "isResolved": false, "isOutdated": false,
+        "path": "src/provider_test.js", "line": 42, "startLine": null,
+        "originalLine": 42, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c1",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This raises one test operation's deadline above the repository's hard 30-second limit. Keep the retry behavior but shorten the delay for this test and keep the 30-second bound.",
+           "createdAt": "2026-10-07T15:46:14Z", "updatedAt": "2026-10-07T15:46:14Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919854",
+           "path": "src/provider_test.js", "line": 42, "startLine": null,
+           "originalLine": 42, "originalStartLine": null,
+           "diffHunk": "@@ -40,3 +40,3 @@\n-  timeout: 30_000,\n+  timeout: 60_000,"}
+        ]}
+      },
+      {
+        "id": "PRRT_t2", "isResolved": false, "isOutdated": false,
+        "path": "src/mapping_test.js", "line": 17, "startLine": null,
+        "originalLine": 17, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c2",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This recreates strict decoding instead of exercising the production parser, so it would still pass if the production path stopped enabling strict mode. Call the production parser and assert on its error.",
+           "createdAt": "2026-10-07T15:46:15Z", "updatedAt": "2026-10-07T15:46:15Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919952",
+           "path": "src/mapping_test.js", "line": 17, "startLine": null,
+           "originalLine": 17, "originalStartLine": null,
+           "diffHunk": "@@ -15,3 +15,3 @@\n-  parse(input)\n+  strictParse(input)"}
+        ]}
+      }
+    ]}
+  },
+  "pending_rereview": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "d7efa4900000000000000000000000000000000d7",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_initial",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\nThe provider test exceeds the repository's timeout limit, and the mapping test bypasses the production parser.\n\n<details open>\n<summary><strong>2 open findings</strong></summary>\n\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-light.png\" alt=\"High severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test exceeds 30-second limit](#discussion_r4208919854) · New\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/medium-v2-light.png\" alt=\"Medium severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test bypasses production parser](#discussion_r4208919952) · New\n</details>\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T15:46:14Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
+        "commit": {"oid": "f4a55e30000000000000000000000000000000f4"}
+      }
+    ]},
+    "reviewRequests": {"nodes": [
+      {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "timelineItems": {"nodes": [
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T15:42:27Z",
+       "actor": {"login": "a-human"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:20:05Z",
+       "actor": {"login": "loop-agent"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "reviewThreads": {"nodes": [
+      {
+        "id": "PRRT_t1", "isResolved": true, "isOutdated": true,
+        "path": "src/provider_test.js", "line": null, "startLine": null,
+        "originalLine": 42, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c1",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This raises one test operation's deadline above the repository's hard 30-second limit.",
+           "createdAt": "2026-10-07T15:46:14Z", "updatedAt": "2026-10-07T15:46:14Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919854",
+           "path": "src/provider_test.js", "line": null, "startLine": null,
+           "originalLine": 42, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      },
+      {
+        "id": "PRRT_t2", "isResolved": true, "isOutdated": true,
+        "path": "src/mapping_test.js", "line": null, "startLine": null,
+        "originalLine": 17, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c2",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This recreates strict decoding instead of exercising the production parser.",
+           "createdAt": "2026-10-07T15:46:15Z", "updatedAt": "2026-10-07T15:46:15Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919952",
+           "path": "src/mapping_test.js", "line": null, "startLine": null,
+           "originalLine": 17, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      }
+    ]}
+  },
+  "after_rereview": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "d7efa4900000000000000000000000000000000d7",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_initial",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\nThe provider test exceeds the repository's timeout limit, and the mapping test bypasses the production parser.\n\n<details open>\n<summary><strong>2 open findings</strong></summary>\n\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/high-v2-light.png\" alt=\"High severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test exceeds 30-second limit](#discussion_r4208919854) · New\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/medium-v2-light.png\" alt=\"Medium severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Test bypasses production parser](#discussion_r4208919952) · New\n</details>\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T15:46:14Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
+        "commit": {"oid": "f4a55e30000000000000000000000000000000f4"}
+      },
+      {
+        "id": "PRR_second",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\nOne follow-up on the retry delay override.\n\n<details open>\n<summary><strong>1 open finding</strong></summary>\n\n- <picture><img src=\"https://github.githubassets.com/static/images/icons/copilot-code-review/low-v2-light.png\" alt=\"Low severity\" width=\"62\" height=\"18\" align=\"texttop\"></picture> [Restore the retry delay in cleanup](#discussion_r4208920100) · New\n</details>\n\n🧠 **Review effort:** Balanced\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T16:20:05Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-2",
+        "commit": {"oid": "d7efa4900000000000000000000000000000000d7"}
+      }
+    ]},
+    "reviewRequests": {"nodes": []},
+    "timelineItems": {"nodes": [
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T15:42:27Z",
+       "actor": {"login": "a-human"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:20:05Z",
+       "actor": {"login": "loop-agent"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "reviewThreads": {"nodes": [
+      {
+        "id": "PRRT_t1", "isResolved": true, "isOutdated": true,
+        "path": "src/provider_test.js", "line": null, "startLine": null,
+        "originalLine": 42, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c1",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This raises one test operation's deadline above the repository's hard 30-second limit.",
+           "createdAt": "2026-10-07T15:46:14Z", "updatedAt": "2026-10-07T15:46:14Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919854",
+           "path": "src/provider_test.js", "line": null, "startLine": null,
+           "originalLine": 42, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      },
+      {
+        "id": "PRRT_t2", "isResolved": true, "isOutdated": true,
+        "path": "src/mapping_test.js", "line": null, "startLine": null,
+        "originalLine": 17, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c2",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This recreates strict decoding instead of exercising the production parser.",
+           "createdAt": "2026-10-07T15:46:15Z", "updatedAt": "2026-10-07T15:46:15Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919952",
+           "path": "src/mapping_test.js", "line": null, "startLine": null,
+           "originalLine": 17, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      },
+      {
+        "id": "PRRT_t3", "isResolved": false, "isOutdated": false,
+        "path": "src/provider_test.js", "line": 51, "startLine": null,
+        "originalLine": 51, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c3",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "The package has no parallel tests today, but restoring the global in cleanup avoids leaking the override into later tests.",
+           "createdAt": "2026-10-07T16:20:05Z", "updatedAt": "2026-10-07T16:20:05Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208920100",
+           "path": "src/provider_test.js", "line": 51, "startLine": null,
+           "originalLine": 51, "originalStartLine": null,
+           "diffHunk": "@@ -49,3 +49,4 @@\n+  DefaultRetryDelay = 10 * time.Millisecond"}
+        ]}
+      }
+    ]}
+  },
+  "clean": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "6f03c250000000000000000000000000000000f6",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_clean",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟢 Approval recommended\n\nThe status logic is consistent across bundled copies and covers the relevant transitions with focused tests.\n\n**0 open findings**\n\n<details>\n<summary><strong>What changed in this PR</strong></summary>\n\nTightens the provider mapping and its tests.\n</details>\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T17:18:25Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-3",
+        "commit": {"oid": "6f03c250000000000000000000000000000000f6"}
+      }
+    ]},
+    "reviewRequests": {"nodes": []},
+    "timelineItems": {"nodes": [
+      {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T17:16:57Z",
+       "actor": {"login": "loop-agent"},
+       "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+    ]},
+    "reviewThreads": {"nodes": []}
+  },
+  "clean_stale": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "6f03c250000000000000000000000000000000f6",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_clean_old",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\n### 🟢 Approval recommended\n\nLooks consistent.\n\n**0 open findings**\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T17:18:25Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-3",
+        "commit": {"oid": "f4a55e30000000000000000000000000000000f4"}
+      }
+    ]},
+    "reviewRequests": {"nodes": []},
+    "timelineItems": {"nodes": []},
+    "reviewThreads": {"nodes": []}
+  },
+  "unparseable": {
+    "number": 159,
+    "url": "https://github.com/acme/widget/pull/159",
+    "title": "Tighten provider mapping",
+    "headRefOid": "f4a55e30000000000000000000000000000000f4",
+    "comments": {"nodes": []},
+    "reviews": {"nodes": [
+      {
+        "id": "PRR_odd",
+        "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+        "body": "<!-- ccr-overview-v2 -->\n\nAn overview layout this parser does not know.\n",
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T15:46:14Z",
+        "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
+        "commit": {"oid": "f4a55e30000000000000000000000000000000f4"}
+      }
+    ]},
+    "reviewRequests": {"nodes": []},
+    "timelineItems": {"nodes": []},
+    "reviewThreads": {"nodes": [
+      {
+        "id": "PRRT_t1", "isResolved": false, "isOutdated": false,
+        "path": "src/provider_test.js", "line": 42, "startLine": null,
+        "originalLine": 42, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c1",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This raises one test operation's deadline above the repository's hard 30-second limit.",
+           "createdAt": "2026-10-07T15:46:14Z", "updatedAt": "2026-10-07T15:46:14Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919854",
+           "path": "src/provider_test.js", "line": 42, "startLine": null,
+           "originalLine": 42, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      },
+      {
+        "id": "PRRT_t2", "isResolved": false, "isOutdated": false,
+        "path": "src/mapping_test.js", "line": 17, "startLine": null,
+        "originalLine": 17, "originalStartLine": null, "diffSide": "RIGHT",
+        "comments": {"nodes": [
+          {"id": "PRRC_c2",
+           "author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
+           "body": "This recreates strict decoding instead of exercising the production parser.",
+           "createdAt": "2026-10-07T15:46:15Z", "updatedAt": "2026-10-07T15:46:15Z",
+           "url": "https://github.com/acme/widget/pull/159#discussion_r4208919952",
+           "path": "src/mapping_test.js", "line": 17, "startLine": null,
+           "originalLine": 17, "originalStartLine": null, "diffHunk": ""}
+        ]}
+      }
+    ]}
+  }
+}
