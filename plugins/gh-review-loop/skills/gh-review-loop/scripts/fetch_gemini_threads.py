@@ -1136,8 +1136,15 @@ def review_body_findings(
     return findings
 
 
+_PROVENANCE_UNSET = object()
+
+
 def review_request_count_complete(
-    pull_request: dict[str, Any], *, review_request_vendor: bool = True
+    pull_request: dict[str, Any],
+    *,
+    review_request_vendor: bool = True,
+    loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
+    counted_requests: int | None = None,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1152,6 +1159,13 @@ def review_request_count_complete(
     """
     if not review_request_vendor:
         return True
+    # Provenance is the third thing the count rests on: without a local record
+    # the loop cannot tell its own requests from the member's clicks. That only
+    # makes the number a bound when there is something to attribute — with no
+    # candidate requests at all, zero is exact. Callers that pass neither get
+    # the page-limit answer alone (back-compat).
+    if loop_request_times is None and counted_requests:
+        return False
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
     reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     return len(nodes) < PAGE_LIMIT_TIMELINE and len(reviews) < PAGE_LIMIT_REVIEWS
@@ -1563,16 +1577,24 @@ def _state_key(pr: PullRequest) -> str:
 def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str] | None:
     """Timestamps this loop recorded for its own review requests on ``pr``.
 
-    None when the reviewer is not a review-request vendor (the comment path
-    counts mentions, not events) — the caller then keeps the actor filter.
+    None means "no usable record": the reviewer is not a review-request vendor
+    (the comment path counts mentions, not events), the PR has no local
+    history, or a state write failed after a POST and marked the history
+    incomplete. The caller then keeps the actor filter — an over-count, which
+    is the safe direction — and reports the count as incomplete.
     """
     vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
     entry = load_sticky_state().get(_state_key(pr), {})
-    requests = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+        return None
+    requests = entry.get("review_requests")
     if not isinstance(requests, list):
-        return []
+        # No record for this PR: unknown, not empty. An empty list is
+        # authoritative to the counter and would display zero cap usage, so the
+        # loop would run another fix/push cycle before the write refuses.
+        return None
     out = []
     for item in requests:
         if not isinstance(item, dict):
@@ -4641,10 +4663,15 @@ def main() -> int:
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
                         "limitReached": len(rereviews) >= args.max_rereview_requests,
-                        # False when the timeline page was full: the count
-                        # above is then a lower bound (review-request vendors).
+                        # False when a page the count rests on was full, or
+                        # when the loop has no local record of its own
+                        # requests: the count above is then a bound, not a
+                        # count (review-request vendors).
                         "reReviewCountComplete": review_request_count_complete(
-                            pull_request, review_request_vendor=review_request_vendor
+                            pull_request,
+                            review_request_vendor=review_request_vendor,
+                            loop_request_times=loop_request_times(pr, args.author),
+                            counted_requests=len(rereviews),
                         ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),

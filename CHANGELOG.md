@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **The fetch propagates unknown request provenance.** The write side already
+  refused to guess; the fetch still treated a missing or incomplete local
+  record as an authoritative empty list, so the loop could display zero cap
+  usage and run another fix/push cycle before the write refused. Unknown
+  provenance now falls back to the actor filter and sets
+  `reReviewCountComplete: false` — unless there is nothing to attribute, where
+  zero is exact.
+
 - **Reviewer discovery paginates review authors.** A clean Copilot pass leaves
   no thread, so its review is the only evidence it reviewed; on a PR with more
   than 100 reviews that review fell outside the unpaginated page and discovery

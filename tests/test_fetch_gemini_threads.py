@@ -4553,3 +4553,74 @@ class TestDiscoveryPaginatesReviewAuthors:
             result["pull_request"], self_login=None
         )
         assert [c.login for c in candidates] == ["copilot-pull-request-reviewer"]
+
+
+class TestFetchProvenanceUnknown:
+    """The fetch must carry the same uncertainty the request script does, or
+    the loop displays zero cap usage and runs another fix/push cycle before the
+    write refuses (PR #116 review)."""
+
+    PR = _fgt.PullRequest(owner="acme", repo="widget", number=159, url="u")
+
+    @staticmethod
+    def _pr_with_requests():
+        first_review = "2026-10-07T15:46:14Z"
+        return {
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer"}, "state": "COMMENTED",
+                 "submittedAt": first_review, "commit": {"oid": "a"}},
+            ]},
+            "timelineItems": {"nodes": [
+                {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:20:05Z",
+                 "actor": {"login": "agent"},
+                 "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+            ]},
+        }
+
+    def test_no_state_entry_is_unknown_not_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
+    def test_an_incomplete_marker_is_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {
+            "review_requests": [{"reviewer": "copilot-pull-request-reviewer", "at": "2026-10-07T16:20:05Z"}],
+            "review_requests_incomplete": True,
+        }})
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
+    def test_a_recorded_history_is_used(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {
+            "review_requests": [{"reviewer": "copilot-pull-request-reviewer", "at": "2026-10-07T16:20:05Z"}],
+        }})
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
+
+    def test_unknown_provenance_marks_the_count_incomplete(self):
+        pr = self._pr_with_requests()
+
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=None, counted_requests=1
+        ) is False
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
+        ) is True
+
+    def test_unknown_provenance_with_nothing_to_attribute_is_still_exact(self):
+        """Cycle 0 on a fresh PR: no record and no requests, so zero is not a
+        bound, it is the count."""
+        assert _fgt.review_request_count_complete(
+            self._pr_with_requests(), loop_request_times=None, counted_requests=0
+        ) is True
+
+    def test_unknown_provenance_still_counts_candidates_so_the_cap_is_not_understated(self):
+        pr = self._pr_with_requests()
+
+        counted = _fgt.rereview_requests(
+            pr, "agent", reviewer_login="copilot-pull-request-reviewer", loop_request_times=None
+        )
+
+        assert len(counted) == 1
