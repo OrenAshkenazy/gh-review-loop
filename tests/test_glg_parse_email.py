@@ -237,3 +237,47 @@ class TestPlaintextLinksAreRejected:
         links = pge.extract_links(body)
 
         assert [link["cpid"] for link in links] == ["2"]
+
+
+class TestRobustKindAndExpiry:
+    def test_an_out_of_range_jwt_expiry_does_not_abort_parsing(self):
+        """`datetime.fromtimestamp()` raises OverflowError (OSError on some
+        platforms) for an absurd `exp`. The link is still a link; only its
+        expiry is unknown (PR #116 review)."""
+        huge = base64.urlsafe_b64encode(json.dumps({"exp": 10 ** 20}).encode()).decode().rstrip("=")
+        url = f"https://members.glgresearch.com/accept/accept?cpid=7&_session=hdr.{huge}.sig"
+
+        assert pge._jwt_expiry(f"hdr.{huge}.sig") is None
+
+        links = pge.extract_links(f"Review Project Now: {url}")
+        assert [link["role"] for link in links] == ["accept"]
+        assert links[0]["expires_at"] is None
+
+    def test_a_followup_link_beats_quoted_qa_text(self):
+        """A reply quoting an earlier confirmation carries Q:/A: lines. The
+        actionable signal is the follow-up link, not the quoted text, or the
+        loop seeds stale answers and misses an open follow-up (PR #116
+        review)."""
+        body = (
+            "Please answer these: https://members.glgresearch.com/cm-accept-followup/abc?cpid=5\n"
+            "\n> On an earlier project you told us:\n"
+            "Q: Familiarity with Datadog?\nA: \"Very Familiar\"\n"
+        )
+
+        parsed = pge.parse(body, "GLG: Follow up on your acceptance for Observability")
+
+        assert parsed["kind"] == "followup"
+
+    def test_a_survey_subject_beats_quoted_qa_text(self):
+        body = "Q: Familiarity with Datadog?\nA: \"Very Familiar\"\n"
+
+        parsed = pge.parse(body, "GLG: Paid survey opportunity on Observability")
+
+        assert parsed["kind"] == "survey"
+
+    def test_a_real_accept_confirmation_is_still_detected(self):
+        parsed = pge.parse(fixture("accept_confirmation.txt"),
+                           "GLG: Accept Confirmation – Cloud Security Platforms")
+
+        assert parsed["kind"] == "accept_confirmation"
+        assert parsed["recorded_answers"]

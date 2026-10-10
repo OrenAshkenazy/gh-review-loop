@@ -77,16 +77,41 @@ class NotReusable(ValueError):
 # would come back from lookup() as a BANK suggestion, which is exactly the
 # answer the member must give afresh — so the store refuses them rather than
 # relying on the agent to remember.
+# The list mirrors references/compliance.md, "Questions that always go to the
+# member", class for class. A class missing here is an answer the bank would
+# offer back as BANK for a compliance attestation — the one place a stale
+# answer is not merely unhelpful but wrong.
 ATTESTATION_PATTERNS = [
+    # Current employment, and contacting it.
     re.compile(r"\bcurrent(ly)?\b[^.?]*\bemploy", re.IGNORECASE),
     re.compile(r"\bemploy(ed|er|ment)\b[^.?]*\b(now|current|present|today)", re.IGNORECASE),
     re.compile(r"\bwho is your (current )?employer\b", re.IGNORECASE),
+    re.compile(r"\b(may|can) we contact\b", re.IGNORECASE),
+    re.compile(r"\bdo you work for any of these\b", re.IGNORECASE),
+    # Conflicts and non-public information.
     re.compile(r"\bconflict(s)? of interest\b|\bhave a conflict\b", re.IGNORECASE),
+    re.compile(r"\b(material )?non[- ]public information\b", re.IGNORECASE),
+    re.compile(r"\binside information\b", re.IGNORECASE),
+    # Recording consent.
     re.compile(r"\brecord(ed|ing)\b[^.?]*\b(consent|permission|agree|call)\b", re.IGNORECASE),
     re.compile(r"\bconsent\b[^.?]*\brecord", re.IGNORECASE),
+    # Blinded clients.
     re.compile(r"\bsingle[- ]blind(ed)?\b", re.IGNORECASE),
     re.compile(r"\bblinded client\b", re.IGNORECASE),
-    re.compile(r"\bnon[- ]public information\b", re.IGNORECASE),
+    # Pending trials and litigation.
+    re.compile(r"\bpending\b[^.?]*\b(trial|litigation|lawsuit|proceeding)", re.IGNORECASE),
+    re.compile(r"\b(trial|litigation|lawsuit)\b[^.?]*\b(pending|ongoing|involved)", re.IGNORECASE),
+    # Government and public-sector roles.
+    re.compile(r"\bgovernment\b[^.?]*\b(role|official|position|employee|service)", re.IGNORECASE),
+    re.compile(r"\bpublic[- ]sector\b[^.?]*\b(role|position|employ)", re.IGNORECASE),
+    re.compile(r"\bpublic official\b", re.IGNORECASE),
+    # Public-company employment within the last six months.
+    re.compile(r"\bpublicly[- ]traded\b", re.IGNORECASE),
+    re.compile(r"\bpublic company\b[^.?]*\b(employ|work|officer|board)", re.IGNORECASE),
+    re.compile(r"\b(six|6) months\b[^.?]*\b(employ|work|left|depart)", re.IGNORECASE),
+    re.compile(r"\b(employ|work|left|depart)[^.?]*\b(six|6) months\b", re.IGNORECASE),
+    # Other GLG projects.
+    re.compile(r"\bother GLG\b|\bGLG projects?\b", re.IGNORECASE),
 ]
 
 

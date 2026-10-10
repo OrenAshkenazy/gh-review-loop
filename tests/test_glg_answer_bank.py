@@ -204,3 +204,38 @@ def test_an_ordinary_question_is_still_stored(tmp_path, monkeypatch):
     bank.add_entry("Which observability vendors have you evaluated?", ["Datadog", "Grafana"])
 
     assert len(bank.load_entries()) == 1
+
+
+COMPLIANCE_QUESTIONS = [
+    "Do you hold, or have you held, any government or public-sector role?",
+    "Are you involved in any pending trial or litigation?",
+    "Have you been employed by a publicly traded company within the last six months?",
+    "Which other GLG projects have you participated in?",
+    "Do you have access to material non-public information about this company?",
+    "May we contact your current employer?",
+]
+
+
+@pytest.mark.parametrize("question", COMPLIANCE_QUESTIONS)
+def test_every_class_in_compliance_md_is_refused(question, tmp_path, monkeypatch):
+    """references/compliance.md lists the questions that always go to the
+    member. The predicate must cover all of them, not just the first four: a
+    reused answer here produces a false compliance attestation (PR #116
+    review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+
+    assert bank.is_attestation(question), question
+    with pytest.raises(bank.NotReusable):
+        bank.add_entry(question, "No")
+
+
+def test_topical_questions_are_not_swept_up_by_the_compliance_patterns():
+    """The guard must not refuse ordinary project questions; an over-broad
+    predicate would push every answer to NEEDS MEMBER."""
+    for question in (
+        "Which observability vendors have you evaluated in the last two years?",
+        "How many engineers does your organisation employ?",
+        "What drove the decision to move off your previous government cloud vendor?",
+        "Please rate your familiarity with these public cloud platforms.",
+    ):
+        assert not bank.is_attestation(question), question

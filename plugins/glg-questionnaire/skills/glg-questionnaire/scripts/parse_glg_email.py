@@ -72,9 +72,12 @@ def _jwt_expiry(token: str) -> str | None:
     try:
         data = json.loads(base64.urlsafe_b64decode(payload))
         exp = int(data["exp"])
-    except (ValueError, KeyError, TypeError):
+        # An out-of-range exp raises OverflowError here (OSError on some
+        # platforms). The link is still a link; only its expiry is unknown, and
+        # one odd token must not abort parsing of the whole email.
+        return datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+    except (ValueError, KeyError, TypeError, OverflowError, OSError):
         return None
-    return datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
 
 
 def classify_link(url: str) -> str:
@@ -218,17 +221,28 @@ def extract_recorded_answers(body: str) -> list[dict[str, Any]]:
 
 
 def detect_kind(subject: str, links: list[dict[str, Any]], answers: list) -> str:
+    """What kind of GLG message this is.
+
+    Actionable signals come first. Q:/A: text is weak evidence — a reply that
+    quotes an earlier confirmation carries it — so an open follow-up link, a
+    live accept link or an explicit survey subject outranks it. Reading it the
+    other way round seeded stale answers and hid work the member still owes.
+    """
     low = subject.lower()
-    if answers:
-        return "accept_confirmation"
     roles = {link["role"] for link in links}
     if "followup" in roles:
         return "followup"
+    explicit = next((kind for needle, kind in SUBJECT_KIND_HINTS if needle in low), None)
+    # The subject naming an acceptance confirmation, a survey or a payment is
+    # the message's own statement of what it is.
+    if explicit in {"survey", "payment", "accept_confirmation", "call_reminder", "call_request"}:
+        return explicit
     if "accept" in roles:
         return "invitation"
-    for needle, kind in SUBJECT_KIND_HINTS:
-        if needle in low:
-            return kind
+    if answers:
+        return "accept_confirmation"
+    if explicit:
+        return explicit
     if low.endswith("- glg") or "glg -" in low:
         return "invitation"
     return "other"
