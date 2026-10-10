@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **A review request GitHub accepts but does not register is refused, not
+  stamped.** The first live run (an account without Copilot code review) showed
+  the requested-reviewers POST returning 201 with no reviewer added, no pending
+  request and no timeline event — and the script reported `posted: true`,
+  consumed a cap slot and sent the loop into a wait nothing would end. REST
+  cannot tell that apart from a real Copilot request, so after a 201 the
+  script reads GraphQL `reviewRequests` (and the head's reviews) back, up to
+  three times a second apart, and reports `review_request_rejected` with
+  `reason: not_enabled` when the reviewer never appears. A read-back that fails
+  is `review_request_uncertain` / `registration_unknown` with nothing recorded.
+
 - **The fetch propagates unknown request provenance.** The write side already
   refused to guess; the fetch still treated a missing or incomplete local
   record as an authoritative empty list, so the loop could display zero cap

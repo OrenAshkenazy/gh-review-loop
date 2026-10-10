@@ -1184,6 +1184,9 @@ class TestReviewRequestMain:
             request_rereview, "post_rereview",
             lambda *a, **k: pytest.fail("a review_request vendor must never get a comment"),
         )
+        # GitHub registered the request (the live run showed it can answer 201
+        # and register nothing; tests about that stub this to False).
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
 
     @staticmethod
     def _fake_request(sink):
@@ -1350,6 +1353,76 @@ class TestReviewRequestMain:
         assert payload["posted"] is False
         assert "not enabled" in payload["message"]
         assert self._stamped(tmp_path) == 0
+
+    def test_a_request_github_accepts_but_does_not_register_is_refused_and_not_stamped(self, monkeypatch, capsys, tmp_path):
+        """Live run 2026-10-10 (OrenAshkenazy/copilot-review-lab#1, no Copilot plan):
+        POST → 201 with requested_reviewers [] and nothing on the PR — no
+        pending request, no timeline event. REST cannot tell that apart from a
+        real Copilot request (requested_reviewers is empty for Copilot either
+        way), so the script must confirm registration before claiming a post."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: False)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_rejected"
+        assert payload["reason"] == "not_enabled"
+        assert payload["http_status"] == 201
+        assert payload["retryable"] is False
+        assert payload["posted"] is False
+        assert "did not add" in payload["message"] and "plan" in payload["message"]
+        assert self._stamped(tmp_path) == 0
+
+    def test_a_registered_request_is_posted_and_stamped_once(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        seen = {}
+        monkeypatch.setattr(
+            request_rereview, "request_registered",
+            lambda repo, pr, vendor, requested_at, **k: seen.update(requested_at=requested_at) or True,
+        )
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["posted"] is True and payload["registered"] is True
+        assert seen["requested_at"] == CREATED_AT
+        assert self._stamped(tmp_path) == 1
+
+    def test_an_unverifiable_registration_is_uncertain_and_not_stamped(self, monkeypatch, capsys, tmp_path):
+        # GitHub answered 201 and the read-back failed: whether Copilot was
+        # added is unknown. Stamping would record a request that may not exist
+        # (cap drift); claiming nothing was posted would invite a duplicate.
+        # Report unknown, record nothing, and let the next state read decide
+        # (review_pending if it landed, absent if GitHub dropped it).
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: None)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["reason"] == "registration_unknown"
+        assert payload["http_status"] == 201
+        assert payload["posted"] is None and payload["outcome"] == "unknown"
+        assert payload["requested_at"] == CREATED_AT
+        assert "review_pending" in payload["message"]
+        assert self._stamped(tmp_path) == 0
+
+    def test_dry_run_never_checks_registration(self, monkeypatch, capsys):
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: pytest.fail("dry run posted nothing to confirm"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["would_post"] is True
 
     def test_rate_limit_is_retryable(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch)
@@ -1519,6 +1592,7 @@ class TestExplicitMentionOverridesPersistedVendor:
             lambda *a, **k: pytest.fail("an explicit @copilot mention must not post a comment"),
         )
         requested = {}
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
             requested.update(login=login)
             or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
@@ -1706,6 +1780,7 @@ class TestFreeInitialRequest:
             lambda *a, **k: pytest.fail("the free initial request needs no cap accounting"),
         )
         requested = {}
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
             requested.update(login=login)
             or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
@@ -1724,6 +1799,7 @@ class TestFreeInitialRequest:
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: self._state())
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
             "created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
             "reviewer": login, "posted": True,
@@ -1923,3 +1999,53 @@ class TestProvenanceFailsClosed:
         assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
         ) is None
+
+
+class TestRequestRegistered:
+    """After a 201, did GitHub actually add the reviewer?
+
+    Observed live (2026-10-10): on an account without Copilot code review the
+    POST for `copilot-pull-request-reviewer[bot]` (and `Copilot`, `copilot`)
+    returns 201 with `requested_reviewers: []`, and the PR gains no pending
+    request and no timeline event. Only GraphQL `reviewRequests` (or the
+    review itself landing on the head) proves registration.
+    """
+
+    REQUESTED_AT = "2026-10-10T16:40:01Z"
+
+    def _check(self, runner, sleeps=None, attempts=3):
+        return request_rereview.request_registered(
+            "acme/widget", 159, review_vendors.COPILOT, self.REQUESTED_AT,
+            runner=runner, attempts=attempts,
+            sleep=(sleeps.append if sleeps is not None else (lambda s: None)),
+        )
+
+    def test_true_when_graphql_lists_the_vendor_as_requested(self):
+        sleeps = []
+        assert self._check(_state_runner(_gql_pr("54845f0400", pending=[COPILOT_LOGIN])), sleeps) is True
+        assert sleeps == []
+
+    def test_false_after_retries_when_nothing_is_registered(self):
+        sleeps = []
+        assert self._check(_state_runner(_gql_pr("54845f0400")), sleeps, attempts=3) is False
+        # Registration is read back three times a second apart before giving up.
+        assert len(sleeps) == 2 and all(s >= 1 for s in sleeps)
+
+    def test_true_when_the_review_already_landed_on_the_head(self):
+        # Copilot's fastest observed turnaround is a few seconds; a review on
+        # the head submitted at or after the request is the request succeeding.
+        runner = _state_runner(
+            _gql_pr("54845f0400"),
+            reviews=[(COPILOT_LOGIN, "COMMENTED", "2026-10-10T16:40:05Z", "54845f0400")],
+        )
+        assert self._check(runner) is True
+
+    def test_an_older_review_of_the_head_does_not_count(self):
+        runner = _state_runner(
+            _gql_pr("54845f0400"),
+            reviews=[(COPILOT_LOGIN, "COMMENTED", "2026-10-10T16:39:00Z", "54845f0400")],
+        )
+        assert self._check(runner) is False
+
+    def test_none_when_the_read_fails(self):
+        assert self._check(_state_runner(None, rc=1)) is None

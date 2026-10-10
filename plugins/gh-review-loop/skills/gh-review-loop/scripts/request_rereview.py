@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,25 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
     gets created, so the honest answer is unknown plus a delayed state check.
     """
     detail = (exc.detail or "").strip() or "no detail from GitHub"
+    if exc.reason == "registration_unknown":
+        # GitHub answered 201, so the POST landed; what failed is reading back
+        # whether the reviewer was added (spec §6.1). Recording it could stamp
+        # a request that does not exist; denying it could invite a duplicate.
+        message = (
+            f"GitHub accepted the review request for `{reviewer}` (HTTP 201) but reading "
+            f"the PR's requested reviewers back failed ({detail}), so whether `{reviewer}` "
+            "was added is unknown. Nothing was recorded. Do not request again immediately: "
+            "re-run this script in a minute — its state check reports review_pending if "
+            "the request landed, and posts a fresh request only if GitHub dropped it."
+        )
+    else:
+        message = (
+            f"The review request for `{reviewer}` returned no HTTP status ({detail}), "
+            "and no matching request was visible on the PR timeline yet, so whether "
+            "GitHub accepted it is unknown. Do not request again immediately: the "
+            "timeline can lag by seconds. Re-read the PR state in a minute and "
+            "request again only if no review request from this agent appears."
+        )
     return {
         "status": "review_request_uncertain",
         "posted": None,
@@ -211,12 +231,34 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
         "http_status": exc.http_status,
         "retryable": exc.retryable,
         "requested_at": exc.requested_at,
+        "message": message,
+    }
+
+
+def not_enabled_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
+    """GitHub answered 201 but added nobody: Copilot code review is not available here.
+
+    Observed on the first live run (spec §6.1): without a plan that includes
+    code review, the POST succeeds, `requested_reviewers` stays empty, no
+    request is pending and no timeline event is written. Nothing to wait for,
+    nothing to count.
+    """
+    return {
+        "status": "review_request_rejected",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "reason": "not_enabled",
+        "http_status": exc.http_status,
+        "retryable": False,
+        "requested_at": exc.requested_at,
         "message": (
-            f"The review request for `{reviewer}` returned no HTTP status ({detail}), "
-            "and no matching request was visible on the PR timeline yet, so whether "
-            "GitHub accepted it is unknown. Do not request again immediately: the "
-            "timeline can lag by seconds. Re-read the PR state in a minute and "
-            "request again only if no review request from this agent appears."
+            f"GitHub accepted the review request for `{reviewer}` (HTTP 201) but did not add "
+            "it as a reviewer, and no review followed. That is what GitHub does when Copilot "
+            f"code review is not available for {repo}: the account needs a Copilot plan that "
+            "includes code review (Pro or above), or an organization that enables it for the "
+            "repository. Nothing is pending and the cap is unchanged; stop and tell the user."
         ),
     }
 
@@ -224,6 +266,8 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
 def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
     if exc.reason == "uncertain":
         return uncertain_payload(repo, pr, reviewer, exc)
+    if exc.reason == "not_enabled":
+        return not_enabled_payload(repo, pr, reviewer, exc)
     detail = (exc.detail or "").strip() or "no detail from GitHub"
     hints = {
         "permission": "Check that `gh` is authenticated as a user with write access to the PR.",
@@ -821,6 +865,65 @@ def confirm_posted_after_uncertain(
     return False
 
 
+def request_registered(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    requested_at: str | None,
+    runner: Any = None,
+    attempts: int = 3,
+    sleep: Any = None,
+) -> bool | None:
+    """After a 201, is ``vendor`` actually a requested reviewer on the PR?
+
+    GitHub answers 201 and adds nobody when Copilot code review is not
+    available for the repository (spec §6.1, first live run), and REST
+    ``requested_reviewers`` is empty for Copilot either way (LV-3), so the
+    only proof is GraphQL ``reviewRequests`` listing the vendor — or the
+    review itself already sitting on the head, submitted at or after the
+    request. Read back up to ``attempts`` times a second apart. None when the
+    reads fail (unknown), never a guess.
+    """
+    if runner is None:
+        runner = subprocess.run
+    if sleep is None:
+        sleep = time.sleep
+    owner, repo_name = parse_repo(repo)
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            sleep(1)
+        data = _gh_json(
+            ["gh", "api", "graphql", "-f", f"query={STATE_QUERY}",
+             "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"],
+            runner,
+        )
+        try:
+            pull = data["data"]["repository"]["pullRequest"]
+        except (KeyError, TypeError):
+            return None
+        if not isinstance(pull, dict):
+            return None
+        requests = (pull.get("reviewRequests") or {}).get("nodes") or []
+        if any(
+            isinstance(node, dict)
+            and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
+            for node in requests
+        ):
+            return True
+        head = pull.get("headRefOid") or ""
+        reviews = _all_reviews(repo, pr, runner)
+        if reviews is None:
+            return None
+        for review in reviews:
+            if review_vendors.vendor_for(_review_author(review)) is not vendor:
+                continue
+            if review.get("state") == "PENDING" or _review_commit(review) != head:
+                continue
+            if requested_at and (_review_submitted_at(review) or "") >= requested_at:
+                return True
+    return False
+
+
 def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
     return {
         "status": "capped",
@@ -1158,6 +1261,8 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
                 "reviewer": reviewer,
                 "posted": True,
                 "confirmed_after_uncertain": True,
+                # The timeline event is the registration.
+                "registered": True,
             }
         else:
             _emit(rejected_payload(args.repo, args.pr, reviewer, exc), json_output=json_output)
@@ -1165,6 +1270,40 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if not payload.get("dry_run") and "registered" not in payload:
+        # A 201 is not proof: without Copilot code review GitHub accepts the
+        # request and adds nobody (spec §6.1). Confirm before stamping, so a
+        # dropped request neither consumes the cap nor starts a wait.
+        registered = request_registered(args.repo, args.pr, vendor, payload.get("created_at"))
+        if registered is False:
+            _emit(
+                rejected_payload(
+                    args.repo, args.pr, reviewer,
+                    ReviewRequestRejected(
+                        "GitHub returned 201 but the reviewer was not added",
+                        reason="not_enabled", http_status=201, retryable=False,
+                        requested_at=payload.get("created_at"),
+                    ),
+                ),
+                json_output=json_output,
+            )
+            return 0
+        if registered is None:
+            # The read-back failed: unknown, not posted and not rejected.
+            # Nothing is recorded; the next run's state read settles it.
+            _emit(
+                uncertain_payload(
+                    args.repo, args.pr, reviewer,
+                    ReviewRequestRejected(
+                        "the requested-reviewers read-back failed",
+                        reason="registration_unknown", http_status=201, retryable=False,
+                        requested_at=payload.get("created_at"),
+                    ),
+                ),
+                json_output=json_output,
+            )
+            return 0
+        payload["registered"] = True
     payload["state"] = state["state"]
     payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
     if payload.get("dry_run"):

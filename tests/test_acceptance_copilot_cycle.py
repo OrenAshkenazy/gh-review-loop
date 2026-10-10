@@ -158,6 +158,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
                 "kind": "review_request", "reviewer": request_login, "posted": True}
 
     monkeypatch.setattr(request_rereview, "request_review", fake_request)
+    monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
     assert request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--json"]) == 0
     posted = json.loads(capsys.readouterr().out)
 

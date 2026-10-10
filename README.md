@@ -63,7 +63,7 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 - **`gh` CLI**, authenticated against the repos you'll run this on.
 - **Python 3.10+** and **git**.
 - **A reviewer bot that posts GitHub review threads on your PRs.** Codex, Gemini Code Assist and GitHub Copilot code review ship with full vendor knowledge. CodeRabbit, Qodo, Sourcery and others work once you give the loop their author login and re-review mention. There is no assumed default: on a PR with no reviewer configured the loop asks instead of guessing.
-- **For Copilot:** a Copilot subscription with code review enabled on the repo, and a `gh` token allowed to request reviewers on the PR (write access). Copilot reviews only when asked, so the loop sends the review request for you.
+- **For Copilot:** a Copilot subscription with code review enabled on the repo, and a `gh` token allowed to request reviewers on the PR (write access). Copilot reviews only when asked, so the loop sends the review request for you. Without that plan GitHub accepts the request and silently adds nobody; the loop detects that and stops with `review_request_rejected` / `not_enabled` instead of waiting.
 
 > **Note on Gemini Code Assist.** Gemini is a first-class reviewer here and works exactly as it always did, automatic first review included, on the enterprise GitHub app. Google [deprecated the consumer app 2026-06-18 and shut it down 2026-07-17](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review), so it can no longer be installed on the free tier. Nothing about its support here changed. Select it with `--reviewer gemini-code-assist`.
 

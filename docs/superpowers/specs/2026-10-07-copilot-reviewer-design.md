@@ -302,6 +302,25 @@ Each row is a named regression test; the owning file is in parentheses.
 | T21 | Regrade: older overview High, newer overview Low for same discussion id, both recorded with their commits | `low`, `reviewerSeveritySource.commit` is the newer commit (test_copilot_overview) |
 | T22 | Codex acceptance and Gemini fixtures unchanged | existing suites pass unmodified |
 
+### 6.1 Amendment (first live run, 2026-10-10)
+
+A new `reason`, `not_enabled`: GitHub answers **201 Created** to the POST for
+`copilot-pull-request-reviewer[bot]` (also for `Copilot` and `copilot`) and adds
+nobody when Copilot code review is not available for the repository — REST
+`requested_reviewers` is `[]`, GraphQL `reviewRequests` is empty, no
+`ReviewRequestedEvent` is written. The bare login
+`copilot-pull-request-reviewer` is a 422 ("not a collaborator"). Because REST
+`requested_reviewers` is also empty for a *registered* Copilot request (LV-3),
+the response cannot distinguish the two. After every 201 the script therefore
+reads GraphQL `reviewRequests` back (retrying three times a second apart, and
+accepting a vendor review on the head submitted at or after the request as
+proof too); if the vendor never appears it emits `review_request_rejected` /
+`not_enabled` (`http_status: 201`, `posted: false`), stamps nothing, and the
+cap is untouched (I3). A failed read-back is `review_request_uncertain` /
+`registration_unknown` (`posted: null`): nothing is recorded, because stamping
+could record a request that does not exist and denying it could invite a
+duplicate; the next run's state read settles it (PENDING → wait, ABSENT → post).
+
 ## 9. Live GitHub validation (requirements 1–3)
 
 Public PRs are read-only for us, but Copilot's behavior there is observable: request
@@ -337,6 +356,18 @@ gh api graphql -f query='query{repository(owner:"qizsecurity",name:"k8s-deploy")
 ```
 
 Paste the outputs into the PR description; they are the evidence for LV-1..6.
+
+**Run 1 — 2026-10-10, `OrenAshkenazy/copilot-review-lab#1`, head `54845f0`, account
+without a Copilot code review plan.** Discovery: no Copilot candidate (Sourcery
+had already reviewed). `--dry-run`: `state: ABSENT`, `would_post: true`. Real
+POST: 201, script said `posted: true`; immediate re-run: `ABSENT` again and a
+second 201. GraphQL afterwards: `reviewRequests: []`, no request events; REST
+`requested_reviewers: []`. Probes with `Copilot` and `copilot`: 201, nothing
+registered; `copilot-pull-request-reviewer`: 422. The head-anchored wait did not
+accept the Sourcery or Codex reviews of the same head and ran to its timeout.
+Outcome: the state machine's ABSENT reading was correct; the gap was trusting
+the 201 — fixed by §6.1. LV-1/LV-4 under this token remain open until a repo
+with Copilot code review is available.
 
 ## 10. Decisions amended since the grilling session
 
