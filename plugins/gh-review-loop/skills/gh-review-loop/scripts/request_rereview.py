@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Post an AI reviewer re-review request comment for a PR."""
+"""Request an AI reviewer re-review for a PR: a comment, or a review request.
+
+Comment vendors (Gemini, Codex) read an @mention posted as a PR comment.
+Review-request vendors (Copilot) ignore comments and are re-reviewed through
+GitHub's requested-reviewers API; GitHub does not deduplicate those requests,
+so this script resolves the PR's state first and only posts from ABSENT or
+STALE_PENDING (see docs/superpowers/specs/2026-10-07-copilot-reviewer-design.md §3).
+"""
 
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import re
 import subprocess
@@ -42,6 +50,178 @@ def no_safe_trigger_payload(reviewer_login: str) -> dict[str, Any]:
             f"No safe re-review trigger known for `{reviewer}`; "
             "pass --review-trigger-mention to enable re-review requests."
         ),
+    }
+
+
+# A pending review request older than this with no review for the head is
+# treated as abandoned and re-requested. Observed Copilot latency on public
+# PRs is 4 s to ~8 min (spec §9, LV-5).
+STALE_REQUEST_SECONDS = 1200
+
+# One read for the whole request-side state machine. REST `requested_reviewers`
+# is deliberately not used: it is empty while a Copilot request is pending
+# (spec §9, LV-3); only GraphQL `reviewRequests` lists the bot.
+STATE_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      headRefOid
+      reviews(last:100) {
+        nodes { author { login } state submittedAt commit { oid } }
+      }
+      reviewRequests(first:50) {
+        nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
+      }
+      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT]) {
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent {
+            createdAt
+            actor { login }
+            requestedReviewer { __typename ... on Bot { login } ... on User { login } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+class ReviewRequestRejected(RuntimeError):
+    """The requested-reviewers POST did not succeed.
+
+    ``reason`` classifies it (spec §6): permission, validation, not_found,
+    rate_limited, transient, or uncertain (no HTTP status — the request may
+    have landed). ``requested_at`` is the pre-POST timestamp an uncertain
+    outcome is reconciled against.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        reason: str = "uncertain",
+        http_status: int | None = None,
+        retryable: bool = False,
+        requested_at: str | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.reason = reason
+        self.http_status = http_status
+        self.retryable = retryable
+        self.requested_at = requested_at
+
+
+_HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
+
+
+def classify_gh_failure(stderr: str | None) -> tuple[str, int | None, bool]:
+    """(reason, http_status, retryable) for a failed ``gh api`` call.
+
+    No ``HTTP <code>`` in the output means the request may or may not have
+    reached GitHub: that is ``uncertain`` and never auto-retried.
+    """
+    text = stderr or ""
+    match = _HTTP_STATUS_RE.search(text)
+    if not match:
+        return ("uncertain", None, False)
+    code = int(match.group(1))
+    if code == 429 or (code == 403 and "rate limit" in text.lower()):
+        return ("rate_limited", code, True)
+    if code in (401, 403):
+        return ("permission", code, False)
+    if code == 404:
+        return ("not_found", code, False)
+    if code >= 500:
+        return ("transient", code, True)
+    return ("validation", code, False)
+
+
+def utc_now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _parse_iso(value: str) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def already_reviewed_payload(repo: str, pr: int, reviewer: str, head_sha: str) -> dict[str, Any]:
+    return {
+        "status": "already_reviewed_head",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "head": head_sha,
+        "message": (
+            f"`{reviewer}` has already reviewed the current head {head_sha[:7]}; "
+            "no new request was posted. Fetch that review instead of waiting."
+        ),
+    }
+
+
+def review_pending_payload(repo: str, pr: int, reviewer: str, pending_since: str | None) -> dict[str, Any]:
+    since = f" since {pending_since}" if pending_since else ""
+    return {
+        "status": "review_pending",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "pending_since": pending_since,
+        "message": (
+            f"A review by `{reviewer}` is already pending{since}; no new request was "
+            "posted (a second request would produce a second review). Wait for it."
+        ),
+    }
+
+
+def head_mismatch_payload(repo: str, pr: int, expected_head: str, head: str) -> dict[str, Any]:
+    return {
+        "status": "head_mismatch",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "expected_head": expected_head,
+        "head": head,
+        "message": (
+            f"The PR head on GitHub is {head[:7]} but --expect-head is {expected_head[:7]}; "
+            "the push has not landed yet. Nothing was posted; retry shortly."
+        ),
+    }
+
+
+def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
+    detail = (exc.detail or "").strip() or "no detail from GitHub"
+    hints = {
+        "permission": "Check that `gh` is authenticated as a user with write access to the PR.",
+        "validation": "Check that this reviewer is enabled for the repository (Copilot code review needs a Pro, Pro+, Max, Business or Enterprise plan).",
+        "not_found": "Check the repository and PR number, and that the token can see the repository.",
+        "rate_limited": "GitHub rate limit; retry in a few minutes.",
+        "transient": "GitHub-side error; retry.",
+        "uncertain": "The request may or may not have reached GitHub; it was not found on the PR timeline. Re-run — the state check prevents a duplicate.",
+    }
+    return {
+        "status": "review_request_rejected",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "reason": exc.reason,
+        "http_status": exc.http_status,
+        "retryable": exc.retryable,
+        "message": (
+            f"GitHub did not accept the review request for `{reviewer}` ({exc.reason}"
+            f"{', HTTP ' + str(exc.http_status) if exc.http_status else ''}): {detail}. "
+            f"{hints.get(exc.reason, '')} Nothing was posted."
+        ).strip(),
     }
 
 
@@ -119,6 +299,24 @@ def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
     if not isinstance(login, str) or not login:
         return None
     return reviewer
+
+
+def resolve_reviewer_login(
+    *,
+    repo: str,
+    pr: int,
+    reviewer_login: str | None,
+    reviewer_mention: str | None,
+) -> str | None:
+    """Which reviewer this run is about: explicit login, else persisted, else the mention."""
+    if reviewer_login:
+        return reviewer_login
+    persisted = read_persisted_reviewer(repo, pr)
+    if persisted:
+        return str(persisted["login"])
+    if reviewer_mention:
+        return reviewer_mention.lstrip("@")
+    return None
 
 
 def resolve_review_trigger(
@@ -274,6 +472,179 @@ def count_agent_pings(
     return count
 
 
+def _gh_json(cmd: list[str], runner: Any) -> Any:
+    """Run a gh command and parse its JSON stdout; None on any failure."""
+    try:
+        result = runner(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    if "--paginate" in cmd:
+        return parse_paginated_json(result.stdout)
+    try:
+        return json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+
+
+def request_state(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    runner: Any = None,
+    now: _dt.datetime | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the review-request state machine for ``vendor`` on the PR (spec §3).
+
+    Returns ``{"state", "head", "pending_since", "first_completed_review_at"}``
+    with ``state`` one of COMPLETED_HEAD (a submitted vendor review covers the
+    head), PENDING (requested, no review for the head yet), STALE_PENDING
+    (pending for at least STALE_REQUEST_SECONDS), ABSENT (nothing pending,
+    head unreviewed). None when the PR cannot be read.
+    """
+    if runner is None:
+        runner = subprocess.run
+    owner, repo_name = parse_repo(repo)
+    data = _gh_json(
+        ["gh", "api", "graphql", "-f", f"query={STATE_QUERY}",
+         "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"],
+        runner,
+    )
+    try:
+        pull = data["data"]["repository"]["pullRequest"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(pull, dict):
+        return None
+    head = pull.get("headRefOid") or ""
+    if not head:
+        return None
+
+    reviews = (pull.get("reviews") or {}).get("nodes") or []
+    vendor_reviews = [
+        review for review in reviews
+        if isinstance(review, dict)
+        and review_vendors.vendor_for((review.get("author") or {}).get("login")) is vendor
+    ]
+    completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
+    completed_head = any((review.get("commit") or {}).get("oid") == head for review in completed)
+
+    requests = (pull.get("reviewRequests") or {}).get("nodes") or []
+    pending = any(
+        isinstance(node, dict)
+        and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
+        for node in requests
+    ) or any(review.get("state") == "PENDING" for review in vendor_reviews)
+
+    events = [
+        reviewer_resolver.normalize_request_event(node)
+        for node in (pull.get("timelineItems") or {}).get("nodes") or []
+    ]
+    vendor_events = sorted(
+        (event for event in events
+         if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor),
+        key=lambda event: event["created_at"],
+    )
+    completed_times = [review.get("submittedAt") or "" for review in completed]
+    pending_since = None
+    if vendor_events:
+        newest = vendor_events[-1]["created_at"]
+        if not any(submitted > newest for submitted in completed_times):
+            pending_since = newest
+
+    if completed_head:
+        state = "COMPLETED_HEAD"
+    elif pending:
+        state = "PENDING"
+        since = _parse_iso(pending_since) if pending_since else None
+        if since is not None:
+            now = now or _dt.datetime.now(_dt.timezone.utc)
+            if (now - since).total_seconds() >= STALE_REQUEST_SECONDS:
+                state = "STALE_PENDING"
+    else:
+        state = "ABSENT"
+    return {
+        "state": state,
+        "head": head,
+        "pending_since": pending_since,
+        "first_completed_review_at": reviewer_resolver.first_completed_review_at(reviews, vendor),
+    }
+
+
+def _timeline_events(repo: str, pr: int, runner: Any) -> list[Any] | None:
+    owner, repo_name = parse_repo(repo)
+    events = _gh_json(
+        ["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{pr}/timeline"],
+        runner,
+    )
+    return events if isinstance(events, list) else None
+
+
+def count_agent_review_requests(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    agent_login: str | None,
+    first_completed_review_at: str | None,
+    runner: Any = None,
+) -> int | None:
+    """Count the agent's review requests for ``vendor`` that consume the cap.
+
+    The REST timeline is the complete record of who clicked or called
+    "request review" (paginated, unlike the fetch's GraphQL page). The rule
+    itself lives in ``reviewer_resolver.counted_review_requests`` so the fetch
+    and this script can never disagree. None when it cannot be established.
+    """
+    if not agent_login:
+        return None
+    if runner is None:
+        runner = subprocess.run
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return None
+    return len(reviewer_resolver.counted_review_requests(
+        events,
+        agent_login=agent_login,
+        vendor=vendor,
+        first_completed_review_at=first_completed_review_at,
+    ))
+
+
+def confirm_posted_after_uncertain(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    agent_login: str | None,
+    requested_at: str | None,
+    runner: Any = None,
+) -> bool:
+    """After an uncertain POST, did the agent's request land on the timeline?
+
+    ``>=`` on the timestamp: GitHub stamps to the second, so a request that
+    landed within the same second as the local pre-POST time still counts.
+    """
+    if not agent_login or not requested_at:
+        return False
+    if runner is None:
+        runner = subprocess.run
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return False
+    for raw in events:
+        event = reviewer_resolver.normalize_request_event(raw)
+        if event is None:
+            continue
+        if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
+            continue
+        if event["actor_login"] == agent_login and event["created_at"] >= requested_at:
+            return True
+    return False
+
+
 def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
     return {
         "status": "capped",
@@ -396,9 +767,162 @@ def post_rereview(
     }
 
 
+def request_review(
+    repo: str,
+    pr: int,
+    request_login: str,
+    runner: Any = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Add ``request_login`` as a requested reviewer and return the result payload.
+
+    This is how review_request vendors (Copilot) are asked for another look:
+    the same call for the first request and every re-request. ``created_at``
+    is local UTC taken just before the POST (the response is the PR object
+    and carries no event timestamp); it is narration and the reconciliation
+    anchor for an uncertain outcome, never what the waiter keys on.
+    """
+    if runner is None:
+        runner = subprocess.run
+    owner, repo_name = parse_repo(repo)
+    if not isinstance(pr, int) or pr <= 0:
+        raise ValueError("--pr must be a positive integer")
+    if not request_login:
+        raise ValueError("review_request vendor has no request login")
+
+    if dry_run:
+        return {
+            "created_at": None,
+            "repo": repo,
+            "pr": pr,
+            "kind": "review_request",
+            "reviewer": request_login,
+            "dry_run": True,
+            "posted": False,
+        }
+
+    requested_at = utc_now_iso()
+    cmd = [
+        "gh",
+        "api",
+        f"repos/{owner}/{repo_name}/pulls/{pr}/requested_reviewers",
+        "--method",
+        "POST",
+        "--raw-field",
+        f"reviewers[]={request_login}",
+    ]
+    try:
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ReviewRequestRejected(
+            f"could not run gh api: {exc}", reason="uncertain", requested_at=requested_at
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        reason, http_status, retryable = classify_gh_failure(detail)
+        raise ReviewRequestRejected(
+            detail or "gh api failed",
+            reason=reason,
+            http_status=http_status,
+            retryable=retryable,
+            requested_at=requested_at,
+        )
+    return {
+        "created_at": requested_at,
+        "repo": repo,
+        "pr": pr,
+        "kind": "review_request",
+        "reviewer": request_login,
+        "posted": True,
+    }
+
+
+def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"[loop] {payload['message']}")
+
+
+def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
+    """The review_request path (spec §3): resolve state, dedupe, cap, POST, stamp."""
+    reviewer = vendor.request_login
+    json_output = args.json_output
+    if args.phrase is not None or args.reviewer_mention:
+        print(
+            f"warning: {vendor.display_name} is re-reviewed through a review "
+            "request, not a comment; ignoring --phrase/--review-trigger-mention.",
+            file=sys.stderr,
+        )
+    state = request_state(args.repo, args.pr, vendor)
+    if state is None:
+        _emit(
+            uncountable_count_payload(args.repo, args.pr, effective_cap(args.max_rereview_requests)),
+            json_output=json_output,
+        )
+        return 0
+    if args.expect_head and args.expect_head != state["head"]:
+        _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
+        return 0
+    if state["state"] == "COMPLETED_HEAD":
+        _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
+        return 0
+    if state["state"] == "PENDING":
+        _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
+        return 0
+    if not args.no_cap_check:
+        cap = effective_cap(args.max_rereview_requests)
+        used = count_agent_review_requests(
+            args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]
+        )
+        if used is None:
+            _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
+            return 0
+        if used >= cap:
+            _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
+            return 0
+    try:
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+    except ReviewRequestRejected as exc:
+        if exc.reason == "uncertain" and confirm_posted_after_uncertain(
+            args.repo, args.pr, vendor, gh_login(), exc.requested_at
+        ):
+            payload = {
+                "created_at": exc.requested_at,
+                "repo": args.repo,
+                "pr": args.pr,
+                "kind": "review_request",
+                "reviewer": reviewer,
+                "posted": True,
+                "confirmed_after_uncertain": True,
+            }
+        else:
+            _emit(rejected_payload(args.repo, args.pr, reviewer, exc), json_output=json_output)
+            return 0
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    payload["state"] = state["state"]
+    payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
+    if payload.get("dry_run"):
+        payload["would_post"] = True
+    else:
+        record_rereview_posted(args.repo, args.pr)
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif payload.get("dry_run"):
+        print(
+            f"[loop] dry run — would request a review from {reviewer} on "
+            f"{args.repo}#{args.pr} (state {state['state']})"
+        )
+    else:
+        print(f"[loop] {vendor.display_name} review requested at {payload['created_at']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Request an AI reviewer re-review by posting a PR comment."
+        description="Request an AI reviewer re-review by posting a PR comment or a review request."
     )
     parser.add_argument("--repo", required=True, help="GitHub repository in OWNER/REPO format.")
     parser.add_argument("--pr", required=True, type=positive_pr, help="Positive PR number.")
@@ -435,6 +959,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cap-check",
         action="store_true",
         help="Skip the cap check. Only for callers that enforce the cap themselves.",
+    )
+    parser.add_argument(
+        "--expect-head",
+        default=None,
+        help=(
+            "Review-request vendors only: the commit sha the PR head must be at "
+            "(your pushed HEAD). A mismatch means the push has not landed; nothing is posted."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -479,6 +1011,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"[loop] {payload['message']}")
         return 0
+
+    # Review-request vendors (Copilot) never get a comment; resolve the vendor
+    # from the login before the comment path's no-safe-trigger logic runs.
+    reviewer_login = resolve_reviewer_login(
+        repo=args.repo,
+        pr=args.pr,
+        reviewer_login=args.reviewer_login,
+        reviewer_mention=args.reviewer_mention,
+    )
+    vendor = review_vendors.vendor_for(reviewer_login)
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        return run_review_request(args, vendor)
 
     try:
         trigger = None
