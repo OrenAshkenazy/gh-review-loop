@@ -4128,3 +4128,40 @@ class TestConvergenceReceiptWiring:
             f"{owners['format_convergence_line']}; only build_convergence may "
             "render the convergence line"
         )
+
+
+from fetch_gemini_threads import reviewer_selection_state  # noqa: E402
+
+
+class TestReviewRequestSelectionState:
+    def test_copilot_selection_keeps_its_display_name_without_a_mention_trigger(self):
+        state = reviewer_selection_state(
+            {"login": "copilot-pull-request-reviewer", "display_name": "Copilot Pull Request Reviewer"},
+            source="persisted",
+        )
+
+        assert state["display_name"] == "Copilot"
+        assert state["review_trigger"] is None
+        assert state["trigger_kind"] == "review_request"
+        assert state["request_login"] == "copilot-pull-request-reviewer[bot]"
+        assert state["auto_reviews"] is False
+        assert state["configured"] is True
+
+    def test_a_stale_persisted_mention_for_copilot_is_dropped(self):
+        """Records saved by the old 'configurable' path carry review_trigger
+        '@copilot'. A comment never triggers Copilot, so the projection must
+        not advertise one."""
+        state = reviewer_selection_state(
+            {"login": "copilot-pull-request-reviewer", "review_trigger": "@copilot"},
+            source="persisted",
+        )
+
+        assert state["review_trigger"] is None
+        assert state["trigger_kind"] == "review_request"
+
+    def test_codex_selection_is_unchanged(self):
+        state = reviewer_selection_state({"login": "chatgpt-codex-connector"}, source="persisted")
+
+        assert state["review_trigger"] == "@codex"
+        assert state["trigger_kind"] == "comment"
+        assert state["request_login"] is None

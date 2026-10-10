@@ -122,6 +122,8 @@ def test_make_reviewer_record_fills_known_defaults_and_timestamp():
         "login": "gemini-code-assist",
         "display_name": "Gemini Code Assist",
         "review_trigger": "@gemini-code-assist",
+        "trigger_kind": "comment",
+        "request_login": None,
         "auto_reviews": True,
         "source": "confirmed",
         "selected_at": "2026-06-28T12:00:00Z",
@@ -173,3 +175,56 @@ def test_unknown_reviewers_are_assumed_to_review_on_their_own():
     )
 
     assert record["auto_reviews"] is True
+
+
+COPILOT = "copilot-pull-request-reviewer"
+
+
+def test_copilot_has_no_mention_trigger_but_a_request_login():
+    assert reviewer_resolver.trigger_for(COPILOT) is None
+    assert reviewer_resolver.phrase_for(COPILOT) is None
+    assert reviewer_resolver.trigger_kind_for(COPILOT) == "review_request"
+    assert reviewer_resolver.request_login_for(COPILOT) == "copilot-pull-request-reviewer[bot]"
+
+
+def test_unknown_and_comment_vendors_keep_the_comment_kind():
+    assert reviewer_resolver.trigger_kind_for("coderabbitai") == "comment"
+    assert reviewer_resolver.request_login_for("coderabbitai") is None
+    assert reviewer_resolver.trigger_kind_for("chatgpt-codex-connector") == "comment"
+    assert reviewer_resolver.trigger_for("chatgpt-codex-connector") == "@codex"
+
+
+def test_copilot_record_carries_kind_and_request_login():
+    record = reviewer_resolver.make_reviewer_record(COPILOT, source="confirmed")
+
+    assert record["display_name"] == "Copilot"
+    assert record["review_trigger"] is None
+    assert record["trigger_kind"] == "review_request"
+    assert record["request_login"] == "copilot-pull-request-reviewer[bot]"
+    assert record["auto_reviews"] is False
+
+
+def test_codex_record_still_carries_its_mention_and_the_comment_kind():
+    record = reviewer_resolver.make_reviewer_record("chatgpt-codex-connector", source="confirmed")
+
+    assert record["review_trigger"] == "@codex"
+    assert record["trigger_kind"] == "comment"
+    assert record["request_login"] is None
+
+
+def test_candidate_dict_carries_kind_and_source():
+    candidate = reviewer_resolver.Candidate(
+        login=COPILOT,
+        display_name="Copilot",
+        review_trigger=None,
+        trigger_kind="review_request",
+        source="requested",
+    )
+
+    assert candidate.to_dict() == {
+        "login": COPILOT,
+        "display_name": "Copilot",
+        "review_trigger": None,
+        "trigger_kind": "review_request",
+        "source": "requested",
+    }
