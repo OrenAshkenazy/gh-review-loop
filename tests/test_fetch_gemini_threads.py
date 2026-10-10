@@ -953,6 +953,24 @@ class TestReviewerSelectionCli:
         assert fgt.read_reviewer_selection(self.PR) is None
 
 
+def _with_reviews_page(responder, logins=()):
+    """Wrap a thread-query responder so the reviews query is answered too.
+
+    Reviewer discovery reads review authors from their own paginated query
+    (PR #116 review); these tests exercise thread pagination and only need
+    that query satisfied.
+    """
+    def run_gh(args, cwd=None):
+        query = args[3] if len(args) > 3 else ""
+        if "reviewsAfter" in query:
+            return {"data": {"repository": {"pullRequest": {"reviews": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"author": {"login": login, "__typename": "Bot"}} for login in logins],
+            }}}}}
+        return responder(args)
+    return run_gh
+
+
 class TestReviewerDiscoveryFetch:
     PR = PullRequest(owner="o", repo="r", number=5)
 
@@ -1011,7 +1029,7 @@ class TestReviewerDiscoveryFetch:
             calls.append(args)
             return next(responses)
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR)
 
@@ -1034,7 +1052,7 @@ class TestReviewerDiscoveryFetch:
         monkeypatch.setattr(
             fgt,
             "run_gh",
-            lambda args: {"data": {"repository": None}},
+            _with_reviews_page(lambda args: {"data": {"repository": None}}),
         )
 
         with pytest.raises(RuntimeError, match="missing or invalid data"):
@@ -1102,7 +1120,7 @@ class TestReviewerDiscoveryFetch:
                 }
             }
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR)
 
@@ -1162,7 +1180,7 @@ class TestReviewerDiscoveryFetch:
                 }
             }
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR, max_pages=1)
 
@@ -4378,14 +4396,22 @@ class TestReviewerDiscoverySources:
         captured = {}
 
         def fake_run_gh(args, cwd=None):
-            captured["query"] = args[3]
+            query = args[3]
+            if "reviewsAfter" in query:
+                captured["reviews_query"] = query
+                return {"data": {"repository": {"pullRequest": {"reviews": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": payload["data"]["repository"]["pullRequest"]["reviews"]["nodes"],
+                }}}}}
+            captured["query"] = query
             return payload
 
         monkeypatch.setattr(_fgt, "run_gh", fake_run_gh)
 
         discovery = _fgt.fetch_reviewer_discovery(PullRequest(owner="acme", repo="widget", number=1))
 
-        assert "reviews(last:100)" in captured["query"]
+        # Review authors come from their own paginated query now.
+        assert "reviews(first:100, after:$reviewsAfter)" in captured["reviews_query"]
         assert "reviewRequests(first:50)" in captured["query"]
         pr = discovery["pull_request"]
         assert pr["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
@@ -4464,3 +4490,66 @@ class TestFetchSideCapCompleteness:
         assert _fgt.review_request_count_complete(
             self._pr(100), review_request_vendor=False
         ) is True
+
+
+import reviewer_resolver  # noqa: E402
+
+
+class TestDiscoveryPaginatesReviewAuthors:
+    """A clean Copilot pass leaves no thread, so its review is the only
+    evidence it reviewed. On a PR with more than 100 reviews that review can
+    fall outside one page, and discovery would then ask the user to pick a
+    reviewer again (PR #116 review)."""
+
+    PR = _fgt.PullRequest(owner="o", repo="r", number=5, url="https://github.com/o/r/pull/5")
+
+    @staticmethod
+    def _reviews_page(logins, *, has_next, end_cursor=None):
+        return {"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+            "nodes": [
+                {"author": {
+                    "login": login,
+                    "__typename": "Bot" if login.endswith("reviewer") else "User",
+                }}
+                for login in logins
+            ],
+        }}}}}
+
+    @staticmethod
+    def _threads_page():
+        return {"data": {"repository": {"pullRequest": {
+            "number": 5,
+            "url": "https://github.com/o/r/pull/5",
+            "reviewRequests": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        }}}}
+
+    def test_a_review_author_on_a_later_page_is_still_discovered(self, monkeypatch):
+        calls = []
+        responses = iter([
+            self._reviews_page(["a-human"], has_next=True, end_cursor="RCUR1"),
+            self._reviews_page(["copilot-pull-request-reviewer"], has_next=False),
+            self._threads_page(),
+        ])
+
+        def fake_run_gh(args):
+            calls.append(args)
+            return next(responses)
+
+        monkeypatch.setattr(_fgt, "run_gh", fake_run_gh)
+
+        result = _fgt.fetch_reviewer_discovery(self.PR)
+
+        authors = [
+            (node.get("author") or {}).get("login")
+            for node in result["pull_request"]["reviews"]["nodes"]
+        ]
+        assert "copilot-pull-request-reviewer" in authors
+        assert any("reviewsAfter=RCUR1" in arg for arg in calls[1])
+        assert result["partial"] is False
+
+        candidates = reviewer_resolver.discover_candidates(
+            result["pull_request"], self_login=None
+        )
+        assert [c.login for c in candidates] == ["copilot-pull-request-reviewer"]

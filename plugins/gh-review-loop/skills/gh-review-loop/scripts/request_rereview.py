@@ -297,9 +297,15 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
     """
     state = load_state()
     entry = state.get(state_key_for(state, repo, pr))
-    requests = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+        # No record for this PR, or a POST whose record could not be written:
+        # the history is unknown, not empty. An empty list would be taken as
+        # authoritative and report zero requests used, which would let every
+        # pushed head post another request past the hard cap.
+        return None
+    requests = entry.get("review_requests")
     if not isinstance(requests, list):
-        return []
+        return None
     out = []
     for item in requests:
         if not isinstance(item, dict):
@@ -356,6 +362,22 @@ def record_rereview_posted(
         path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
+        # The request was posted but is now unrecorded, so the local history is
+        # no longer a complete account of what the loop did. Mark it unusable so
+        # the cap falls back to counting by actor instead of under-counting.
+        # Best effort: if this write fails too, the stale history stays, which
+        # is why the next read also treats a missing entry as unknown.
+        if reviewer:
+            try:
+                marked = load_state()
+                key_now = state_key_for(marked, repo, pr)
+                existing = marked.get(key_now)
+                existing = dict(existing) if isinstance(existing, dict) else {}
+                existing["review_requests_incomplete"] = True
+                marked[key_now] = existing
+                path.write_text(json.dumps(marked, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError:
+                pass
 
 
 def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
@@ -747,14 +769,25 @@ def count_agent_review_requests(
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
-    return len(reviewer_resolver.counted_review_requests(
+    recorded = loop_request_times(repo, pr, vendor)
+    counted = reviewer_resolver.counted_review_requests(
         events,
         agent_login=agent_login,
         vendor=vendor,
         first_completed_review_at=first_completed_review_at,
-        loop_request_times=loop_request_times(repo, pr, vendor),
+        loop_request_times=recorded,
         match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
-    ))
+    )
+    if recorded is None and counted:
+        # No local record, yet requests under this login exist after the
+        # vendor's first review. They may be the loop's (a cleared state dir)
+        # or the member's own clicks, and the two findings this resolves pull
+        # opposite ways: charging the member's clicks to the loop stops a first
+        # run as capped, while assuming zero would let every pushed head post
+        # another request past the cap. So the count is unknown and the caller
+        # refuses to post — `--no-cap-check` is the deliberate override.
+        return None
+    return len(counted)
 
 
 def confirm_posted_after_uncertain(

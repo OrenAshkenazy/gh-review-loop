@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Reviewer discovery paginates review authors.** A clean Copilot pass leaves
+  no thread, so its review is the only evidence it reviewed; on a PR with more
+  than 100 reviews that review fell outside the unpaginated page and discovery
+  reported no Copilot candidate. Review authors now come from their own
+  paginated query.
+
+- **Missing request provenance fails closed.** An empty local record was
+  indistinguishable from a lost or unwritable one, and the counter treats any
+  list as authoritative — zero used, so every pushed head could post another
+  request past the cap. Unavailable history is now `None`: with no record and
+  no candidate requests the count is a verified zero, but with candidate
+  requests under the same login it is unknown and nothing is posted
+  (`--no-cap-check` is the deliberate override). A state write that fails after
+  a successful POST marks the history unusable rather than silently short.
+
 - **The fetch-side cap count admits when it is a lower bound.**
   `review_request_count_complete()` checked only the timeline page, while the
   free-cycle boundary comes from the reviews page: a full page can hide the

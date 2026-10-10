@@ -322,17 +322,25 @@ query($owner:String!, $repo:String!, $number:Int!) {
 }
 """
 
+REVIEW_AUTHORS_DISCOVERY_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $reviewsAfter:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviews(first:100, after:$reviewsAfter) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login __typename } }
+      }
+    }
+  }
+}
+"""
+
 REVIEWER_DISCOVERY_QUERY = """
 query($owner:String!, $repo:String!, $number:Int!, $threadsAfter:String) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number
       url
-      reviews(last:100) {
-        nodes {
-          author { login __typename }
-        }
-      }
       reviewRequests(first:50) {
         nodes {
           requestedReviewer {
@@ -465,6 +473,57 @@ def fetch_remaining_discovery_comments(
     return {"nodes": nodes, "partial": partial, "warnings": warnings}
 
 
+def fetch_discovery_review_authors(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
+    """Every review author on the PR, paginated.
+
+    Discovery cannot read this off one page. A clean Copilot pass leaves no
+    inline thread, so the review itself is the only evidence it reviewed at
+    all; on a PR with more than 100 reviews that review can fall outside a
+    single page, and once no request is pending discovery would report no
+    Copilot candidate and ask the user to choose a reviewer again.
+    """
+    nodes: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    partial = False
+    after: str | None = None
+    for _ in range(max_pages):
+        gh_args = [
+            "api", "graphql",
+            "-f", f"query={REVIEW_AUTHORS_DISCOVERY_QUERY}",
+            "-F", f"owner={pr.owner}",
+            "-F", f"repo={pr.repo}",
+            "-F", f"number={pr.number}",
+        ]
+        if after:
+            gh_args.extend(["-F", f"reviewsAfter={after}"])
+        result = run_gh(gh_args)
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected gh GraphQL response.")
+        if "errors" in result:
+            raise RuntimeError(f"gh GraphQL errors: {result['errors']}")
+        try:
+            reviews = result["data"]["repository"]["pullRequest"]["reviews"] or {}
+            if not isinstance(reviews, dict):
+                raise TypeError("reviews is not a dictionary")
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Unexpected gh GraphQL shape: missing or invalid reviews ({exc})"
+            ) from exc
+        nodes.extend(node for node in (reviews.get("nodes") or []) if isinstance(node, dict))
+        page_info = reviews.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+        if not after:
+            partial = True
+            warnings.append("reviewer discovery review pagination stopped without an end cursor")
+            break
+    else:
+        partial = True
+        warnings.append("reviewer discovery review page cap reached")
+    return {"nodes": nodes, "partial": partial, "warnings": warnings}
+
+
 def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
     """Fetch review-thread comment authors for reviewer discovery.
 
@@ -476,9 +535,13 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
     warnings: list[str] = []
     after: str | None = None
     partial = False
-    # reviews and reviewRequests are not paginated with the threads; the first
-    # page's copy is the one to keep (review authors and pending requests are
-    # discovery sources too — a clean Copilot pass has no thread comments).
+    # Review authors come from their own paginated query; reviewRequests is not
+    # paginated with the threads, so the first page's copy is the one to keep
+    # (both are discovery sources — a clean Copilot pass has no thread
+    # comments).
+    review_authors = fetch_discovery_review_authors(pr, max_pages=max_pages)
+    partial = partial or review_authors["partial"]
+    warnings.extend(review_authors["warnings"])
     extras: dict[str, Any] = {}
     for _ in range(max_pages):
         gh_args = [
@@ -513,7 +576,7 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
             ) from exc
         if not extras:
             extras = {
-                "reviews": pull_request.get("reviews") or {"nodes": []},
+                "reviews": {"nodes": review_authors["nodes"]},
                 "reviewRequests": pull_request.get("reviewRequests") or {"nodes": []},
             }
         nodes = review_threads.get("nodes") or []
@@ -548,6 +611,9 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
         if not page_info.get("hasNextPage"):
             merged = dict(pull_request)
             merged["reviewThreads"] = {"nodes": all_threads}
+            # The thread query no longer carries reviews; the paginated authors
+            # are the only copy, and this is the common single-page exit.
+            merged["reviews"] = {"nodes": review_authors["nodes"]}
             return {"pull_request": merged, "partial": partial, "warnings": warnings}
         after = page_info.get("endCursor")
         if not after:
