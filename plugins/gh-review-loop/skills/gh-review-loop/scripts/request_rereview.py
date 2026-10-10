@@ -617,10 +617,13 @@ def current_head(repo: str, pr: int, runner: Any = None) -> str | None:
     if runner is None:
         runner = subprocess.run
     owner, repo_name = parse_repo(repo)
-    head = _gh_json(
-        ["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}", "--jq", ".head.sha"],
-        runner,
-    )
+    # Read the PR object, not `--jq .head.sha`: that prints a bare sha, which
+    # is not JSON, so the parse would fail and every head read would look
+    # unreadable.
+    data = _gh_json(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], runner)
+    if not isinstance(data, dict):
+        return None
+    head = (data.get("head") or {}).get("sha")
     if isinstance(head, str) and head.strip():
         return head.strip()
     return None
