@@ -68,8 +68,9 @@ def test_seed_from_parsed_dedupes(state):
     }
     first = bank.seed_from_parsed(parsed)
     second = bank.seed_from_parsed(parsed)
-    assert len(first) == 2
-    assert second == []
+    assert len(first["added"]) == 2
+    assert second["added"] == []
+    assert first["skipped"] == [] and second["skipped"] == []
     assert all(e["source"] == "glg_accept_confirmation" for e in bank.load_entries())
     assert bank.load_entries()[0]["project"] == "Observability | Customers"
 
@@ -138,3 +139,68 @@ def test_existing_loose_permissions_are_tightened(tmp_path, monkeypatch):
 
     assert base.stat().st_mode & 0o777 == 0o700
     assert answers.stat().st_mode & 0o777 == 0o600
+
+
+ATTESTATIONS = [
+    "Are you currently employed by any of the companies listed above?",
+    "Do you have a conflict of interest with the client for this project?",
+    "Do you consent to this call being recorded?",
+    "Please acknowledge the single-blinded client notice for this consultation.",
+    "Who is your current employer?",
+]
+
+
+@pytest.mark.parametrize("question", ATTESTATIONS)
+def test_attestations_cannot_be_added_to_the_bank(question, tmp_path, monkeypatch):
+    """SKILL.md hard rule 3 and PRIVACY.md both say these go to the member every
+    time. A stored copy would come back as a BANK suggestion (PR #116 review)."""
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+
+    with pytest.raises(bank.NotReusable):
+        bank.add_entry(question, "No")
+
+    assert bank.load_entries() == []
+
+
+def test_seed_skips_attestations_and_reports_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+    parsed = {
+        "kind": "accept_confirmation",
+        "project_title": "Observability Platforms",
+        "recorded_answers": [
+            {"question": "Please highlight your familiarity with these platforms.",
+             "value": {"Datadog": ["Current Paying Customer"]}, "note": ""},
+            {"question": "Do you have a conflict of interest with the client?",
+             "value": "No", "note": ""},
+            {"question": "Do you consent to this call being recorded?",
+             "value": "Yes", "note": ""},
+        ],
+    }
+
+    result = bank.seed_from_parsed(parsed)
+
+    added = result["added"] if isinstance(result, dict) else result
+    skipped = result["skipped"] if isinstance(result, dict) else []
+    assert [entry["value"] for entry in added] == [{"Datadog": ["Current Paying Customer"]}]
+    assert len(skipped) == 2
+    assert all("conflict" in s["question"].lower() or "recorded" in s["question"].lower() for s in skipped)
+    assert len(bank.load_entries()) == 1
+
+
+def test_cli_add_refuses_an_attestation_with_exit_3(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+
+    rc = bank.main(["add", "--question", "Do you have a conflict of interest?", "--answer", '"No"'])
+
+    out = capsys.readouterr()
+    assert rc == 3
+    assert "member" in (out.err + out.out).lower()
+    assert bank.load_entries() == []
+
+
+def test_an_ordinary_question_is_still_stored(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path))
+
+    bank.add_entry("Which observability vendors have you evaluated?", ["Datadog", "Grafana"])
+
+    assert len(bank.load_entries()) == 1

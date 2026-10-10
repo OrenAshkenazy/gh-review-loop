@@ -1120,8 +1120,19 @@ def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
 
 
 def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dict[str, Any]]:
+    """``author``'s submitted reviews, oldest first.
+
+    PENDING reviews are excluded, as ``head_review()`` excludes them: a draft
+    GraphQL happens to expose is not a review of the head. Counting one would
+    report the head as covered — sending the loop to ``overview_unparseable``
+    on an empty draft body, or clearing the clean gate on a zero-finding draft
+    that was never submitted.
+    """
     return sorted(
-        filter_reviews(pull_request, author),
+        (
+            review for review in filter_reviews(pull_request, author)
+            if review.get("state") != "PENDING"
+        ),
         key=lambda review: review.get("submittedAt") or "",
     )
 
@@ -1282,6 +1293,7 @@ def rereview_requests(
     *,
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
     reviewer_login: str | None = None,
+    loop_request_times: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """The re-review requests the loop cap counts.
 
@@ -1301,6 +1313,10 @@ def rereview_requests(
             first_completed_review_at=reviewer_resolver.first_completed_review_at(
                 (pull_request.get("reviews") or {}).get("nodes") or [], vendor
             ),
+            # The same local provenance request_rereview.py enforces the cap
+            # with, so the displayed count and the enforced count agree. A
+            # request the member clicked themselves is not the loop's.
+            loop_request_times=loop_request_times,
         )
     if not review_trigger_mention:
         return []
@@ -1469,6 +1485,31 @@ STICKY_RECEIPT_MARKER = "<!-- gh-review-loop:sticky-receipt -->"
 
 def _state_key(pr: PullRequest) -> str:
     return f"{pr.owner}/{pr.repo}#{pr.number}"
+
+
+def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str] | None:
+    """Timestamps this loop recorded for its own review requests on ``pr``.
+
+    None when the reviewer is not a review-request vendor (the comment path
+    counts mentions, not events) — the caller then keeps the actor filter.
+    """
+    vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return None
+    entry = load_sticky_state().get(_state_key(pr), {})
+    requests = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(requests, list):
+        return []
+    out = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        at = item.get("at")
+        if isinstance(at, str) and at:
+            out.append(at)
+    return sorted(out)
 
 
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
@@ -3171,10 +3212,16 @@ def render_markdown(
     judge_results: dict[str, dict[str, Any]] | None = None,
     baseline: dict[str, str] | None = None,
     full: bool = False,
+    loop_requests: list[str] | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
+    # `loop_requests` is the local provenance record, supplied by the caller
+    # that knows which PR this is; without it the count keeps the actor filter.
     rereviews = rereview_requests(
-        pr, review_trigger_mention=review_trigger_mention, reviewer_login=author
+        pr,
+        review_trigger_mention=review_trigger_mention,
+        reviewer_login=author,
+        loop_request_times=loop_requests,
     )
     outdated = outdated_unresolved_threads(pr, author)
     deferred = addressed_by_reply_threads(pr, author)
@@ -3924,6 +3971,7 @@ def main() -> int:
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
+            loop_request_times=loop_request_times(pr, args.author),
         )
         _limit_reached = len(rereviews) >= args.max_rereview_requests
         if args.resolve_outdated:
@@ -4131,6 +4179,7 @@ def main() -> int:
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
+            loop_request_times=loop_request_times(pr, args.author),
         )
         if len(rereviews) >= args.max_rereview_requests:
             print(
@@ -4571,6 +4620,7 @@ def main() -> int:
                 judge_results=judge_results,
                 baseline=render_baseline,
                 full=args.full,
+                loop_requests=loop_request_times(pr, args.author),
             ),
             end="",
         )

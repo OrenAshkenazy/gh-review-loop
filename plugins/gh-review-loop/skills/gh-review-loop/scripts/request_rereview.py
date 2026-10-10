@@ -280,7 +280,45 @@ def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
     return f"{repo}#{pr}"
 
 
-def record_rereview_posted(repo: str, pr: int) -> None:
+# How far after the local pre-POST timestamp a timeline event may appear and
+# still be the same request. GitHub stamps the event server-side; the gap is
+# normally under a second.
+REQUEST_MATCH_WINDOW_SECONDS = 180
+
+
+def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) -> list[str]:
+    """When this loop posted a review request for ``vendor`` on this PR.
+
+    The cap bounds what the loop posts, not what the member clicks. Both act
+    under the same `gh` login, so the timeline's actor cannot tell them apart —
+    three manual Copilot requests would otherwise make a first loop run stop as
+    `capped`. These records are written at the moment of posting, so they are
+    the loop's own provenance.
+    """
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    requests = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(requests, list):
+        return []
+    out = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        at = item.get("at")
+        if isinstance(at, str) and at:
+            out.append(at)
+    return sorted(out)
+
+
+def record_rereview_posted(
+    repo: str,
+    pr: int,
+    *,
+    reviewer: str | None = None,
+    requested_at: str | None = None,
+) -> None:
     """Stamp the cycle transition this re-review request completes.
 
     The session-cycle ordinal (#104) needs to know that a cycle actually
@@ -305,6 +343,13 @@ def record_rereview_posted(repo: str, pr: int) -> None:
     posted = posted if isinstance(posted, int) and not isinstance(posted, bool) else 0
     run["rereviews_posted"] = posted + 1
     entry["run"] = run
+    if reviewer:
+        # Outside entry["run"], which run tracking clears: provenance for the
+        # cap must outlive a single loop run on the PR.
+        requests = entry.get("review_requests")
+        requests = list(requests) if isinstance(requests, list) else []
+        requests.append({"reviewer": reviewer, "at": requested_at or utc_now_iso()})
+        entry["review_requests"] = requests
     state[key] = entry
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -685,6 +730,8 @@ def count_agent_review_requests(
         agent_login=agent_login,
         vendor=vendor,
         first_completed_review_at=first_completed_review_at,
+        loop_request_times=loop_request_times(repo, pr, vendor),
+        match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
     ))
 
 
@@ -731,6 +778,29 @@ def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
             f"Re-review cap reached: {used} of {cap} requests already posted by "
             "this agent on this PR. Raise max_rereview_requests or pass "
             "--max-rereview-requests to continue."
+        ),
+    }
+
+
+def state_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    """The PR's request state could not be read, so nothing was posted.
+
+    Deliberately offers no `--no-cap-check` advice: that flag is consulted
+    after this point, so the suggested retry takes the same path and still
+    posts nothing. The dedupe reads are not the cap; they are what keeps a
+    second request off a head that already has a review.
+    """
+    return {
+        "status": "uncountable_state",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"The review state of {repo}#{pr} could not be read (the PR, review or "
+            "timeline query failed), so a request for `" + reviewer + "` would be "
+            "neither deduplicated nor counted. Nothing was posted. Check `gh auth "
+            "status` and network access, then retry."
         ),
     }
 
@@ -984,10 +1054,7 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
         )
     state = request_state(args.repo, args.pr, vendor)
     if state is None:
-        _emit(
-            uncountable_count_payload(args.repo, args.pr, effective_cap(args.max_rereview_requests)),
-            json_output=json_output,
-        )
+        _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
         return 0
     if args.expect_head and args.expect_head != state["head"]:
         _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
@@ -1044,7 +1111,9 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
     if payload.get("dry_run"):
         payload["would_post"] = True
     else:
-        record_rereview_posted(args.repo, args.pr)
+        record_rereview_posted(
+            args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at")
+        )
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     elif payload.get("dry_run"):

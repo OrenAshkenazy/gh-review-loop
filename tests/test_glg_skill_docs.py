@@ -83,3 +83,29 @@ def test_privacy_policy_covers_this_plugin():
     assert "glg-questionnaire" in policy
     for needle in ("Gmail", "~/.config/glg-questionnaire", "answers.jsonl", "submissions.jsonl"):
         assert needle in policy, needle
+
+
+def test_untrusted_text_is_never_interpolated_into_a_shell_command():
+    """Email subjects and questionnaire questions are attacker-influenced text.
+    `--subject "<subject>"` in a copied command runs `$(...)` and backticks in
+    the local shell, since double quotes do not suppress command substitution
+    (PR #116 review). Such values must travel by file or stdin."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    for banned in ('--subject "<subject>"', '--question "<question text>"'):
+        assert banned not in text, banned
+    assert "--subject-file" in text
+    assert "--question-file" in text
+
+
+def test_triage_does_not_group_messages_without_a_consultation_id():
+    """Surveys, payments, reminders and digests all parse with `cpid: null`;
+    grouping on it alone collapses them into one row and the hard rules require
+    reporting them (PR #116 review)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    assert "cpid" in text
+    lowered = text.lower().replace("`", "")
+    assert "without a cpid" in lowered or "no cpid" in lowered
+    assert "non-empty" in lowered or "nonempty" in lowered
+    assert "thread" in lowered

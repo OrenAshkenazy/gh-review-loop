@@ -211,3 +211,29 @@ class TestMalformedUrls:
 
         assert [link["role"] for link in links] == ["accept"]
         assert links[0]["url"] == good
+
+
+class TestPlaintextLinksAreRejected:
+    """GLG action URLs carry a `_session` bearer token in the query string, so
+    an `http://` variant would leak it on the first request. Only https links
+    get an actionable role (PR #116 review)."""
+
+    @pytest.mark.parametrize("path", [
+        "/accept/accept?cpid=1",
+        "/cm-accept-followup/abc",
+        "/opportunities?consultationIds=abc",
+        "/profile",
+    ])
+    def test_http_links_are_not_actionable(self, path):
+        assert pge.classify_link(f"http://members.glgresearch.com{path}") == "other"
+        assert pge.classify_link(f"https://members.glgresearch.com{path}") != "other"
+
+    def test_a_plaintext_link_is_dropped_from_extract_links(self):
+        body = (
+            "Old link: http://members.glgresearch.com/accept/accept?cpid=1\n"
+            "Review Project Now: https://members.glgresearch.com/accept/accept?cpid=2\n"
+        )
+
+        links = pge.extract_links(body)
+
+        assert [link["cpid"] for link in links] == ["2"]
