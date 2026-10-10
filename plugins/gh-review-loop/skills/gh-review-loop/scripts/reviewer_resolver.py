@@ -235,35 +235,60 @@ def _is_bot_author(author: dict[str, Any]) -> bool:
     return False
 
 
+_SOURCE_RANK = {"thread": 0, "review": 1, "requested": 2}
+
+
 def discover_candidates(
     pull_request: dict[str, Any],
     *,
     self_login: str | None,
 ) -> list[Candidate]:
-    first_seen: dict[str, int] = {}
+    """Bot reviewers visible on the PR: threads first, then reviews, then pending requests.
+
+    Thread comment authors are the strongest signal (they left findings). A
+    review with no inline comments (a clean Copilot pass) only shows up as a
+    review author. A reviewer that was requested but has not answered yet only
+    shows up as a pending request. Within a source, first-seen order; a login
+    seen in an earlier source keeps that source.
+    """
+    seen: dict[str, tuple[int, int, str]] = {}
+
+    def consider(author: Any, index: int, source: str) -> None:
+        if not isinstance(author, dict):
+            return
+        login = author.get("login")
+        if not isinstance(login, str) or not login:
+            return
+        if self_login and login == self_login:
+            return
+        if login in seen or not _is_bot_author(author):
+            return
+        seen[login] = (_SOURCE_RANK[source], index, source)
+
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
     for thread_index, thread in enumerate(threads):
         if not isinstance(thread, dict):
             continue
         for comment in _iter_comments(thread):
-            author = comment.get("author")
-            if not isinstance(author, dict):
-                continue
-            login = author.get("login")
-            if not isinstance(login, str) or not login:
-                continue
-            if self_login and login == self_login:
-                continue
-            if login in first_seen or not _is_bot_author(author):
-                continue
-            first_seen[login] = thread_index
+            consider(comment.get("author"), thread_index, "thread")
+    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
+    for review_index, review in enumerate(reviews):
+        if isinstance(review, dict):
+            consider(review.get("author"), review_index, "review")
+    requests = (pull_request.get("reviewRequests") or {}).get("nodes") or []
+    for request_index, request in enumerate(requests):
+        if isinstance(request, dict):
+            consider(request.get("requestedReviewer"), request_index, "requested")
+
     return [
         Candidate(
             login=login,
             display_name=display_name_for(login),
             review_trigger=trigger_for(login),
+            trigger_kind=trigger_kind_for(login),
+            source=source,
         )
-        for login, _thread_index in sorted(
-            first_seen.items(), key=lambda item: (item[1], item[0])
+        for login, (_rank, _index, source) in sorted(
+            seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
         )
     ]

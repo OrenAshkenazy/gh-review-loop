@@ -310,6 +310,20 @@ query($owner:String!, $repo:String!, $number:Int!, $threadsAfter:String) {
     pullRequest(number:$number) {
       number
       url
+      reviews(last:100) {
+        nodes {
+          author { login __typename }
+        }
+      }
+      reviewRequests(first:50) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on Bot { login }
+            ... on User { login }
+          }
+        }
+      }
       reviewThreads(first:100, after:$threadsAfter) {
         pageInfo {
           hasNextPage
@@ -444,6 +458,10 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
     warnings: list[str] = []
     after: str | None = None
     partial = False
+    # reviews and reviewRequests are not paginated with the threads; the first
+    # page's copy is the one to keep (review authors and pending requests are
+    # discovery sources too — a clean Copilot pass has no thread comments).
+    extras: dict[str, Any] = {}
     for _ in range(max_pages):
         gh_args = [
             "api",
@@ -475,6 +493,11 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
             raise RuntimeError(
                 f"Unexpected gh GraphQL shape: missing or invalid data ({exc})"
             ) from exc
+        if not extras:
+            extras = {
+                "reviews": pull_request.get("reviews") or {"nodes": []},
+                "reviewRequests": pull_request.get("reviewRequests") or {"nodes": []},
+            }
         nodes = review_threads.get("nodes") or []
         for thread in nodes:
             if not isinstance(thread, dict):
@@ -520,6 +543,7 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
         "pull_request": {
             "number": pr.number,
             "url": pr.url,
+            **extras,
             "reviewThreads": {"nodes": all_threads},
         },
         "partial": partial,
@@ -3674,8 +3698,15 @@ def main() -> int:
                     print(f"warning: {warning}", file=sys.stderr)
                 if candidates:
                     for candidate in candidates:
-                        trigger = candidate.review_trigger or "(no safe trigger known)"
-                        print(f"- {candidate.display_name} `{candidate.login}` trigger={trigger}")
+                        if candidate.trigger_kind == "review_request":
+                            trigger = "review request (GitHub API)"
+                        else:
+                            trigger = candidate.review_trigger or "(no safe trigger known)"
+                        note = (
+                            " (requested, not yet reviewed)"
+                            if candidate.source == "requested" else ""
+                        )
+                        print(f"- {candidate.display_name} `{candidate.login}` trigger={trigger}{note}")
                 elif partial:
                     print("[loop] Reviewer discovery incomplete; retry or select a reviewer manually.")
                 else:

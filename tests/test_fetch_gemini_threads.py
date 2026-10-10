@@ -4348,3 +4348,52 @@ class TestHeadAnchoredWait:
         second = _fgt.run_wait_chunk(pr_ref, self.COPILOT, timeout_seconds=600, interval_seconds=1,
                                      quiet_seconds=0, after_iso=after, chunk_seconds=0)
         assert second["status"] == "ready"
+
+
+class TestReviewerDiscoveryFetch:
+    def test_single_page_discovery_keeps_reviews_and_pending_requests(self, monkeypatch):
+        payload = {"data": {"repository": {"pullRequest": {
+            "number": 1,
+            "url": "https://github.com/acme/widget/pull/1",
+            "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+            ]},
+            "reviewRequests": {"nodes": [
+                {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+            ]},
+        }}}}
+        captured = {}
+
+        def fake_run_gh(args, cwd=None):
+            captured["query"] = args[3]
+            return payload
+
+        monkeypatch.setattr(_fgt, "run_gh", fake_run_gh)
+
+        discovery = _fgt.fetch_reviewer_discovery(PullRequest(owner="acme", repo="widget", number=1))
+
+        assert "reviews(last:100)" in captured["query"]
+        assert "reviewRequests(first:50)" in captured["query"]
+        pr = discovery["pull_request"]
+        assert pr["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
+        assert pr["reviewRequests"]["nodes"][0]["requestedReviewer"]["login"] == "copilot-pull-request-reviewer"
+        assert discovery["partial"] is False
+
+    def test_page_capped_discovery_still_carries_the_first_pages_reviews(self, monkeypatch):
+        def page(cursor):
+            return {"data": {"repository": {"pullRequest": {
+                "number": 1, "url": "u",
+                "reviewThreads": {"pageInfo": {"hasNextPage": True, "endCursor": cursor}, "nodes": []},
+                "reviews": {"nodes": [{"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}}]},
+                "reviewRequests": {"nodes": []},
+            }}}}
+
+        monkeypatch.setattr(_fgt, "run_gh", lambda args, cwd=None: page("c1"))
+
+        discovery = _fgt.fetch_reviewer_discovery(
+            PullRequest(owner="acme", repo="widget", number=1), max_pages=2
+        )
+
+        assert discovery["partial"] is True
+        assert discovery["pull_request"]["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
