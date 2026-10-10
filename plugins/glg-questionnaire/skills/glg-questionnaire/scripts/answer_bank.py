@@ -67,6 +67,35 @@ def log_path() -> Path:
     return state_dir() / "submissions.jsonl"
 
 
+class NotReusable(ValueError):
+    """Raised for a question whose answer must never be reused from the bank."""
+
+
+# Per-project attestations: current employer, conflicts, recording consent and
+# blinded-client acknowledgements. SKILL.md hard rule 3 sends these to the
+# member every time, and PRIVACY.md states they are not stored. A stored copy
+# would come back from lookup() as a BANK suggestion, which is exactly the
+# answer the member must give afresh — so the store refuses them rather than
+# relying on the agent to remember.
+ATTESTATION_PATTERNS = [
+    re.compile(r"\bcurrent(ly)?\b[^.?]*\bemploy", re.IGNORECASE),
+    re.compile(r"\bemploy(ed|er|ment)\b[^.?]*\b(now|current|present|today)", re.IGNORECASE),
+    re.compile(r"\bwho is your (current )?employer\b", re.IGNORECASE),
+    re.compile(r"\bconflict(s)? of interest\b|\bhave a conflict\b", re.IGNORECASE),
+    re.compile(r"\brecord(ed|ing)\b[^.?]*\b(consent|permission|agree|call)\b", re.IGNORECASE),
+    re.compile(r"\bconsent\b[^.?]*\brecord", re.IGNORECASE),
+    re.compile(r"\bsingle[- ]blind(ed)?\b", re.IGNORECASE),
+    re.compile(r"\bblinded client\b", re.IGNORECASE),
+    re.compile(r"\bnon[- ]public information\b", re.IGNORECASE),
+]
+
+
+def is_attestation(question: str) -> bool:
+    """True when this question is the member's to answer on every project."""
+    text = " ".join((question or "").split())
+    return any(pattern.search(text) for pattern in ATTESTATION_PATTERNS)
+
+
 def normalize(question: str) -> str:
     words = re.findall(r"[a-z0-9]+", question.lower())
     return " ".join(word for word in words if word not in STOPWORDS)
@@ -100,6 +129,12 @@ def add_entry(
     source: str = "member",
     project: str | None = None,
 ) -> dict[str, Any]:
+    if is_attestation(question):
+        raise NotReusable(
+            "this question is a per-project attestation (employer, conflict, "
+            "recording consent, blinded client): ask the member every time, "
+            "do not store the answer"
+        )
     record = {
         "question": " ".join(question.split()),
         "normalized": normalize(question),
@@ -132,21 +167,29 @@ def seed_from_parsed(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     if parsed.get("kind") != "accept_confirmation":
         raise ValueError("seed needs a parsed accept_confirmation email")
     known = {(e["normalized"], json.dumps(e["value"], sort_keys=True)) for e in load_entries()}
-    added = []
+    added: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     for item in parsed.get("recorded_answers", []):
-        key = (normalize(item["question"]), json.dumps(item["value"], sort_keys=True))
+        question = item["question"]
+        if is_attestation(question):
+            # Reported, never stored: the agent must see that GLG recorded an
+            # answer here and still ask the member for this project's.
+            skipped.append({"question": " ".join(question.split()), "reason": "attestation"})
+            continue
+        key = (normalize(question), json.dumps(item["value"], sort_keys=True))
         if key in known:
             continue
+        known.add(key)
         added.append(
             add_entry(
-                item["question"],
+                question,
                 item["value"],
                 note=item.get("note", ""),
                 source="glg_accept_confirmation",
                 project=parsed.get("project_title"),
             )
         )
-    return added
+    return {"added": added, "skipped": skipped}
 
 
 def log_submission(project: str, cpid: str | None, action: str, detail: str = "") -> dict:
@@ -159,6 +202,24 @@ def log_submission(project: str, cpid: str | None, action: str, detail: str = ""
     }
     _append(log_path(), record)
     return record
+
+
+def read_text_arg(value: str | None, path: Path | None) -> str:
+    """One question, from a file (or stdin with ``-``) rather than a shell word.
+
+    Questionnaire questions come from a web page the member did not write. A
+    documented command template that interpolates one into an argument runs
+    whatever ``$(...)`` or backticks it contains, since double quotes do not
+    suppress command substitution. Reading the text from a file removes the
+    shell from the path entirely.
+    """
+    if path is not None:
+        if str(path) == "-":
+            return sys.stdin.read().strip()
+        return path.read_text(encoding="utf-8").strip()
+    if value is None:
+        raise ValueError("pass --question or --question-file")
+    return value
 
 
 def _parse_value(raw: str) -> Any:
@@ -177,13 +238,15 @@ def main(argv: list[str] | None = None) -> int:
     seed.add_argument("--from-parsed", type=Path, required=True)
 
     add = sub.add_parser("add", help="store one answer the member wrote")
-    add.add_argument("--question", required=True)
+    add.add_argument("--question")
+    add.add_argument("--question-file", type=Path, help="read the question from a file, or - for stdin")
     add.add_argument("--answer", required=True, help="JSON or plain text")
     add.add_argument("--note", default="")
     add.add_argument("--project")
 
     look = sub.add_parser("lookup", help="find stored answers for a question")
-    look.add_argument("--question", required=True)
+    look.add_argument("--question")
+    look.add_argument("--question-file", type=Path, help="read the question from a file, or - for stdin")
     look.add_argument("--limit", type=int, default=3)
     look.add_argument("--min-score", type=float, default=0.55)
 
@@ -200,11 +263,24 @@ def main(argv: list[str] | None = None) -> int:
     # Step 2: dispatch and print JSON so the agent can relay it
     if args.command == "seed":
         parsed = json.loads(args.from_parsed.read_text(encoding="utf-8"))
-        result: Any = {"added": seed_from_parsed(parsed)}
+        result: Any = seed_from_parsed(parsed)
     elif args.command == "add":
-        result = add_entry(args.question, _parse_value(args.answer), args.note, project=args.project)
+        try:
+            result = add_entry(
+                read_text_arg(args.question, args.question_file),
+                _parse_value(args.answer),
+                args.note,
+                project=args.project,
+            )
+        except NotReusable as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 3
     elif args.command == "lookup":
-        result = lookup(args.question, args.limit, args.min_score)
+        result = lookup(
+            read_text_arg(args.question, args.question_file),
+            args.limit,
+            args.min_score,
+        )
     elif args.command == "list":
         result = load_entries()
     else:

@@ -7,8 +7,11 @@ when those links expire, and, for an "Accept Confirmation" email, the exact
 question and answer pairs GLG recorded. Stdlib only. Nothing is sent anywhere.
 
 Usage:
-    parse_glg_email.py --subject "..." < body.txt
-    parse_glg_email.py --file body.txt --subject "..."
+    parse_glg_email.py --subject-file subject.txt < body.txt
+    parse_glg_email.py --file body.txt --subject-file subject.txt
+
+The subject is attacker-influenced text, so prefer --subject-file over
+--subject: a shell expands $(...) and backticks inside double quotes.
 """
 
 from __future__ import annotations
@@ -93,7 +96,9 @@ def classify_link(url: str) -> str:
         parts.port  # noqa: B018 — raises ValueError on an out-of-range port
     except ValueError:
         return "other"
-    if parts.scheme.lower() not in {"http", "https"} or host != MEMBERS_HOST:
+    # https only: these URLs carry the `_session` bearer token in the query
+    # string, so an http variant would put it on the wire in the clear.
+    if parts.scheme.lower() != "https" or host != MEMBERS_HOST:
         return "other"
     path = parts.path
     if "/accept/accept" in path:
@@ -263,14 +268,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--file", type=Path, help="plain-text body (default: stdin)")
     parser.add_argument("--subject", default="", help="the email subject line")
+    parser.add_argument(
+        "--subject-file",
+        type=Path,
+        help=(
+            "read the subject from this file instead of the command line. "
+            "Preferred: a subject is attacker-influenced text, and a shell "
+            "expands $(...) and backticks inside double quotes."
+        ),
+    )
     args = parser.parse_args(argv)
+    subject = args.subject
+    if args.subject_file:
+        subject = args.subject_file.read_text(encoding="utf-8").strip()
     body = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read()
     if not body.strip():
         print("error: empty email body", file=sys.stderr)
         return 2
 
     # Step 2: parse and emit JSON for the agent to read
-    print(json.dumps(parse(body, args.subject), indent=2, ensure_ascii=False))
+    print(json.dumps(parse(body, subject), indent=2, ensure_ascii=False))
     return 0
 
 

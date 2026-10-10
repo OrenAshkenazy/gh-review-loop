@@ -64,8 +64,12 @@ Seeding dedupes on normalized question plus value, so re-running is safe. Do thi
 
 ## Lookup semantics
 
-`lookup --question "<text>"` normalizes both sides (lowercase, alphanumeric tokens, stopwords removed) and ranks by sequence similarity, default threshold 0.55, newest first on ties. A grid question matches as a whole; take the per-vendor values from `value` and only reuse rows whose vendor appears in the new grid. A vendor the bank has never seen is `NEEDS MEMBER`, not a guess.
+`lookup --question-file <file>` (write the question to a file; never paste questionnaire text into a command line) normalizes both sides (lowercase, alphanumeric tokens, stopwords removed) and ranks by sequence similarity, default threshold 0.55, newest first on ties. A grid question matches as a whole; take the per-vendor values from `value` and only reuse rows whose vendor appears in the new grid. A vendor the bank has never seen is `NEEDS MEMBER`, not a guess.
 
 ## submissions.jsonl
 
 `answer_bank.py log --project "<title>" --cpid <id> --action submitted|declined|accepted|skipped --detail "..."` appends one line per outcome. Read it at the start of triage so a project already handled in an earlier session is shown as done rather than offered again.
+
+## Per-project attestations are refused, not stored
+
+`add` raises and the CLI exits 3 for a question about current employment, a conflict of interest, recording consent, a blinded client or non-public information; `seed` leaves such an answer out of the bank and reports it under `skipped` so you can see GLG recorded one and still ask the member for this project's. This is enforced in the script, not left to memory: a stored copy would come back from `lookup` as a `BANK` suggestion for exactly the questions the member must answer every time.

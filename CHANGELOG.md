@@ -22,6 +22,32 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Untrusted text never reaches a shell word.** The GLG skill's documented
+  commands interpolated an email subject and a questionnaire question into
+  `--subject "<subject>"` / `--question "<question text>"`; double quotes do
+  not suppress `$(...)` or backticks, so following the template with a crafted
+  subject ran it locally. `parse_glg_email.py` takes `--subject-file` and
+  `answer_bank.py` takes `--question-file` (`-` for stdin), and the docs write
+  the value to a file first.
+
+- **Per-project attestations are refused by the store, not by memory.** An
+  Accept Confirmation carrying a current-employer, conflict, recording-consent
+  or blinded-client answer was seeded into the bank, where `lookup()` could
+  offer it as reusable — against SKILL.md hard rule 3 and against PRIVACY.md's
+  statement that these are never stored. `add` now raises `NotReusable` (CLI
+  exit 3) and `seed` reports them under `skipped` instead of storing them.
+
+- **Only `https` GLG links are actionable.** An `http://members.glgresearch.com`
+  accept or follow-up URL carries the `_session` bearer token in its query
+  string, so opening one would put the member's session on the wire in the
+  clear. Plaintext links classify as `other`.
+
+- **Triage no longer collapses messages without a consultation ID.** Surveys,
+  payments, call reminders and digests all parse with `cpid: null`; grouping on
+  it alone merged them into one row and could hide a paid survey the hard rules
+  require reporting. Only non-empty IDs group; the rest key by Gmail thread,
+  falling back to the project ID.
+
 - **`glg-questionnaire` resolves its plugin root on both runtimes.** The skill
   addressed its scripts through `${CLAUDE_PLUGIN_ROOT}`, which is unset under
   Codex, where the plugin is also published — the command expanded to
