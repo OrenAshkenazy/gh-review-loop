@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **A pending review never covers the head.** `_reviews_oldest_first()` fed
+  `PENDING` reviews into the overview and severity helpers, which
+  `head_review()` already excluded: a draft reported as covering the head sent
+  the loop to `overview_unparseable` instead of waiting, and a zero-finding
+  draft could clear the clean gate before submission.
+
+- **The cap counts the loop's own requests, not yours.** Loop and member act
+  under the same `gh` login, so the timeline's actor could not tell a
+  loop-issued Copilot request from one clicked in the GitHub UI — three manual
+  requests could stop a first run as `capped`. Requests are now recorded
+  locally as they are posted (outside the per-run block, so they outlive run
+  tracking) and the cap counts those, with the fetch reading the same record so
+  the displayed and enforced counts agree.
+
+- **An unreadable PR state is no longer reported as a counting failure.** It
+  emitted `uncountable_count`, whose message suggested retrying with
+  `--no-cap-check` — a flag consulted after that branch, so the retry took the
+  same path and still posted nothing. It is now `uncountable_state`, with no
+  bypass advice.
+
 - **A still-pending Copilot request is never doubled.** `STALE_PENDING` fell
   through to a second POST while GraphQL still listed the first request as
   pending, and the design evidence records that producing two reviews. Age

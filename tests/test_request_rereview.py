@@ -1057,6 +1057,16 @@ class TestReviewRequestHelpers:
             assert cmd[3] == "repos/acme/widget/issues/159/timeline"
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=json.dumps(page1) + "\n" + json.dumps(page2), stderr="")
 
+        # Two of the agent-actored events are the loop's own (recorded as it
+        # posted them). The pre-boundary event is free, the human's click and
+        # the team request never counted.
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        )
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T17:00:00Z"
+        )
+
         used = request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
         )
@@ -1319,7 +1329,7 @@ class TestReviewRequestMain:
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
-        assert json.loads(capsys.readouterr().out)["status"] == "uncountable_count"
+        assert json.loads(capsys.readouterr().out)["status"] == "uncountable_state"
 
     def test_rejected_422_is_validation_and_not_stamped(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
@@ -1573,3 +1583,86 @@ class TestCancelReviewRequest:
         assert request_rereview.cancel_review_request(
             "acme/widget", 159, COPILOT_REQUEST, runner=failing
         ) is False
+
+
+class TestRequestProvenance:
+    """The cap bounds what the loop posts, not what the member clicks.
+
+    Timeline actor identity cannot tell the two apart — the loop uses the
+    member's own `gh` auth — so three manual Copilot requests used to make a
+    first loop run stop as `capped` (PR #116 review). Loop-issued requests are
+    therefore recorded locally at the moment they are posted, and the cap counts
+    those.
+    """
+
+    def test_posting_records_the_request_locally(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        )
+
+        recorded = request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT)
+        assert recorded == [T_REQUEST]
+        # A comment vendor's pings are recorded against that vendor only.
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.CODEX) == []
+
+    def test_manual_requests_do_not_consume_the_cap(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        manual = _rest_request_events([
+            ("agent", "2026-10-07T16:00:00Z"),
+            ("agent", "2026-10-07T16:05:00Z"),
+            ("agent", "2026-10-07T16:10:00Z"),
+        ])
+
+        def runner(cmd, **kwargs):
+            assert cmd[3].endswith("/timeline")
+            return _completed(cmd, manual)
+
+        used = request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        )
+
+        assert used == 0
+
+    def test_a_recorded_loop_request_is_counted(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:05:00Z"
+        )
+        events = _rest_request_events([
+            ("agent", "2026-10-07T16:00:00Z"),   # manual
+            ("agent", "2026-10-07T16:05:02Z"),   # the loop's own, two seconds later
+            ("agent", "2026-10-07T16:10:00Z"),   # manual
+        ])
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, events)
+
+        used = request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        )
+
+        assert used == 1
+
+
+class TestStateReadFailure:
+    def test_an_unreadable_state_does_not_advise_the_cap_bypass(self, monkeypatch, capsys):
+        """`--no-cap-check` is consulted after this branch, so the advised retry
+        takes the same path and still posts nothing (PR #116 review)."""
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: None)
+        monkeypatch.setattr(
+            request_rereview, "request_review",
+            lambda *a, **k: pytest.fail("an unreadable state must not post"),
+        )
+
+        rc = request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
+        ])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["status"] == "uncountable_state"
+        assert payload["posted"] is False
+        assert "--no-cap-check" not in payload["message"]
+        assert "could not be read" in payload["message"].lower()

@@ -161,36 +161,76 @@ def first_completed_review_at(
     return earliest
 
 
+def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
+    """True when a timeline event is the request posted at ``posted_at``."""
+    start = _parse_instant(posted_at)
+    seen = _parse_instant(event_at)
+    if start is None or seen is None:
+        return False
+    delta = (seen - start).total_seconds()
+    return -1 <= delta <= window_seconds
+
+
+def _parse_instant(value: str) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def counted_review_requests(
     events: Any,
     *,
     agent_login: str | None,
     vendor: review_vendors.ReviewVendor,
     first_completed_review_at: str | None,
+    loop_request_times: list[str] | None = None,
+    match_window_seconds: int = 180,
 ) -> list[dict[str, Any]]:
     """The review requests that consume the loop cap, in timeline order.
 
-    An event counts when it asks ``vendor``, was made by ``agent_login`` (any
-    actor when None), and came after the vendor's first completed review. So
-    the initial request, a human's click, a failed POST (no event) and a
-    deduplicated request (no POST) all cost nothing. This is the single
-    counting rule shared by the fetch (GraphQL nodes) and the request script
-    (REST events).
+    An event counts when it asks ``vendor`` and came after the vendor's first
+    completed review, so the initial request, a failed POST (no event) and a
+    deduplicated request (no POST) all cost nothing.
+
+    Provenance comes from ``loop_request_times`` — the timestamps the loop
+    recorded locally as it posted. The actor cannot supply it: the loop uses
+    the member's own `gh` credentials, so a request the member clicked in the
+    GitHub UI carries the same ``actor_login``, and counting those would let a
+    few manual clicks stop a first loop run as capped. Each recorded time
+    claims at most one event. ``loop_request_times=None`` means "no local
+    record available" and falls back to the actor filter, which bounds the
+    loop from above rather than exactly.
     """
     if not first_completed_review_at:
         return []
-    out: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for raw in events or []:
         event = normalize_request_event(raw)
         if event is None:
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if agent_login is not None and event["actor_login"] != agent_login:
-            continue
         if event["created_at"] <= first_completed_review_at:
             continue
-        out.append(event)
+        candidates.append(event)
+    candidates.sort(key=lambda event: event["created_at"])
+
+    if loop_request_times is None:
+        if agent_login is None:
+            return candidates
+        return [event for event in candidates if event["actor_login"] == agent_login]
+
+    out: list[dict[str, Any]] = []
+    unmatched = list(candidates)
+    for posted_at in sorted(loop_request_times):
+        for index, event in enumerate(unmatched):
+            if _within(event["created_at"], posted_at, match_window_seconds):
+                out.append(unmatched.pop(index))
+                break
+    out.sort(key=lambda event: event["created_at"])
     return out
 
 

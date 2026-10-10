@@ -352,3 +352,38 @@ def test_fewer_parsed_links_than_the_reported_count_blocks_clean():
     assert clean_blocked_by(
         [], agreed, review_request_vendor=True, known_thread_ids={"11", "22"}
     ) is None
+
+
+def test_a_pending_review_never_covers_the_head_or_grades_a_finding():
+    """GraphQL can expose an in-progress review as `state: PENDING`.
+    `head_review()` already skips those; the overview helpers must too, or a
+    draft reports as covering the head — routing the loop to
+    overview_unparseable instead of waiting, or clearing the clean gate before
+    the review is submitted (PR #116 review)."""
+    import fetch_gemini_threads as fgt
+
+    submitted = {
+        "author": {"login": "copilot-pull-request-reviewer"},
+        "state": "COMMENTED",
+        "submittedAt": "2026-10-07T15:46:14Z",
+        "commit": {"oid": "aaa111"},
+        "body": "## Pull Request Overview\n\nLooks good overall.\n\n**Open findings: 0**\n",
+        "url": "https://github.com/o/r/pull/1#pullrequestreview-1",
+    }
+    pending = {
+        "author": {"login": "copilot-pull-request-reviewer"},
+        "state": "PENDING",
+        "submittedAt": None,
+        "commit": {"oid": "bbb222"},
+        "body": "",
+        "url": "https://github.com/o/r/pull/1#pullrequestreview-2",
+    }
+    pr = {
+        "headRefOid": "bbb222",
+        "reviews": {"nodes": [submitted, pending]},
+    }
+
+    assert fgt._reviews_oldest_first(pr, "copilot-pull-request-reviewer") == [submitted]
+
+    overview = fgt.latest_reviewer_overview(pr, "copilot-pull-request-reviewer")
+    assert overview is None or overview.get("covers_head") is not True
