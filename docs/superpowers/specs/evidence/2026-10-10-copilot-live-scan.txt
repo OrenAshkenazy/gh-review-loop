@@ -1,0 +1,99 @@
+# Copilot review-request behaviour, public PRs, scanned 2026-10-10 ~09:45Z via gh api graphql
+
+## Bingblop/ADB-Application-Manager#99  head=c1d5686  pendingRequests=[]
+  REQ 2026-10-10T09:19:20Z by Bingblop
+  REQ 2026-10-10T09:24:34Z by Bingblop
+  REV 2026-10-10T09:23:15Z COMMENTED commit=877c36f
+  REV 2026-10-10T09:26:58Z APPROVED commit=c1d5686
+
+## Portocolom-Studio/potocolom#713  head=07f149b  pendingRequests=[]
+  REQ 2026-10-10T09:43:17Z by leonfullxr
+  REQ 2026-10-10T09:43:30Z by leonfullxr
+  REV 2026-10-10T09:43:21Z COMMENTED commit=07f149b
+  REV 2026-10-10T09:43:36Z COMMENTED commit=07f149b
+
+## bytechefhq/bytechef#6141  head=18093e4  pendingRequests=[]
+  REQ 2026-10-09T17:30:27Z by ivicac
+  REQ 2026-10-09T19:35:50Z by ivicac
+  REQ 2026-10-09T21:54:08Z by ivicac
+  REQ 2026-10-09T23:10:59Z by ivicac
+  REQ 2026-10-10T05:36:24Z by ivicac
+  REQ 2026-10-10T06:34:30Z by ivicac
+  REQ 2026-10-10T07:07:23Z by ivicac
+  REQ 2026-10-10T07:35:55Z by ivicac
+  REQ 2026-10-10T09:37:33Z by ivicac
+  REV 2026-10-09T17:39:21Z COMMENTED commit=da63eac
+  REV 2026-10-09T19:43:29Z COMMENTED commit=c2567ce
+  REV 2026-10-09T22:03:02Z COMMENTED commit=499b9a1
+  REV 2026-10-09T23:19:48Z COMMENTED commit=10f1b95
+  REV 2026-10-10T05:44:57Z COMMENTED commit=9e15e47
+  REV 2026-10-10T06:42:16Z COMMENTED commit=f27c2f8
+  REV 2026-10-10T07:15:42Z COMMENTED commit=83c1f7b
+  REV 2026-10-10T07:45:08Z COMMENTED commit=c3d79dc
+  REV 2026-10-10T09:45:01Z COMMENTED commit=e52e584
+
+## AreAArseth/git-subrepo#6  head=ed366e6  pendingRequests=['copilot-pull-request-reviewer']
+  REQ 2026-10-10T08:20:49Z by AreAArseth
+  REQ 2026-10-10T08:30:04Z by AreAArseth
+  REQ 2026-10-10T08:57:00Z by AreAArseth
+  REQ 2026-10-10T09:29:09Z by AreAArseth
+  REQ 2026-10-10T09:44:50Z by AreAArseth
+  REV 2026-10-10T08:26:36Z COMMENTED commit=994616f
+  REV 2026-10-10T08:35:37Z COMMENTED commit=353dfa2
+  REV 2026-10-10T09:02:30Z COMMENTED commit=08d0d3a
+  REV 2026-10-10T09:34:15Z COMMENTED commit=2783643
+
+## vanillagreencom/kendex#4656  head=e15f128  pendingRequests=['copilot-pull-request-reviewer']
+  REQ 2026-10-10T07:39:18Z by github-actions
+  REQ 2026-10-10T08:40:17Z by github-actions
+  REQ 2026-10-10T09:45:06Z by github-actions
+  REV 2026-10-10T07:42:17Z COMMENTED commit=56d3b26
+  REV 2026-10-10T08:42:55Z DISMISSED commit=47c2861
+
+## yeelam-gordon/intelligent-terminal#44  head=f39d1a7  pendingRequests=['copilot-pull-request-reviewer']
+  REQ 2026-10-09T14:40:37Z by yeelam-gordon
+  REQ 2026-10-09T15:10:52Z by yeelam-gordon
+  REQ 2026-10-09T15:35:28Z by yeelam-gordon
+  REQ 2026-10-09T15:59:55Z by yeelam-gordon
+  REQ 2026-10-09T16:39:47Z by yeelam-gordon
+  REQ 2026-10-09T17:05:44Z by yeelam-gordon
+  REQ 2026-10-09T20:59:57Z by yeelam-gordon
+  REQ 2026-10-09T21:30:21Z by yeelam-gordon
+  REQ 2026-10-09T22:20:18Z by yeelam-gordon
+  REQ 2026-10-10T00:51:56Z by yeelam-gordon
+  REQ 2026-10-10T01:17:56Z by yeelam-gordon
+  REQ 2026-10-10T04:25:53Z by yeelam-gordon
+  REQ 2026-10-10T05:02:45Z by yeelam-gordon
+  REQ 2026-10-10T07:00:57Z by yeelam-gordon
+  REQ 2026-10-10T07:39:34Z by yeelam-gordon
+  REQ 2026-10-10T08:05:00Z by yeelam-gordon
+  REQ 2026-10-10T08:56:22Z by yeelam-gordon
+  REQ 2026-10-10T09:23:57Z by yeelam-gordon
+  REQ 2026-10-10T09:45:12Z by yeelam-gordon
+  REV 2026-10-09T14:58:19Z COMMENTED commit=c3aebf1
+  REV 2026-10-09T15:28:10Z COMMENTED commit=c6e5a8b
+  REV 2026-10-09T15:53:43Z COMMENTED commit=b9c9fb3
+  REV 2026-10-09T16:18:04Z COMMENTED commit=b9c9fb3
+  REV 2026-10-09T16:58:05Z COMMENTED commit=8461955
+  REV 2026-10-09T17:24:02Z COMMENTED commit=c3a1069
+  REV 2026-10-09T21:18:18Z COMMENTED commit=17432b7
+  REV 2026-10-09T21:47:17Z COMMENTED commit=17432b7
+  REV 2026-10-09T22:38:10Z COMMENTED commit=17432b7
+  REV 2026-10-10T01:09:42Z COMMENTED commit=17432b7
+  REV 2026-10-10T01:36:17Z COMMENTED commit=9c4d521
+  REV 2026-10-10T04:43:52Z COMMENTED commit=9c4d521
+  REV 2026-10-10T05:20:07Z COMMENTED commit=5d05672
+  REV 2026-10-10T07:19:20Z COMMENTED commit=7a293d4
+  REV 2026-10-10T07:57:01Z COMMENTED commit=7a293d4
+  REV 2026-10-10T08:23:53Z COMMENTED commit=7a293d4
+  REV 2026-10-10T09:13:53Z COMMENTED commit=9751353
+  REV 2026-10-10T09:41:54Z COMMENTED commit=665676d
+
+## haacked/dotfiles#235  head=6f03c25  pendingRequests=[]
+  REQ 2026-10-07T17:16:57Z by haacked
+  REV 2026-10-07T17:18:25Z COMMENTED commit=6f03c25
+
+## block/schemabot#1669  head=968ee60  pendingRequests=[None, None, None, None, None]
+  REQ 2026-10-07T15:42:27Z by morgo
+  REV 2026-10-07T15:46:14Z COMMENTED commit=f4a55e3
+
