@@ -4254,6 +4254,18 @@ class TestReviewRequestCounting:
         assert _fgt.review_request_count_complete(partial) is True
         assert _fgt.review_request_count_complete({"comments": {"nodes": []}}) is True
 
+    def test_comment_vendors_always_have_a_complete_count(self):
+        # The timeline is only consulted for review-request vendors; a busy
+        # Gemini PR with a full event page must not be told its mention count
+        # is a lower bound.
+        full = self._pr(timeline_size=_fgt.PAGE_LIMIT_TIMELINE)
+
+        assert _fgt.review_request_count_complete(full, review_request_vendor=False) is True
+        assert _fgt.review_request_count_complete(full, review_request_vendor=True) is False
+        assert not any("review-request events" in w for w in _fgt.pagination_warnings(full))
+        assert not any("review-request events" in w for w in _fgt.pagination_warnings(full, review_request_vendor=False))
+        assert any("review-request events" in w for w in _fgt.pagination_warnings(full, review_request_vendor=True))
+
     def test_the_fetch_query_asks_for_review_requested_events_and_review_commits(self):
         assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT])" in _fgt.QUERY
         assert "... on ReviewRequestedEvent" in _fgt.QUERY

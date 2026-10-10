@@ -114,6 +114,24 @@ COPILOT_OPEN_FINDINGS_RE = re.compile(
 COPILOT_APPROVING_RE = re.compile(
     r"^(ready to approve|approval recommended|approved?|lgtm|looks good)\b", re.IGNORECASE
 )
+# What the agent should do for each `cleanBlockedBy` reason (spec §5.3).
+CLEAN_BLOCKED_HINTS = {
+    "no_review_for_head": (
+        "{reviewer} has not reviewed the current head; request a review if none "
+        "is pending, then wait, before calling this PR clean."
+    ),
+    "overview_unparseable": (
+        "{reviewer} reviewed the current head but its overview could not be read; "
+        "decide from the threads and the review itself, do not report clean on "
+        "this signal."
+    ),
+    "overview_reports_open_findings": (
+        "{reviewer}'s head overview reports findings with no thread in this "
+        "fetch (page limit or deleted thread); check the review before calling "
+        "this PR clean."
+    ),
+}
+
 DISCUSSION_ANCHOR_RE = re.compile(r"#discussion_r(\d+)$")
 
 # Page sizes embedded in QUERY below. Used by the pagination guard to detect
@@ -818,17 +836,23 @@ def _derive_outcome(
     return "human"
 
 
-def pagination_warnings(pull_request: dict[str, Any]) -> list[str]:
+def pagination_warnings(
+    pull_request: dict[str, Any], *, review_request_vendor: bool = False
+) -> list[str]:
     """Return human-readable warnings when any GraphQL page hit its limit.
 
     Hitting the limit means the script may be silently dropping data — the
     loop should surface this so the user knows to paginate or scope the PR.
+    The timeline warning applies only to review-request vendors (Copilot),
+    whose cap count is derived from it.
     """
     warnings: list[str] = []
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
     reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
-    if not review_request_count_complete(pull_request):
+    if not review_request_count_complete(
+        pull_request, review_request_vendor=review_request_vendor
+    ):
         warnings.append(
             f"review-request events hit page limit ({PAGE_LIMIT_TIMELINE}); "
             "the re-review count is a lower bound."
@@ -1046,8 +1070,16 @@ def review_body_findings(
     return findings
 
 
-def review_request_count_complete(pull_request: dict[str, Any]) -> bool:
-    """False when the timeline page is full, so the review-request count is a lower bound."""
+def review_request_count_complete(
+    pull_request: dict[str, Any], *, review_request_vendor: bool = True
+) -> bool:
+    """False when the timeline page is full, so the review-request count is a lower bound.
+
+    Only review-request vendors count timeline events; a comment vendor's
+    count comes from PR comments, so for it this is always True.
+    """
+    if not review_request_vendor:
+        return True
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
     return len(nodes) < PAGE_LIMIT_TIMELINE
 
@@ -1150,27 +1182,57 @@ def annotate_reviewer_severity(
                 break
 
 
+def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head: str) -> dict[str, Any]:
+    commit = (review.get("commit") or {}).get("oid")
+    return {
+        "assessment": parsed["assessment"] if parsed else "",
+        "approving": parsed["approving"] if parsed else False,
+        "open_findings": parsed["open_findings"] if parsed else None,
+        "complete": bool(parsed and parsed["complete"]),
+        "covers_head": bool(commit) and commit == head,
+        "commit": commit,
+        "submitted_at": review.get("submittedAt"),
+        "url": review.get("url"),
+        "finding_ids": [f["discussion_id"] for f in parsed["findings"]] if parsed else [],
+        "unlinked_findings": parsed["unlinked_findings"] if parsed else 0,
+    }
+
+
 def latest_reviewer_overview(
     pull_request: dict[str, Any], author: str
 ) -> dict[str, Any] | None:
-    """The newest overview by ``author`` with whether it covers the PR head, or None."""
+    """The overview that describes the PR head, or the newest one, or None.
+
+    The newest ``author`` review *of the head commit* wins even when its body
+    is not a readable overview: it still proves the head was reviewed
+    (``covers_head: true``, ``complete: false``), which is "unparseable", not
+    "no review for head" — the waiter is already satisfied, so telling the
+    loop to wait would be a dead end. With no head review, the newest
+    readable overview is reported with ``covers_head: false``.
+    """
     head = pull_request.get("headRefOid") or ""
-    for review in reversed(_reviews_oldest_first(pull_request, author)):
+    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
+    for review in newest_first:
+        if head and (review.get("commit") or {}).get("oid") == head:
+            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+    for review in newest_first:
         parsed = parse_copilot_overview(review.get("body"))
-        if parsed is None:
-            continue
-        commit = (review.get("commit") or {}).get("oid")
-        return {
-            "assessment": parsed["assessment"],
-            "approving": parsed["approving"],
-            "open_findings": parsed["open_findings"],
-            "complete": parsed["complete"],
-            "covers_head": bool(commit) and commit == head,
-            "commit": commit,
-            "submitted_at": review.get("submittedAt"),
-            "url": review.get("url"),
-        }
+        if parsed is not None:
+            return _overview_record(review, parsed, head)
     return None
+
+
+def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
+    """Discussion ids of every review thread on the PR, in any state."""
+    ids: set[str] = set()
+    for thread in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+        if not isinstance(thread, dict):
+            continue
+        for comment in _iter_comments(thread):
+            match = DISCUSSION_ANCHOR_RE.search(comment.get("url") or "")
+            if match:
+                ids.add(match.group(1))
+    return ids
 
 
 def clean_blocked_by(
@@ -1178,13 +1240,19 @@ def clean_blocked_by(
     overview: dict[str, Any] | None,
     *,
     review_request_vendor: bool,
+    known_thread_ids: set[str] | None = None,
 ) -> str | None:
     """Why zero actionable threads is *not yet* clean for a review-request vendor.
 
     Threads always win: with any actionable thread the gate does not apply,
     and the overview is never a reason to drop one. With none, a Copilot PR
-    is clean only when a complete overview on the current head reports zero
-    open findings (spec §5.3). Comment vendors have no overview gate.
+    is clean when a complete overview on the current head reports zero open
+    findings, or when every finding it does report has a thread on the PR
+    (``known_thread_ids``, any state): the overview is a snapshot taken at
+    review time, thread state is live, and the normal classification already
+    decided those threads (spec §5.3). A reported finding the fetch never saw
+    — no thread link, or a link to a thread that is not on the PR — still
+    blocks. Comment vendors have no overview gate.
     """
     if threads or not review_request_vendor:
         return None
@@ -1193,7 +1261,11 @@ def clean_blocked_by(
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
     if (overview.get("open_findings") or 0) > 0:
-        return "overview_reports_open_findings"
+        if known_thread_ids is None or overview.get("unlinked_findings"):
+            return "overview_reports_open_findings"
+        linked = overview.get("finding_ids") or []
+        if not linked or any(fid not in known_thread_ids for fid in linked):
+            return "overview_reports_open_findings"
     return None
 
 
@@ -3914,7 +3986,13 @@ def main() -> int:
                 else:
                     msg = f"--drop-unknown-severity: dropped {dropped} unknown-severity thread(s)."
                 print(msg, file=sys.stderr)
-        page_warnings = pagination_warnings(pull_request)
+        # Comment vendors keep the original one-argument call (their count
+        # never depends on the timeline page).
+        page_warnings = (
+            pagination_warnings(pull_request, review_request_vendor=True)
+            if review_request_vendor
+            else pagination_warnings(pull_request)
+        )
         for warning in page_warnings:
             print(f"warning: {warning}", file=sys.stderr)
 
@@ -4421,6 +4499,7 @@ def main() -> int:
                         "cleanBlockedBy": clean_blocked_by(
                             threads, reviewer_overview,
                             review_request_vendor=review_request_vendor,
+                            known_thread_ids=discussion_ids_on_pr(pull_request),
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -4432,7 +4511,9 @@ def main() -> int:
                         "limitReached": len(rereviews) >= args.max_rereview_requests,
                         # False when the timeline page was full: the count
                         # above is then a lower bound (review-request vendors).
-                        "reReviewCountComplete": review_request_count_complete(pull_request),
+                        "reReviewCountComplete": review_request_count_complete(
+                            pull_request, review_request_vendor=review_request_vendor
+                        ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
                         "addressedByReplyThreads": len(addressed_by_reply_threads(pull_request, args.author)),
@@ -4502,13 +4583,14 @@ def main() -> int:
                 )
             )
         blocked = clean_blocked_by(
-            threads, reviewer_overview, review_request_vendor=review_request_vendor
+            threads, reviewer_overview, review_request_vendor=review_request_vendor,
+            known_thread_ids=discussion_ids_on_pr(pull_request),
         )
         if blocked:
             print(
                 color_loop_block(
-                    f"[loop] not clean: {blocked} — wait for a {args.reviewer_name} "
-                    "review of the current head before calling this PR clean.",
+                    f"[loop] not clean: {blocked} — "
+                    + CLEAN_BLOCKED_HINTS[blocked].format(reviewer=args.reviewer_name),
                     enabled=color_enabled,
                 )
             )

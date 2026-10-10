@@ -128,6 +128,8 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
         "commit": OLD_HEAD,
         "submitted_at": "2026-10-07T15:46:14Z",
         "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
+        "finding_ids": ["4208919854", "4208919952"],
+        "unlinked_findings": 0,
         "warnings": [],
     }
     assert first["loopStatus"]["reReviewRequests"] == 0
@@ -244,6 +246,58 @@ def test_an_unparseable_overview_with_no_threads_blocks_clean(loop, monkeypatch,
 
     assert result["threads"] == []
     assert result["loopStatus"]["cleanBlockedBy"] == "overview_unparseable"
+
+
+def test_every_finding_dispositioned_without_a_push_is_clean(loop, monkeypatch, capsys):
+    # The agent (or a human in the UI) resolved both of Copilot's threads as
+    # won't-fix. No push, so the head overview still says 2 open findings.
+    # Thread state is live; the overview is a snapshot. Clean, like Gemini.
+    payload = copy.deepcopy(FIXTURE["initial"])
+    for thread in payload["reviewThreads"]["nodes"]:
+        thread["isResolved"] = True
+    loop["payload"] = payload
+
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+
+    assert result["threads"] == []
+    assert result["reviewerOverview"]["open_findings"] == 2
+    assert result["reviewerOverview"]["covers_head"] is True
+    assert result["loopStatus"]["cleanBlockedBy"] is None
+
+
+def test_a_finding_the_fetch_cannot_see_blocks_clean(loop, monkeypatch, capsys):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    payload["reviewThreads"]["nodes"][0]["isResolved"] = True
+    del payload["reviewThreads"]["nodes"][1]
+    loop["payload"] = payload
+
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+
+    assert result["threads"] == []
+    assert result["loopStatus"]["cleanBlockedBy"] == "overview_reports_open_findings"
+
+
+def test_a_head_review_without_a_readable_overview_blocks_as_unparseable(loop, monkeypatch, capsys):
+    payload = copy.deepcopy(FIXTURE["clean"])
+    payload["reviews"]["nodes"][0]["body"] = "Looks good to me."
+    loop["payload"] = payload
+
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+
+    assert result["reviewerOverview"]["covers_head"] is True
+    assert result["reviewerOverview"]["complete"] is False
+    assert result["loopStatus"]["cleanBlockedBy"] == "overview_unparseable"
+
+
+def test_gemini_loop_status_never_claims_a_lower_bound_count(loop, monkeypatch, capsys):
+    payload = copy.deepcopy(FIXTURE["after_rereview"])
+    payload["timelineItems"]["nodes"] = payload["timelineItems"]["nodes"] * 50
+    loop["payload"] = payload
+
+    result = run_fetch(monkeypatch, capsys, "--reviewer", "gemini-code-assist", "--reviewer-source", "confirmed")
+
+    assert result["loopStatus"]["reReviewCountComplete"] is True
+    assert not any("review-request events" in w for w in result.get("warnings", []))
 
 
 def test_only_the_agents_post_review_requests_count(loop):
