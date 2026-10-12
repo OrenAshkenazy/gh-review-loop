@@ -15,10 +15,8 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # standard truncation cap.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --full
 
-# Wait for configured reviewer activity to appear (cycle 1 / initial review).
-# No --after → returns as soon as activity is present; it does NOT wait for a
-# quiet/settle period — at the initial review there either are comments or
-# there aren't.
+# Wait for initial reviewer activity; without --after it returns immediately
+# once activity appears, without waiting for a settle period.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --wait
 
 # Wait for a NEW reviewer response after a re-review request (cycle 2+).
@@ -47,15 +45,14 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # Parse JSON stdout and capture `created_at` as REREVIEW_AT.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/request_rereview.py" \
     --repo OWNER/REPO --pr PR_NUMBER \
-    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --json
+    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --expect-head "$PUBLISHED_HEAD" --json
 # Copilot (persisted trigger_kind: review_request): same command without the
-# mention; it posts a GitHub reviewer request, not a comment. Add
-# --expect-head "$(git rev-parse HEAD)" to refuse if the PR head moved.
+# mention; it posts a GitHub reviewer request. PUBLISHED_HEAD is the publish
+# helper's JSON head; a moved or closed PR blocks the write.
 
 # Render deterministic human-readable formatter blocks for relay.
-# NOTE: the default fetch already appends both blocks to its output (and JSON
-# fetches carry them as humanBlocks.profileIntro/.plannedVerification), so on a
-# repo that already has a profile these standalone forms are out-of-band only.
+# Default fetch includes both blocks (JSON: humanBlocks.profileIntro and
+# .plannedVerification); with a saved profile these forms are out-of-band.
 # They ARE part of the first-run cycle: with no profile saved, the fetch emits
 # a regenerate notice instead of the blocks (humanBlocks.profileBlocksProvisional
 # is true, plannedVerification is empty), because the profile decision lands

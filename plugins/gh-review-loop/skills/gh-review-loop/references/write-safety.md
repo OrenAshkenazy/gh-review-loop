@@ -23,9 +23,12 @@ These safeguards apply to calls through the helper. Arbitrary manual Git command
 
 Claude Code additionally runs three state-gated hooks, which fail open. Codex relies on the verified publish helper for the same publication gate. The re-review cap is independently enforced by `request_rereview.py`; unknown counts refuse to post.
 
+For Copilot, both publication and re-review count native requests matched to the loop's locally recorded timestamps. Manual reviewer requests do not consume the loop's cap. Clearing local state removes that provenance; ambiguous history blocks further publication. Comment vendors continue to count the agent's mention comments.
+
 | Event | Script | Guarantee |
 |---|---|---|
 | `PreToolUse` (`Bash`) | `loop_summary_gate.py` | Blocks Git push with a stale cycle summary. |
 | `PreToolUse` (`Edit`/`Write`/`MultiEdit`) | `loop_profile_gate.py` | Blocks edits without a saved profile decision; Skip clears this edit hook but cannot enable publication. |
 | `Stop` | `loop_summary_hook.py` | Emits the missing cycle summary. |
-`--expect-head <sha>` is honored on both re-review paths: the script reads the PR's head and posts nothing when it differs (`head_mismatch`) or cannot be read (`uncountable_state`). Pass your pushed HEAD, because a trigger that lands before GitHub sees the push buys a review of the previous commit, which the loop then reads as this cycle's verdict.
+
+`--expect-head <sha>` is honored on both re-review paths: pass the full published SHA. Immediately before a guarded comment, native request, or stale-request cancellation, the script rechecks that the PR is open at that head. A mismatch or unreadable state blocks the write; relay the resulting status and do not retry blindly. A trigger that lands before GitHub sees the push buys a review of the previous commit.

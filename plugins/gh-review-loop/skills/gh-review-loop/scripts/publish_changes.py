@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import judge
 import loop_state
 import request_rereview as rr
+import review_vendors
 from run_profile import command_argv, run_profile
 
 
@@ -98,7 +99,7 @@ def validate_profile(profile: object, root: Path) -> dict:
     for check in checks:
         if not command_argv(check.get("command")):
             raise PublishError("verification check has an empty command")
-        directory = check.get("working_directory", profile.get("working_directory", "."))
+        directory = check.get("working_directory") or profile.get("working_directory", ".")
         if not isinstance(directory, str) or not (root / directory).resolve().is_relative_to(root) or not (root / directory).is_dir():
             raise PublishError("verification working directories must exist inside the checkout")
     return profile
@@ -150,9 +151,15 @@ def loop_gate(repo: str, pr: int) -> None:
     reviewer = rr.read_persisted_reviewer(repo, pr)
     if not reviewer:
         raise PublishError("confirm a reviewer for this PR before publishing")
-    trigger, _ = rr.resolve_review_trigger(repo=repo, pr=pr, reviewer_login=None, reviewer_mention=None)
     login = rr.gh_login()
-    used = rr.count_agent_pings(repo, pr, trigger, login) if trigger and login else None
+    vendor = review_vendors.vendor_for(reviewer.get("login"))
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        request = rr.request_state(repo, pr, vendor)
+        first_review = request.get("first_completed_review_at") if request else None
+        used = rr.count_agent_review_requests(repo, pr, vendor, login, first_review) if first_review and login else None
+    else:
+        trigger, _ = rr.resolve_review_trigger(repo=repo, pr=pr, reviewer_login=None, reviewer_mention=None)
+        used = rr.count_agent_pings(repo, pr, trigger, login) if trigger and login else None
     if used is None:
         raise PublishError("re-review cap cannot be established; publishing blocked")
     if used >= rr.effective_cap(None):

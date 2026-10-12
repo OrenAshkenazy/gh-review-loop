@@ -898,6 +898,16 @@ def positive_pr(value: str) -> int:
     return parsed
 
 
+def ensure_expected_head(repo: str, pr: int, expect_head: str, runner: Any) -> None:
+    """Check the open PR immediately before a guarded review write."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", expect_head):
+        raise ValueError("--expect-head must be a full commit SHA")
+    owner, repo_name = parse_repo(repo)
+    info = _gh_json(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], runner)
+    if not isinstance(info, dict) or info.get("state") != "open" or not isinstance(info.get("head"), dict) or info["head"].get("sha") != expect_head:
+        raise RuntimeError("PR head changed or could not be established; no re-review posted")
+
+
 def post_rereview(
     repo: str,
     pr: int,
@@ -930,15 +940,7 @@ def post_rereview(
         }
 
     if expect_head is not None:
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", expect_head):
-            raise ValueError("--expect-head must be a full commit SHA")
-        result = runner(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-        try:
-            info = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("could not establish the current PR head") from exc
-        if result.returncode or not isinstance(info, dict) or info.get("state") != "open" or not isinstance(info.get("head"), dict) or info["head"].get("sha") != expect_head:
-            raise RuntimeError("PR head changed or could not be established; no re-review posted")
+        ensure_expected_head(repo, pr, expect_head, runner)
 
     cmd = [
         "gh",
@@ -984,6 +986,7 @@ def request_review(
     request_login: str,
     runner: Any = None,
     dry_run: bool = False,
+    expect_head: str | None = None,
 ) -> dict[str, Any]:
     """Add ``request_login`` as a requested reviewer and return the result payload.
 
@@ -1012,6 +1015,11 @@ def request_review(
             "posted": False,
         }
 
+    if expect_head is not None:
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except RuntimeError as exc:
+            raise ReviewRequestRejected(str(exc), reason="head_mismatch", retryable=False) from exc
     requested_at = utc_now_iso()
     cmd = [
         "gh",
@@ -1053,6 +1061,7 @@ def cancel_review_request(
     pr: int,
     request_login: str,
     runner: Any = None,
+    expect_head: str | None = None,
 ) -> bool:
     """Withdraw an open review request for ``request_login``; True on success.
 
@@ -1067,6 +1076,11 @@ def cancel_review_request(
     owner, repo_name = parse_repo(repo)
     if not request_login:
         return False
+    if expect_head is not None:
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return False
     cmd = [
         "gh",
         "api",
@@ -1150,14 +1164,14 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
     # The open request is withdrawn only once the cap has cleared, so a refusal
     # never leaves the PR with nothing pending. A dry run withdraws nothing.
     if state["state"] == "STALE_PENDING" and not args.dry_run:
-        if not cancel_review_request(args.repo, args.pr, reviewer):
+        if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head):
             _emit(
                 stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"]),
                 json_output=json_output,
             )
             return 0
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head)
     except ReviewRequestRejected as exc:
         if exc.reason == "uncertain" and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at
@@ -1203,7 +1217,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", required=True, help="GitHub repository in OWNER/REPO format.")
     parser.add_argument("--pr", required=True, type=positive_pr, help="Positive PR number.")
-    parser.add_argument("--expect-head", help="Refuse to post unless the open PR still points at this full commit SHA.")
     parser.add_argument(
         "--phrase",
         default=None,

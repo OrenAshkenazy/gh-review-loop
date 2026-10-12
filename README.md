@@ -330,3 +330,6 @@ Use the installed skill's `publish_changes.py` for every fix cycle. It validates
 
 Python argv arrays preserve Windows paths and quotes; string commands use host quoting. The test matrix covers Ubuntu and Windows on Python 3.10–3.13. POSIX-only Claude shell-hook tests and unavailable symlink capabilities are marked separately.
 
+For Copilot, publication uses the native request counter, and guarded requests recheck the open PR's head immediately before each write.
+
+Copilot review effort selection is not exposed by this version; GitHub determines the effort from its existing settings and prior PR selection.

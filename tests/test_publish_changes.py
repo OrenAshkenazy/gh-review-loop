@@ -93,6 +93,16 @@ def test_failed_required_check_blocks(checkout):
     assert_not_pushed(checkout)
 
 
+@pytest.mark.parametrize("override", ["", None])
+def test_empty_check_directory_cannot_hide_profile_outside_checkout(checkout, monkeypatch, override):
+    checkout[4]["working_directory"] = ".."
+    checkout[4]["checks"][0]["working_directory"] = override
+    monkeypatch.setattr(pc, "run_profile", lambda *args: pytest.fail("an outside verification directory must not run"))
+    with pytest.raises(pc.PublishError, match="working directories"):
+        publish(checkout)
+    assert_not_pushed(checkout)
+
+
 @pytest.mark.parametrize("staged", [False, True])
 def test_unrelated_changes_are_preserved_and_block_publish(checkout, staged):
     root = checkout[0]
@@ -157,6 +167,39 @@ def test_unknown_or_exhausted_cap_blocks(checkout, monkeypatch, count):
     monkeypatch.setattr(rr, "count_agent_pings", lambda *args: count)
     with pytest.raises(pc.PublishError, match="cap"):
         publish(checkout)
+    assert_not_pushed(checkout)
+
+
+@pytest.mark.parametrize("count", [0, 2, 3, None])
+def test_copilot_publication_uses_native_request_cap(checkout, monkeypatch, count):
+    vendor = rr.review_vendors.COPILOT
+    first_review = "2026-10-07T16:00:00Z"
+    monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": vendor.login})
+    monkeypatch.setattr(rr, "request_state", lambda *args: {"first_completed_review_at": first_review})
+    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: pytest.fail("Copilot must not count mention comments"))
+    counted = []
+
+    def count_requests(repo, pr, selected, login, first_completed):
+        counted.append((repo, pr, selected, login, first_completed))
+        return count
+
+    monkeypatch.setattr(rr, "count_agent_review_requests", count_requests)
+    if count is None or count >= 3:
+        with pytest.raises(pc.PublishError, match="cap"):
+            publish(checkout, dry_run=True)
+    else:
+        assert publish(checkout, dry_run=True)["status"] == "verified"
+    assert counted and all(call == ("owner/repo", 1, vendor, "agent", first_review) for call in counted)
+    assert_not_pushed(checkout)
+
+
+@pytest.mark.parametrize("review_state", [None, {"first_completed_review_at": None}])
+def test_copilot_unknown_review_state_blocks_publication(checkout, monkeypatch, review_state):
+    monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": rr.review_vendors.COPILOT.login})
+    monkeypatch.setattr(rr, "request_state", lambda *args: review_state)
+    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: pytest.fail("Copilot must not count mention comments"))
+    with pytest.raises(pc.PublishError, match="cap"):
+        publish(checkout, dry_run=True)
     assert_not_pushed(checkout)
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -112,6 +113,7 @@ def test_cli_seed(tmp_path, capsys):
     assert len(json.loads(capsys.readouterr().out)["added"]) == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only permission bits")
 def test_state_dir_and_data_files_are_owner_only(tmp_path, monkeypatch):
     """The bank holds employment, customer and conflict answers. On a shared
     box with the usual 022 umask these landed as 0644 in a 0755 directory,
@@ -127,6 +129,7 @@ def test_state_dir_and_data_files_are_owner_only(tmp_path, monkeypatch):
     assert bank.log_path().stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only permission bits")
 def test_existing_loose_permissions_are_tightened(tmp_path, monkeypatch):
     base = tmp_path / "state"
     base.mkdir(mode=0o755)
