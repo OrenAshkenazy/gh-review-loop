@@ -11,7 +11,7 @@ Run the full GitHub PR loop: wait for the configured AI reviewer, fetch unresolv
 
 Explicit user instructions override every default here and in the references (cap, severity filter, auto-resolve, reviewer choice); "never X without an explicit request" means an explicit request unlocks X. Say in one line when you override a default. This file wins over any reference file — don't stop to reconcile them, follow this file.
 
-Requires Python 3.10+ (`python3` or `python` on Windows) and an authenticated `gh` CLI with GitHub access. If either is missing the script prints `error: ...` — relay it and stop. Never substitute raw API calls, unauthenticated requests, or guesses about review state.
+Requires Python 3.10+ and authenticated `gh` CLI. Missing either prints `error: ...`; relay it and stop. Never substitute raw API calls except explicitly authorized deferral replies (`references/user-decisions.md`); never use unauthenticated requests or guess review state.
 
 ## Reference files (load on demand)
 

@@ -3,7 +3,7 @@
 
 Comment vendors (Gemini, Codex) read an @mention posted as a PR comment.
 Review-request vendors (Copilot) ignore comments and are re-reviewed through
-GitHub's requested-reviewers API; GitHub does not deduplicate those requests,
+GitHub's review-request APIs; GitHub does not deduplicate those requests,
 so this script resolves the PR's state first and only posts from ABSENT or
 STALE_PENDING (see docs/superpowers/specs/2026-10-07-copilot-reviewer-design.md §3).
 """
@@ -70,6 +70,7 @@ STATE_QUERY = """
 query($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
+      id
       headRefOid
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
@@ -81,7 +82,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
 
 
 class ReviewRequestRejected(RuntimeError):
-    """The requested-reviewers POST did not succeed.
+    """The review-request mutation did not succeed.
 
     ``reason`` classifies it (spec §6): permission, validation, not_found,
     rate_limited, transient, or uncertain (no HTTP status — the request may
@@ -660,7 +661,7 @@ def request_state(
 ) -> dict[str, Any] | None:
     """Resolve the review-request state machine for ``vendor`` on the PR (spec §3).
 
-    Returns ``{"state", "head", "pending_since", "first_completed_review_at"}``
+    Returns ``{"state", "head", "pending_since", "first_completed_review_at", "rerequest_ids"}``
     with ``state`` one of COMPLETED_HEAD (a submitted vendor review covers the
     head), PENDING (requested, no review for the head yet), STALE_PENDING
     (pending for at least STALE_REQUEST_SECONDS), ABSENT (nothing pending,
@@ -697,6 +698,11 @@ def request_state(
         if review_vendors.vendor_for(_review_author(review)) is vendor
     ]
     completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
+    bot_ids = {
+        user["node_id"] for review in completed
+        if (user := review.get("user") or {}).get("type") == "Bot"
+        and isinstance(user.get("node_id"), str) and user["node_id"]
+    }
     completed_head = any(_review_commit(review) == head for review in completed)
 
     requests = (pull.get("reviewRequests") or {}).get("nodes") or []
@@ -735,6 +741,7 @@ def request_state(
         "head": head,
         "pending_since": pending_since,
         "first_completed_review_at": reviewer_resolver.first_completed_review_at(reviews, vendor),
+        "rerequest_ids": (pull["id"], next(iter(bot_ids))) if isinstance(pull.get("id"), str) and pull["id"] and len(bot_ids) == 1 else None,
     }
 
 
@@ -987,11 +994,12 @@ def request_review(
     runner: Any = None,
     dry_run: bool = False,
     expect_head: str | None = None,
+    rerequest_ids: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Add ``request_login`` as a requested reviewer and return the result payload.
 
     This is how review_request vendors (Copilot) are asked for another look:
-    the same call for the first request and every re-request. ``created_at``
+    REST for the first request, GraphQL when prior bot IDs are known. ``created_at``
     is local UTC taken just before the POST (the response is the PR object
     and carries no event timestamp); it is narration and the reconciliation
     anchor for an uncertain outcome, never what the waiter keys on.
@@ -1030,6 +1038,10 @@ def request_review(
         "--raw-field",
         f"reviewers[]={request_login}",
     ]
+    if rerequest_ids:
+        pull_id, bot_id = rerequest_ids
+        query = "mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }"
+        cmd = ["gh", "api", "graphql", "-f", "query=" + query, "-f", "pr=" + pull_id, "-f", "bot=" + bot_id]
     try:
         result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -1046,6 +1058,14 @@ def request_review(
             retryable=retryable,
             requested_at=requested_at,
         )
+    if rerequest_ids:
+        try:
+            data = json.loads(result.stdout)
+            pull = ((data.get("data") or {}).get("rerequestReviews") or {}).get("pullRequest") or {}
+            if data.get("errors") or pull.get("id") != rerequest_ids[0]:
+                raise ValueError("missing mutation result or GraphQL errors")
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ReviewRequestRejected("GraphQL re-request outcome uncertain", reason="uncertain", requested_at=requested_at) from exc
     return {
         "created_at": requested_at,
         "repo": repo,
@@ -1171,7 +1191,7 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
             )
             return 0
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head)
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"))
     except ReviewRequestRejected as exc:
         if exc.reason == "uncertain" and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at

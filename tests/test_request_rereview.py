@@ -919,6 +919,20 @@ OLD_REVIEW = (COPILOT_LOGIN, "COMMENTED", T_FIRST_REVIEW, "f4a55e3000")
 
 
 class TestRequestState:
+    def test_rerequest_ids_come_from_the_selected_completed_bot(self):
+        payload = _gql_pr("new-head")
+        payload["data"]["repository"]["pullRequest"]["id"] = "PR_target"
+        review = _rest_reviews([OLD_REVIEW])[0]
+        review["user"].update(type="Bot", node_id="BOT_copilot")
+        other = {**review, "user": {"login": "other-bot", "type": "Bot", "node_id": "BOT_other"}}
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(payload, review_pages=[[other, review]]),
+        )
+
+        assert state["state"] == "ABSENT"
+        assert state["rerequest_ids"] == ("PR_target", "BOT_copilot")
+
     def test_request_state_completed_head(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
@@ -1116,6 +1130,48 @@ class TestReviewRequestHelpers:
         assert result["posted"] is True
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", result["created_at"])
 
+    def test_rerequest_uses_bot_ids_after_the_head_guard(self):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-1] == "repos/acme/widget/pulls/159":
+                return _completed(cmd, {"state": "open", "head": {"sha": "a" * 40}})
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            assert "rerequestReviews" in cmd[4]
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            assert not kwargs.get("shell")
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+
+        assert result["posted"] is True
+        assert len(calls) == 2
+        calls.clear()
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+        assert not result["posted"] and not calls
+
+    @pytest.mark.parametrize("response", [{}, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_other"}}}}, {"errors": [{"message": "denied"}]}])
+    def test_rerequest_requires_a_confirmed_mutation_result(self, response):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            return _completed(cmd, response)
+
+        with pytest.raises(request_rereview.ReviewRequestRejected) as info:
+            request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner, rerequest_ids=("PR_target", "BOT_copilot"))
+
+        assert info.value.reason == "uncertain"
+        assert info.value.requested_at
+        assert len(calls) == 1  # An ambiguous GraphQL write must never fall back to REST.
+
     def test_request_review_rejection_carries_reason(self):
         def runner(cmd, **kwargs):
             return _completed(cmd, None, rc=1, stderr='{"message":"Reviews may only be requested from collaborators."}\ngh: Validation Failed (HTTP 422)')
@@ -1235,6 +1291,25 @@ class TestReviewRequestMain:
 
         assert requested["login"] == COPILOT_REQUEST
         assert json.loads(capsys.readouterr().out)["kind"] == "review_request"
+
+    def test_main_forwards_rerequest_ids_and_records_one_success(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        state = request_rereview.request_state()
+        state["rerequest_ids"] = ("PR_target", "BOT_copilot")
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: state)
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        monkeypatch.setattr(request_rereview.subprocess, "run", runner)
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert len(calls) == 1 and self._stamped(tmp_path) == 1
 
     def test_pending_state_posts_nothing_and_skips_the_cap(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
