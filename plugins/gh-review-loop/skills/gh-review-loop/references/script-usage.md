@@ -1,11 +1,10 @@
 # Script usage catalog
 
-Resolve `$GGRL_PLUGIN_ROOT` first (see SKILL.md — run as its own Bash call). All commands below assume it is exported.
+Resolve the installed root from the selected SKILL.md's absolute path. Bash examples assume `$GGRL_PLUGIN_ROOT` is exported; on Windows use `python` and quoted absolute script paths with the same arguments.
 
 ```bash
-# Default fetch: resolves unresolved outdated reviewer threads AND
-# addressed-by-reply threads (substantive non-bot reply, >=30 chars) before
-# printing current feedback. The re-review cap does not block this cleanup.
+# Default fetch leaves resolution unchanged and prints current feedback.
+# Explicit resolution uses --resolve-outdated / --resolve-addressed-by-reply.
 # Delta mode: threads unchanged since the previous cycle collapse to one line;
 # any change (new reply, edited body, moved anchor) renders full. The output
 # ends with the profile-intro + planned-verification blocks (relay from here).
@@ -108,3 +107,13 @@ The script emits `warning: ... hit page limit ...` to stderr if any GraphQL page
 #   upgrade/add credits then re-run the same wait); do NOT re-request the review.
 # - timed_out -> record --gemini-unconfirmed; do not guess clean. Say the wait
 #   timed out — never invent feedback.
+
+## Verified publish (all runtimes)
+
+After fixes and `--cycle-summary`, invoke the script using its installed absolute path:
+
+```text
+python "<plugin-root>/skills/gh-review-loop/scripts/publish_changes.py" --repo owner/repo --pr 42 --repo-root "<checkout-root>" --paths src/fix.py tests/test_fix.py --message "Fix reviewer findings"
+```
+
+POSIX also supports `python3`. Paths are individual files relative to the checkout, using forward slashes; the index must be empty. `--dry-run` verifies without Git writes. Pass the output's `head` to `request_rereview.py --expect-head <sha>`, then wait for `created_at`. Failure handling and limits: `write-safety.md`.

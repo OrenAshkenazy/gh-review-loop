@@ -11,7 +11,7 @@ Run the full GitHub PR loop: wait for the configured AI reviewer, fetch unresolv
 
 Explicit user instructions override every default here and in the references (cap, severity filter, auto-resolve, reviewer choice); "never X without an explicit request" means an explicit request unlocks X. Say in one line when you override a default. This file wins over any reference file — don't stop to reconcile them, follow this file.
 
-Requires `python3` (3.10+) and an authenticated `gh` CLI with GitHub access. If either is missing the script prints `error: ...` — relay it and stop. Never substitute raw API calls, unauthenticated requests, or guesses about review state.
+Requires Python 3.10+ (`python3` or `python` on Windows) and an authenticated `gh` CLI with GitHub access. If either is missing the script prints `error: ...` — relay it and stop. Never substitute raw API calls, unauthenticated requests, or guesses about review state.
 
 ## Reference files (load on demand)
 
@@ -36,8 +36,8 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 
 ## Thread States
 
-- **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
-- **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
+- **`RESOLVED`** / **`OUTDATED`** — skip; leave unresolved unless the user explicitly requests resolution.
+- **`ADDRESSED_BY_REPLY`** — an OWNER/COLLABORATOR reply beginning with `/review-loop defer` after the latest bot comment explicitly deferred it: do not fix again; leave unresolved (details: `references/write-safety.md`).
 - **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from the reviewer's severity badges.
 
 ## Cycle Counting
@@ -50,7 +50,7 @@ Bot reviewers are LLMs: fixing only the flagged sites of a pattern teaches the b
 
 ## Verification Profile
 
-Each repo can have a code-derived verification profile — the checks the verify step runs. **First run for a repo** (a `PreToolUse` hook blocks edits until a profile decision is saved): load `references/verification-profile.md` and run its detect → menu → save flow before any edit. **Subsequent runs**: no prompt — the fetch output ends with the profile intro and planned-verification blocks; relay the intro from there, then for `confirmed`/`customized` run `run_profile.py <owner/repo> <repo_root>` — never call the test runner directly — feeding its `verification` field into `--verification` and its JSON into `--verification-details`. Verify fails iff any `required` check fails or times out. On `skipped`/unknown, relay the fallback intro and use ad-hoc narrowest-meaningful checks.
+Each repo can have a code-derived verification profile — the checks the verify step runs. **First run for a repo** (a `PreToolUse` hook blocks edits until a profile decision is saved): load `references/verification-profile.md` and run its detect → menu → save flow before any edit. **Subsequent runs**: no prompt — the fetch output ends with the profile intro and planned-verification blocks; relay the intro from there, then for `confirmed`/`customized` run `run_profile.py <owner/repo> <repo_root>` — never call the test runner directly — feeding its `verification` field into `--verification` and its JSON into `--verification-details`. Verify fails iff any `required` check fails or times out. On `skipped`/unknown, relay the fallback intro; save a customized profile with at least one required meaningful check before publishing.
 
 ## Receipts: per-cycle and terminal
 
@@ -66,7 +66,7 @@ Each repo can have a code-derived verification profile — the checks the verify
 ## Progress Narration
 
 <HARD-GATE>
-Before `git push` on a non-terminal cycle: run `--cycle-summary` and relay its printed `[loop]` pointer line. For a terminal cycle **that follows a final push**: request re-review, capture `REREVIEW_AT`, wait with `--wait --after "$REREVIEW_AT"`, and set the terminal reviewer-confirmation flag from that wait result before `--record-run`. Terminal paths that publish nothing (already clean, cap reached, human decision, regression, no progress) record directly — no push, re-review, or wait. Enforced mechanically on hook runtimes: `loop_summary_gate.py` blocks `git push` while the summary is stale (exit 2 names the exact fix); `--record-run` is exempt. Violating the letter violates the spirit.
+Before `git push` on a non-terminal cycle: run `--cycle-summary` and relay its printed `[loop]` pointer line. For a terminal cycle **that follows a final push**: request re-review, capture `REREVIEW_AT`, wait with `--wait --after "$REREVIEW_AT"`, and set the terminal reviewer-confirmation flag from that wait result before `--record-run`. Terminal paths that publish nothing (already clean, cap reached, human decision, regression, no progress) record directly — no push, re-review, or wait. `publish_changes.py` enforces this on every runtime (manual Git is outside its scope). On hook runtimes: `loop_summary_gate.py` blocks `git push` while the summary is stale (exit 2 names the exact fix); `--record-run` is exempt. Violating the letter violates the spirit.
 </HARD-GATE>
 
 Emit one-line status updates at each phase transition. **N** = session cycle: copy it from the script (`[loop] session cycle N`, `loopStatus.sessionCycle`, or the receipt header) — never count it yourself. It exists only after a fetch, so the pre-fetch line omits it. **M/K** = cap consumed.
@@ -77,7 +77,7 @@ Emit one-line status updates at each phase transition. **N** = session cycle: co
 | After fetch | `[loop] session cycle N — re-review cap: M/K consumed. <J> actionable thread(s) (severity: <breakdown>). Fixing.` + judge tip/block if due |
 | After fixes | `[loop] session cycle N — fixes applied. Verifying via profile runner.` |
 | After verify | `[loop] session cycle N — verified (<test summary>).` |
-| Before push | `--cycle-summary` + relay pointer (HARD GATE), then `[loop] session cycle N — committing and pushing <sha>...` |
+| Before push | `--cycle-summary` + relay pointer; `[loop] session cycle N — verifying and publishing fixes...` |
 | After push | `[loop] session cycle N — pushed. Requesting reviewer re-review. Cap now M/K.` |
 | Reviewer wait | Background task (primary) or chunked heartbeats (fallback) — Workflow step 8 |
 | Stop | `[loop] STOP — <stop-condition>: <one-line explanation>.` |
@@ -104,7 +104,7 @@ At the cap still run cleanup, terminal classification, metrics recording, and th
 5. **Check loop status** — count prior agent re-review requests; at or above the cap → Stopping Conditions.
 6. **Fetch, acknowledge, classify.** Default fetch (below). Summarize actionable findings grouped by file/behavior; none and `loopStatus.cleanBlockedBy` null → report clean and stop (set → not clean, see `references/reviewer-selection.md`). First run for the repo → profile decision NOW, before any edit (see Verification Profile), then relay the profile intro. Explanation requests get a reply draft, not a forced edit; conflicts or regression risk → stop and surface the tradeoff.
 7. **Fix + verify.** Scoped to feedback; read before editing; each change traceable to a feedback cluster; sweep per Pattern → Sweep → Converge. Verify via the profile runner; checks can't run → report why.
-8. **Commit, push, re-review, wait, record.** Commit; `--cycle-summary` + relay pointer; push. Within the cap, post the re-review via `request_rereview.py --repo OWNER/REPO --pr N --expect-head "$(git rev-parse HEAD)" --json` (never hand-write the trigger — it also stamps the cycle boundary, so a hand ping leaves the ordinal stuck; a non-posting `status`: `review_pending` → wait; `already_reviewed_head` → fetch; `head_mismatch` → confirm the push, retry once; `capped`, `no_safe_trigger`, `uncountable_*`, `stale_request_not_replaced`, `review_request_rejected` → stop and relay exactly; `review_request_uncertain` → the POST may have landed: do not request again, re-read the state after a minute), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
+8. **Commit, push, re-review, wait, record.** `--cycle-summary` + relay pointer; use `publish_changes.py` (`references/script-usage.md`) to verify, commit, and push explicit paths. Failure blocks publication; no manual Git fallback. Read its JSON `head` as the published SHA. Within the cap, post the re-review via `request_rereview.py --repo OWNER/REPO --pr N --expect-head <published-sha> --json` (never hand-write the trigger — it also stamps the cycle boundary, so a hand ping leaves the ordinal stuck; a non-posting `status`: `review_pending` → wait; `already_reviewed_head` → fetch; `head_mismatch` → confirm the push, retry once; `capped`, `no_safe_trigger`, `uncountable_*`, `stale_request_not_replaced`, `review_request_rejected` → stop and relay exactly; `review_request_uncertain` → the POST may have landed: do not request again, re-read the state after a minute), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
    ```bash
    python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
      --wait --after "$REREVIEW_AT" --timeout 1800
@@ -113,24 +113,9 @@ At the cap still run cleanup, terminal classification, metrics recording, and th
 
 ## Script Usage
 
-Resolve the runtime-neutral plugin root once, as its own Bash call:
+Plugin root: two parents above the directory containing this selected `SKILL.md`. Use that installed version. Windows: `python` and quoted absolute script paths; the Bash examples use identical arguments. Publication: `references/script-usage.md`.
 
-```bash
-GGRL_PLUGIN_ROOT="${GGRL_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
-if [ -z "$GGRL_PLUGIN_ROOT" ]; then
-  GGRL_PLUGIN_ROOT=$(
-    find ~/.codex/plugins ~/.codex/plugins/cache ~/.claude/plugins/cache \
-      -type d -path "*/skills/gh-review-loop" 2>/dev/null \
-      | sort -rV | head -1 | sed 's|/skills/gh-review-loop$||'
-  )
-fi
-if [ -z "$GGRL_PLUGIN_ROOT" ] && [ -d "$(git rev-parse --show-toplevel 2>/dev/null)/plugins/gh-review-loop" ]; then
-  GGRL_PLUGIN_ROOT="$(git rev-parse --show-toplevel)/plugins/gh-review-loop"
-fi
-export GGRL_PLUGIN_ROOT
-```
-
-Default fetch (resolves stale threads, prints current feedback, ends with the profile intro + planned-verification blocks):
+Default fetch (leaves resolution unchanged, prints feedback and verification plans):
 
 ```bash
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" [--pr <URL>]
@@ -140,4 +125,4 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 
 ## GitHub Write Safety
 
-Invariants: **never resolve an `UNRESOLVED` thread without an explicit user request; never submit approve/request-changes reviews unless explicitly asked.** Stale threads (outdated, addressed-by-reply) auto-resolve by default; uncertain run → `--dry-run` first. Full policy, publish-stop conditions, and the bundled-hooks table: `references/write-safety.md`.
+Invariants: **never resolve an `UNRESOLVED` thread without an explicit user request; never submit approve/request-changes reviews unless explicitly asked.** Thread resolution is off by default; explicit opt-in uses `--resolve-outdated` / `--resolve-addressed-by-reply`; uncertain run → `--dry-run` first. Full policy, publish-stop conditions, and the bundled-hooks table: `references/write-safety.md`.

@@ -58,7 +58,7 @@ Remaining because cap was reached
 
 ## Bucket 3 — Already fixed but still unresolved on GitHub
 
-Fix applied this loop, thread still UNRESOLVED. Not open work — the thread auto-resolves as OUTDATED on the next reviewer pass.
+Fix applied this loop, thread still UNRESOLVED. Await reviewer confirmation; an OUTDATED anchor alone does not establish that the finding was fixed.
 
 ```
 Already fixed but still unresolved on GitHub
@@ -66,7 +66,7 @@ Already fixed but still unresolved on GitHub
 1. <file>:<line> · <GitHub comment URL>
    Finding: <what the reviewer originally flagged>
    Status: fix applied in this session
-   Why still shown: code change shifts the line anchor; thread auto-resolves as OUTDATED on the next reviewer pass
+   Why still shown: the anchor may become OUTDATED; reviewer confirmation is still required
 ```
 
 ## After the buckets

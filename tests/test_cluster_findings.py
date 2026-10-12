@@ -447,7 +447,7 @@ class TestAnchoredTokenContainment:
         return {"path": path, "line": line,
                 "comments": {"nodes": [{"author": {"login": "bot"}, "body": body}]}}
 
-    def test_a_symlinked_anchor_yields_no_tokens(self, tmp_path):
+    def test_a_symlinked_anchor_yields_no_tokens(self, tmp_path, symlinks_available):
         outside = tmp_path / "outside.py"
         outside.write_text("secret_token_alpha = beta_gamma_delta()\n")
         root = tmp_path / "repo"

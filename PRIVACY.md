@@ -34,13 +34,13 @@ The plugin may use GitHub APIs to:
 
 1. Fetch pull request metadata
 2. Fetch review threads and comments
-3. Resolve outdated review threads
-4. Resolve threads that were addressed by a substantive maintainer reply
+3. Resolve outdated review threads only when explicitly requested
+4. Resolve explicitly deferred owner/collaborator threads only when explicitly requested
 5. Post pull request comments
 6. Update sticky receipt comments
 7. Request Gemini Code Assist re review
 
-The plugin may also push commits when Claude Code applies fixes and the user allows the loop to continue.
+The plugin may also push commits when the user authorizes a fix loop. The verified publish helper gates the changed files against required checks on Claude Code and Codex.
 
 The plugin does not merge pull requests, approve reviews, submit GitHub reviews, change repository settings, or grant repository access.
 

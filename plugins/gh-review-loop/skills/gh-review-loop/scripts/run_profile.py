@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Execute a verification profile's checks and compute the required-gate.
 
-Each check ``command`` is split with ``shlex`` and run WITHOUT a shell, with
+Each check ``command`` is an argv list or a host-quoted string, run WITHOUT a shell, with
 ``cwd`` set to the profile's ``working_directory`` and a wall-clock timeout.
 The gate fails iff any ``required`` check fails or times out; non-required
 failures are recorded but non-gating.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -19,6 +20,47 @@ from typing import Any
 
 
 _TAIL_LINES = 20
+
+
+def command_argv(command: str | list[str]) -> list[str]:
+    """Accept literal argument arrays; parse strings using the host's quoting."""
+    if isinstance(command, list):
+        if not command or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
+            raise ValueError("command must contain string arguments")
+        return list(command)
+    if not isinstance(command, str) or "\0" in command:
+        raise ValueError("invalid command")
+    if os.name != "nt":
+        return shlex.split(command)
+    # CommandLineToArgvW preserves Windows paths and embedded escaped quotes.
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    if not command.strip():
+        return []
+    # Windows accepts unclosed quotes; reject them without POSIX path parsing.
+    quoted = False
+    slashes = 0
+    for char in command:
+        if char == '"' and slashes % 2 == 0:
+            quoted = not quoted
+        slashes = slashes + 1 if char == "\\" else 0
+    if quoted:
+        raise ValueError("unclosed command quote")
+    count = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(command.strip(), ctypes.byref(count))
+    if not argv:
+        raise ValueError("invalid Windows command")
+    try:
+        return [argv[i] for i in range(count.value)]
+    finally:
+        kernel32.LocalFree(argv)
 
 
 def _output_tail(text: str) -> str:
@@ -88,11 +130,11 @@ def _run_one(check: Any, cwd: Path, timeout: int) -> CheckResult:
     name = str(check.get("name", "<unnamed>"))
     command = check.get("command")
     required = bool(check.get("required", True))
-    if not isinstance(command, str):
+    if not isinstance(command, (str, list)):
         return CheckResult(name, str(command), required, "failed", None,
                            time.monotonic() - start, reason_code="invalid_command")
     try:
-        argv = shlex.split(command)
+        argv = command_argv(command)
     except ValueError:
         # Malformed/unclosed quotes in a hand-edited command.
         return CheckResult(name, command, required, "failed", None,
@@ -100,6 +142,10 @@ def _run_one(check: Any, cwd: Path, timeout: int) -> CheckResult:
     if not argv:
         return CheckResult(name, command, required, "failed", None,
                            time.monotonic() - start, reason_code="invalid_command")
+    if isinstance(command, list):
+        command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         proc = subprocess.run(  # noqa: S603 - command is user-confirmed, no shell
             argv,
@@ -109,6 +155,7 @@ def _run_one(check: Any, cwd: Path, timeout: int) -> CheckResult:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return CheckResult(name, command, required, "timeout", None,
@@ -165,6 +212,8 @@ def run_profile(profile: Any, repo_root: Path | str) -> ProfileRunResult:
     failed_required = [
         c.name for c in results if c.required and c.status != "passed"
     ]
+    if not any(c.required for c in results):
+        failed_required.append("<missing required checks>")
     verification = "failed" if failed_required else "passed"
     return ProfileRunResult(verification, results, failed_required)
 

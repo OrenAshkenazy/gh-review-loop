@@ -37,7 +37,7 @@ def test_vendor_resolves_from_its_mention_too():
 
 
 def test_unknown_reviewer_login_has_no_vendor_record():
-    assert review_vendors.vendor_for("coderabbitai") is None
+    assert review_vendors.vendor_for("unknown-reviewer") is None
 
 
 def test_codex_does_not_review_until_it_is_pinged():

@@ -7,10 +7,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,21 +24,23 @@ jobs:
       - name: Lint (ruff)
         run: ruff check plugins/ tests/
       - name: Compile scripts
+        shell: bash
         run: |
           python -m py_compile plugins/gh-review-loop/skills/gh-review-loop/scripts/*.py
           python -m py_compile plugins/glg-questionnaire/skills/glg-questionnaire/scripts/*.py
       - name: Validate plugin packaging
+        shell: bash
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
           root = Path("plugins/gh-review-loop")
-          claude = json.loads((root / ".claude-plugin/plugin.json").read_text())
-          codex = json.loads((root / ".codex-plugin/plugin.json").read_text())
-          marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text())
-          catalog = json.loads(Path(".claude-plugin/marketplace.json").read_text())
-          hooks = json.loads((root / "hooks/hooks.json").read_text())
+          claude = json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+          codex = json.loads((root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+          marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
+          catalog = json.loads(Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+          hooks = json.loads((root / "hooks/hooks.json").read_text(encoding="utf-8"))
 
           assert claude["name"] == codex["name"] == "gh-review-loop"
           assert claude["version"] == codex["version"]

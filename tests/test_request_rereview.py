@@ -207,7 +207,7 @@ def test_reviewer_mention_builds_default_phrase(monkeypatch, capsys):
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_review_trigger_mention_alias_builds_default_phrase(monkeypatch, capsys):
@@ -235,7 +235,7 @@ def test_review_trigger_mention_alias_builds_default_phrase(monkeypatch, capsys)
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_missing_safe_trigger_returns_json_stop_without_posting(monkeypatch, capsys):
@@ -333,7 +333,7 @@ def test_persisted_review_trigger_is_used_when_mention_is_omitted(
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_persisted_codex_reviewer_without_trigger_posts_the_exact_codex_phrase(

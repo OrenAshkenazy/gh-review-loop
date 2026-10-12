@@ -904,6 +904,7 @@ def post_rereview(
     phrase: str,
     runner: Any = None,
     dry_run: bool = False,
+    expect_head: str | None = None,
 ) -> dict[str, Any]:
     """Post the top-level PR comment and return the normalized result payload.
 
@@ -927,6 +928,17 @@ def post_rereview(
             "dry_run": True,
             "posted": False,
         }
+
+    if expect_head is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", expect_head):
+            raise ValueError("--expect-head must be a full commit SHA")
+        result = runner(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        try:
+            info = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("could not establish the current PR head") from exc
+        if result.returncode or not isinstance(info, dict) or info.get("state") != "open" or not isinstance(info.get("head"), dict) or info["head"].get("sha") != expect_head:
+            raise RuntimeError("PR head changed or could not be established; no re-review posted")
 
     cmd = [
         "gh",
@@ -1191,6 +1203,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", required=True, help="GitHub repository in OWNER/REPO format.")
     parser.add_argument("--pr", required=True, type=positive_pr, help="Positive PR number.")
+    parser.add_argument("--expect-head", help="Refuse to post unless the open PR still points at this full commit SHA.")
     parser.add_argument(
         "--phrase",
         default=None,
@@ -1374,7 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"[loop] {payload['message']}")
                 return 0
-        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run)
+        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
         # A dry run posts nothing, so it closes no cycle.
         if payload.get("posted") is not False and not payload.get("dry_run"):
             record_rereview_posted(args.repo, args.pr)

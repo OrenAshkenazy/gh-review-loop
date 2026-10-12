@@ -97,13 +97,13 @@ _OK = 'python3 -c "import sys; sys.exit(0)"'
 
 def test_non_dict_profile_does_not_crash(tmp_path):
     result = run_profile("not a profile", tmp_path)
-    assert result.verification == "passed"  # no checks -> vacuously passed
+    assert result.verification == "failed"  # no required checks cannot verify a change
     assert result.checks == []
 
 
 def test_non_list_checks_does_not_crash(tmp_path):
     result = run_profile({"checks": 5}, tmp_path)
-    assert result.verification == "passed"
+    assert result.verification == "failed"
     assert result.checks == []
 
 

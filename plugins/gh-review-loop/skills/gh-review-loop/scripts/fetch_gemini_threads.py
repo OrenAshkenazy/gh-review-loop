@@ -142,9 +142,7 @@ PAGE_LIMIT_PR_COMMENTS = 100
 PAGE_LIMIT_THREAD_COMMENTS = 50
 PAGE_LIMIT_TIMELINE = 100
 
-# Minimum reply length to count a non-bot comment as a substantive reply.
-# Filters out token acks like "ok", "ack", "thanks", "👍".
-ADDRESSED_BY_REPLY_MIN_CHARS = 30
+ADDRESSED_BY_REPLY_MARKER = "/review-loop defer"
 
 
 @dataclass(frozen=True)
@@ -303,6 +301,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
             nodes {
               id
               author { login __typename }
+              authorAssociation
               body
               createdAt
               updatedAt
@@ -652,21 +651,25 @@ def resolve_thread(thread_id: str, *, dry_run: bool = False, label: str = "threa
 
 
 def is_addressed_by_reply(thread: dict[str, Any], bot_author: str) -> bool:
-    """An unresolved thread where a non-bot human posted a substantive reply.
-
-    The reply is treated as a deliberate deferral (defer/wontfix/explanation).
-    The loop should not retry fixing the same thread cycle after cycle.
-    """
+    """An explicit deferral by a repository owner or collaborator after review."""
     if thread.get("isResolved") or thread.get("isOutdated"):
         return False
+    reviewer_seen = False
+    deferred = False
     for comment in (thread.get("comments") or {}).get("nodes") or []:
-        login = (comment.get("author") or {}).get("login") or ""
-        if not login or login == bot_author or login.endswith("[bot]"):
+        author = comment.get("author") or {}
+        login = author.get("login") or ""
+        if login == bot_author:
+            reviewer_seen = True
+            deferred = False
             continue
-        body = (comment.get("body") or "").strip()
-        if len(body) >= ADDRESSED_BY_REPLY_MIN_CHARS:
-            return True
-    return False
+        if not reviewer_seen or not login or author.get("__typename") == "Bot" or login.endswith("[bot]"):
+            continue
+        if comment.get("authorAssociation") not in {"OWNER", "COLLABORATOR"}:
+            continue
+        body = comment.get("body") or ""
+        deferred = bool(body.splitlines() and body.splitlines()[0] == ADDRESSED_BY_REPLY_MARKER)
+    return deferred
 
 
 def filter_threads(
@@ -757,6 +760,7 @@ def thread_severity(thread: dict[str, Any]) -> str:
     see ``annotate_reviewer_severity``) wins. Otherwise Gemini's priority image
     or Codex's P0-P3 badge in a comment body decides; both are unambiguous, so
     both are read regardless of selected reviewer.
+    CodeRabbit's Potential issue header maps Critical/Major/Minor to severity.
     """
     annotated = thread.get("reviewerSeverity")
     if isinstance(annotated, str) and annotated in SEVERITY_ORDER and annotated != "unknown":
@@ -769,6 +773,11 @@ def thread_severity(thread: dict[str, Any]) -> str:
         codex_match = CODEX_PRIORITY_RE.search(body)
         if codex_match:
             return CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+        author = (comment.get("author") or {}).get("login", "").removesuffix("[bot]")
+        if author.lower() == "coderabbitai":
+            match = re.search(r"^\s*_(?:⚠️?\s*)?Potential issue_\s*\|\s*_(?:[🔴🟠🟡]\s*)?(Critical|Major|Minor)_\s*$", body, re.IGNORECASE | re.MULTILINE)
+            if match:
+                return {"critical": "critical", "major": "high", "minor": "low"}[match.group(1).lower()]
     return "unknown"
 
 
@@ -3487,8 +3496,8 @@ def main() -> int:
         "--resolve-outdated",
         dest="resolve_outdated",
         action="store_true",
-        default=True,
-        help="Resolve unresolved outdated reviewer threads before printing current feedback. Enabled by default.",
+        default=False,
+        help="Opt in to resolving outdated reviewer threads; outdated does not mean fixed.",
     )
     parser.add_argument(
         "--no-resolve-outdated",
@@ -3566,10 +3575,10 @@ def main() -> int:
         "--resolve-addressed-by-reply",
         dest="resolve_addressed_by_reply",
         action="store_true",
-        default=True,
+        default=False,
         help=(
-            "Resolve unresolved threads where a non-bot maintainer posted a substantive reply "
-            "(>=%d chars). Enabled by default." % ADDRESSED_BY_REPLY_MIN_CHARS
+            "Opt in to resolving threads explicitly deferred with /review-loop defer "
+            "by a repository owner or collaborator. Disabled by default."
         ),
     )
     parser.add_argument(

@@ -115,7 +115,7 @@ class TestStateDirRename:
         (cfg / "gh-review-loop").mkdir()
         assert loop_state.state_dir() == cfg / "gh-review-loop"
 
-    def test_migration_renames_and_leaves_symlink(self, tmp_path, monkeypatch):
+    def test_migration_renames_and_leaves_symlink(self, tmp_path, monkeypatch, symlinks_available):
         cfg = self._home(monkeypatch, tmp_path)
         legacy = cfg / "gh-gemini-review-loop"
         legacy.mkdir(parents=True)
@@ -130,7 +130,7 @@ class TestStateDirRename:
         assert (legacy / "state.json").read_text() == "{}"
         assert loop_state.state_dir() == new
 
-    def test_migration_is_idempotent(self, tmp_path, monkeypatch):
+    def test_migration_is_idempotent(self, tmp_path, monkeypatch, symlinks_available):
         cfg = self._home(monkeypatch, tmp_path)
         (cfg / "gh-gemini-review-loop").mkdir(parents=True)
         assert loop_state.migrate_legacy_state_dir() is True
@@ -458,6 +458,7 @@ def _run_guard(command: str, env: dict) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Claude hooks require a POSIX shell")
 class TestHooksJsonGuard:
     @pytest.mark.parametrize(("event", "command"), _hook_commands())
     def test_no_sentinel_skips_python(self, guard_env, event, command):

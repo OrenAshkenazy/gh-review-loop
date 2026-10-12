@@ -82,7 +82,15 @@ COPILOT = ReviewVendor(
     request_login="copilot-pull-request-reviewer[bot]",
 )
 
-KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX, COPILOT)}
+CODERABBIT = ReviewVendor(
+    login="coderabbitai",
+    display_name="CodeRabbit",
+    mention="@coderabbitai",
+    rereview_phrase="@coderabbitai review",
+    auto_reviews=True,
+)
+
+KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX, COPILOT, CODERABBIT)}
 
 # The loop has no default reviewer: with nothing configured it asks rather than
 # assumes. This is the reviewer it may *offer*. It is a ping-first vendor so

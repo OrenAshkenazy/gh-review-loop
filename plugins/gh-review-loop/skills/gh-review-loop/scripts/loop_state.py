@@ -45,7 +45,8 @@ LEGACY_STATE_DIR_NAME = "gh-gemini-review-loop"
 
 
 def _config_root() -> Path:
-    return Path(os.path.expanduser("~/.config"))
+    home = os.environ.get("HOME")
+    return (Path(home) if home else Path.home()) / ".config"
 
 
 def state_dir() -> Path:

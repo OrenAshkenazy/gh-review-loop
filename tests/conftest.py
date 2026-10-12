@@ -46,6 +46,19 @@ def _isolate_user_state(tmp_path_factory, monkeypatch):
     themselves and override this.
     """
     monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path_factory.mktemp("ggrl-state")))
+    isolated_home = str(tmp_path_factory.mktemp("ggrl-home"))
+    monkeypatch.setenv("HOME", isolated_home)
+    monkeypatch.setenv("USERPROFILE", isolated_home)
+
+
+@pytest.fixture
+def symlinks_available(tmp_path):
+    target = tmp_path / "symlink-target"
+    target.mkdir()
+    try:
+        (tmp_path / "symlink-probe").symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("filesystem or account does not allow creating symlinks")
 
 
 def stub_cap_check_known_under_cap(monkeypatch):

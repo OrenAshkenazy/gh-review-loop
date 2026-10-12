@@ -49,5 +49,5 @@ class TestPythonScriptCommand:
     def test_uses_installed_script_path(self):
         command = python_script_command("fetch_gemini_threads.py")
         assert command.startswith('python3 "')
-        assert command.endswith('/fetch_gemini_threads.py"')
+        assert command.replace("\\", "/").endswith('/fetch_gemini_threads.py"')
         assert "CLAUDE_PLUGIN_ROOT" not in command

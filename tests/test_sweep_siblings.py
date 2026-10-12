@@ -1432,7 +1432,7 @@ class TestPathContainment:
             changed_files=changed, root=repo,
         )
 
-    def test_a_symlink_out_of_the_repository_is_not_read(self, repo_and_outside):
+    def test_a_symlink_out_of_the_repository_is_not_read(self, repo_and_outside, symlinks_available):
         """Git records the link in the diff, mode 120000 -- not the bytes it
         points at. Following it scans a file outside the PR entirely."""
         repo, outside = repo_and_outside
@@ -1440,7 +1440,7 @@ class TestPathContainment:
 
         assert self._sweep(repo, ["real.py", "escape.py"]).candidates == []
 
-    def test_a_symlink_inside_the_repository_is_also_refused(self, repo_and_outside):
+    def test_a_symlink_inside_the_repository_is_also_refused(self, repo_and_outside, symlinks_available):
         """Still nothing reviewable in it: the diff carries the link, so the
         target's text belongs to whichever real path already holds it."""
         repo, _outside = repo_and_outside
@@ -1465,7 +1465,7 @@ class TestPathContainment:
 
         assert result.candidates == []
 
-    def test_a_symlinked_intermediate_directory_is_refused(self, repo_and_outside):
+    def test_a_symlinked_intermediate_directory_is_refused(self, repo_and_outside, symlinks_available):
         """The final component is a real file; it is a parent that escapes."""
         repo, outside = repo_and_outside
         (repo / "sub").mkdir()
