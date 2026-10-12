@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import sys
+
 from run_profile import run_profile
+
+
+def test_inherited_legacy_encoding_does_not_fail_unicode_check(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    prof = _profile([{"name": "unicode", "command": [sys.executable, "-c", "print(chr(0x2713))"], "required": True}])
+    result = run_profile(prof, tmp_path)
+    assert result.verification == "passed"
+    assert result.checks[0].returncode == 0
 
 
 def _profile(checks, working_directory=".", timeout_seconds=300):

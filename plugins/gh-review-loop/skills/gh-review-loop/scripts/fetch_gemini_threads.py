@@ -298,6 +298,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
           originalStartLine
           diffSide
           comments(first:50) {
+            pageInfo { hasNextPage }
             nodes {
               id
               author { login __typename }
@@ -654,9 +655,12 @@ def is_addressed_by_reply(thread: dict[str, Any], bot_author: str) -> bool:
     """An explicit deferral by a repository owner or collaborator after review."""
     if thread.get("isResolved") or thread.get("isOutdated"):
         return False
+    comments = thread.get("comments") or {}
+    if (comments.get("pageInfo") or {}).get("hasNextPage"):
+        return False
     reviewer_seen = False
     deferred = False
-    for comment in (thread.get("comments") or {}).get("nodes") or []:
+    for comment in comments.get("nodes") or []:
         author = comment.get("author") or {}
         login = author.get("login") or ""
         if login == bot_author:

@@ -40,6 +40,23 @@ def test_later_maintainer_objection_reopens_the_finding():
     assert not fgt.is_addressed_by_reply(thread(BOT, reply("/review-loop defer"), reply("This is still broken; please fix it.")), "coderabbitai")
 
 
+def test_incomplete_comments_do_not_defer_or_hide_the_thread(monkeypatch):
+    finding = thread(BOT, reply("/review-loop defer"))
+    finding["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "more-replies"}
+    pr = {"reviewThreads": {"nodes": [finding]}}
+
+    def graphql_response(args):
+        query = next(arg for arg in args if arg.startswith("query="))
+        assert "pageInfo { hasNextPage }" in query.split("comments(first:50) {", 1)[1]
+        return {"data": {"repository": {"pullRequest": pr}}}
+
+    monkeypatch.setattr(fgt, "run_gh", graphql_response)
+    pr = fgt.fetch_threads(fgt.PullRequest("owner", "repo", 1))
+    assert not fgt.is_addressed_by_reply(finding, "coderabbitai")
+    assert len(fgt.filter_threads(pr, "coderabbitai", False, False)) == 1
+    assert fgt.addressed_by_reply_threads(pr, "coderabbitai") == []
+
+
 @pytest.mark.parametrize("label,expected", [("Critical", "critical"), ("Major", "high"), ("Minor", "low")])
 def test_coderabbit_header_maps_severity(label, expected):
     comment = {"author": {"login": "coderabbitai[bot]"}, "body": f"_⚠️ Potential issue_ | _🟠 {label}_\n\nPlease fix this."}

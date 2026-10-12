@@ -145,7 +145,7 @@ def _run_one(check: Any, cwd: Path, timeout: int) -> CheckResult:
     if isinstance(command, list):
         command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
     env = os.environ.copy()
-    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
         proc = subprocess.run(  # noqa: S603 - command is user-confirmed, no shell
             argv,
