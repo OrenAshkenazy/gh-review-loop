@@ -142,7 +142,7 @@ def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozen
         raise PublishError("staged bytes differ from verified changes; staged changes preserved, no commit")
 
 
-def loop_gate(repo: str, pr: int) -> None:
+def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None) -> None:
     state = rr.load_state()
     entry = state.get(rr.state_key_for(state, repo, pr))
     tracking = entry.get("run") if isinstance(entry, dict) else None
@@ -162,7 +162,7 @@ def loop_gate(repo: str, pr: int) -> None:
         used = rr.count_agent_pings(repo, pr, trigger, login) if trigger and login else None
     if used is None:
         raise PublishError("re-review cap cannot be established; publishing blocked")
-    if used >= rr.effective_cap(None):
+    if used >= rr.effective_cap(max_rereview_requests):
         raise PublishError("re-review cap reached; publishing blocked")
 
 
@@ -188,14 +188,14 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
     return branch, sha
 
 
-def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False) -> dict:
+def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None) -> dict:
     root = root.resolve()
     if not message.strip() or remote.startswith("-") or not remote:
         raise PublishError("provide a commit message and a named Git remote")
     if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
         raise PublishError("repo-root must be the checkout root")
     branch, head = checkout_gate(root, repo, pr, remote)
-    loop_gate(repo, pr)
+    loop_gate(repo, pr, max_rereview_requests)
     before = snapshot(root, paths)
     blobs = verified_blobs(root, paths)
     if snapshot(root, paths) != before:
@@ -207,7 +207,7 @@ def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remo
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during verification; verify again")
     checkout_gate(root, repo, pr, remote, expected_head=head)
-    loop_gate(repo, pr)
+    loop_gate(repo, pr, max_rereview_requests)
     if snapshot(root, paths) != before:
         raise PublishError("files changed before staging; verify again")
     payload = {"status": "verified", "published": False, "dry_run": dry_run, "head": head, "verification": result.to_details()}
@@ -226,7 +226,7 @@ def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remo
     urls = git(root, "remote", "get-url", "--push", "--all", remote).splitlines()
     if len(urls) != 1 or remote_identity(urls[0]) != remote_identity((info.get("head", {}).get("repo") or {}).get("html_url", "")):
         raise PublishError("push remote changed; local commit preserved, no push")
-    loop_gate(repo, pr)
+    loop_gate(repo, pr, max_rereview_requests)
     git(root, "push", remote, f"HEAD:refs/heads/{branch}")
     tip = git(root, "ls-remote", "--refs", remote, f"refs/heads/{branch}").strip().split()
     if len(tip) != 2 or tip[0] != commit:
@@ -244,9 +244,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--message", required=True)
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max-rereview-requests", type=int, default=None)
     args = parser.parse_args(argv)
     try:
-        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run)
+        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run, args.max_rereview_requests)
     except (PublishError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"status": "blocked", "published": False, "error": str(exc)}))
         return 1

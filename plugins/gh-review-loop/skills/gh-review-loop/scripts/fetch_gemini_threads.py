@@ -97,11 +97,16 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
-    r"\[(?P<title>[^\]\n]*)\]\(#discussion_r(?P<id>\d+)\)",
+    r"\[(?P<title>[^\]\n]*)\]\((?:https?://[^\s()]+)?#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
+)
+COPILOT_BODY_FINDING_RE = re.compile(
+    r'<details[^>]*>\s*<summary>\s*<picture>.*?'
+    r'</picture>\s*(?P<title>[^<]+)</summary>(?P<body>.*?)</details>',
+    re.IGNORECASE | re.DOTALL,
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
 # "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
@@ -1098,16 +1103,23 @@ def review_body_findings(
     """Surface priority-badged findings that live in the review body.
 
     Codex usually publishes inline review comments, but it can put a finding
-    directly in the review body, where no thread exists to fetch. Only the
-    newest review counts: a later re-review supersedes older body findings, so
-    these synthetic entries go stale the same way threads do.
+    directly in the review body, where no thread exists to fetch. Copilot can
+    also embed findings in its overview. Its current-head review takes
+    precedence; otherwise the newest review supersedes older body findings.
     """
     reviews = filter_reviews(pull_request, author)
     if not reviews:
         return []
-    latest = max(reviews, key=lambda review: review.get("submittedAt") or "")
+    latest = (
+        _latest_overview_review(pull_request, author)
+        if review_vendors.vendor_for(author) is review_vendors.COPILOT
+        else max(reviews, key=lambda review: review.get("submittedAt") or "")
+    )
+    if latest is None:
+        return []
     body = latest.get("body") or ""
-    badges = list(CODEX_PRIORITY_RE.finditer(body))
+    copilot = COPILOT_OVERVIEW_MARKER in body
+    badges = list((COPILOT_BODY_FINDING_RE if copilot else CODEX_PRIORITY_RE).finditer(body))
     if not badges:
         return []
 
@@ -1121,6 +1133,16 @@ def review_body_findings(
         anchor = anchors[-1] if anchors else None
         path = anchor.group(1) if anchor else "(review body)"
         line = int(anchor.group(2)) if anchor else None
+        finding_body = body[badge.start():end].strip()
+        severity = None
+        if copilot:
+            severity = COPILOT_SEVERITY_ICON_RE.search(badge.group())
+            if not severity:
+                continue
+            finding_body = badge.group("title").strip() + "\n\n" + badge.group("body").strip()
+            location = re.search(r"`([^`\n]+):(\d+)`", badge.group("body"))
+            path = location.group(1).replace("\u200b", "") if location else "(review body)"
+            line = int(location.group(2)) if location else None
         findings.append({
             "id": f"review-body:{review_id}:{index + 1}",
             "isResolved": False,
@@ -1134,7 +1156,7 @@ def review_body_findings(
             "comments": [{
                 "id": f"{review_id}:{index + 1}",
                 "author": {"login": author},
-                "body": body[badge.start():end].strip(),
+                "body": finding_body,
                 "createdAt": latest.get("submittedAt"),
                 "updatedAt": latest.get("submittedAt"),
                 "url": latest.get("url"),
@@ -1146,6 +1168,8 @@ def review_body_findings(
                 "diffHunk": "",
             }],
         })
+        if severity:
+            findings[-1]["reviewerSeverity"] = severity.group(1).lower()
     return findings
 
 
@@ -1264,8 +1288,8 @@ def copilot_overview_severities(
         if parsed["unlinked_findings"]:
             warnings.append(
                 f"{parsed['unlinked_findings']} finding(s) in the {author} review "
-                f"overview at {review.get('url')} have no inline thread and are not "
-                "listed below."
+                f"overview at {review.get('url')} have no linked inline thread; "
+                "check the review-body findings and overview."
             )
     return severities, warnings
 
@@ -1309,6 +1333,20 @@ def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head
     }
 
 
+def _latest_overview_review(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    head = pull_request.get("headRefOid") or ""
+    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
+    for review in newest_first:
+        if head and (review.get("commit") or {}).get("oid") == head:
+            return review
+    for review in newest_first:
+        if parse_copilot_overview(review.get("body")) is not None:
+            return review
+    return None
+
+
 def latest_reviewer_overview(
     pull_request: dict[str, Any], author: str
 ) -> dict[str, Any] | None:
@@ -1322,15 +1360,8 @@ def latest_reviewer_overview(
     readable overview is reported with ``covers_head: false``.
     """
     head = pull_request.get("headRefOid") or ""
-    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
-    for review in newest_first:
-        if head and (review.get("commit") or {}).get("oid") == head:
-            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
-    for review in newest_first:
-        parsed = parse_copilot_overview(review.get("body"))
-        if parsed is not None:
-            return _overview_record(review, parsed, head)
-    return None
+    review = _latest_overview_review(pull_request, author)
+    return _overview_record(review, parse_copilot_overview(review.get("body")), head) if review else None
 
 
 def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
@@ -1371,6 +1402,8 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
+    if overview.get("unlinked_findings"):
+        return "overview_reports_open_findings"
     open_findings = overview.get("open_findings") or 0
     if open_findings > 0:
         if known_thread_ids is None or overview.get("unlinked_findings"):

@@ -113,4 +113,4 @@ After fixes and `--cycle-summary`, invoke the script using its installed absolut
 python "<plugin-root>/skills/gh-review-loop/scripts/publish_changes.py" --repo owner/repo --pr 42 --repo-root "<checkout-root>" --paths src/fix.py tests/test_fix.py --message "Fix reviewer findings"
 ```
 
-POSIX also supports `python3`. Paths are individual files relative to the checkout, using forward slashes; the index must be empty. `--dry-run` verifies without Git writes. Pass the output's `head` to `request_rereview.py --expect-head <sha>`, then wait for `created_at`. Failure handling and limits: `write-safety.md`.
+POSIX supports `python3`. Use individual checkout-relative file paths with forward slashes and an empty index. `--dry-run` verifies without Git writes. Forward any `--max-rereview-requests N` override to both helpers. Pass the output's `head` to `request_rereview.py --expect-head <sha>`, then wait for `created_at`. See `write-safety.md`.

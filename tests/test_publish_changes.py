@@ -170,6 +170,31 @@ def test_unknown_or_exhausted_cap_blocks(checkout, monkeypatch, count):
     assert_not_pushed(checkout)
 
 
+@pytest.mark.parametrize("count, cap, blocked", [(1, 1, True), (3, 4, False)])
+def test_cli_cap_override_applies_to_every_publication_gate(checkout, monkeypatch, capsys, count, cap, blocked):
+    seen_caps = []
+
+    def effective_cap(override):
+        seen_caps.append(override)
+        return override if override is not None else 3
+
+    monkeypatch.setattr(rr, "effective_cap", effective_cap)
+    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: count)
+    status = pc.main(["--repo", "owner/repo", "--pr", "1", "--repo-root", str(checkout[0]), "--paths", "fix.txt", "--message", "fix review", "--max-rereview-requests", str(cap)])
+    result = json.loads(capsys.readouterr().out)
+    if blocked:
+        assert status == 1
+        assert result["published"] is False
+        assert "cap reached" in result["error"]
+        assert seen_caps == [cap]
+        assert_not_pushed(checkout)
+    else:
+        assert status == 0
+        assert result["published"] is True
+        assert seen_caps == [cap, cap, cap]
+        assert pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() == result["head"]
+
+
 @pytest.mark.parametrize("count", [0, 2, 3, None])
 def test_copilot_publication_uses_native_request_cap(checkout, monkeypatch, count):
     vendor = rr.review_vendors.COPILOT

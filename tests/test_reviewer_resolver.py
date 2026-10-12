@@ -151,7 +151,7 @@ def test_phrase_for_returns_the_exact_vendor_phrase():
     )
 
 
-def test_phrase_for_unknown_reviewer_is_none():
+def test_phrase_for_coderabbit_is_its_review_command():
     assert reviewer_resolver.phrase_for("coderabbitai") == "@coderabbitai review"
 
 
