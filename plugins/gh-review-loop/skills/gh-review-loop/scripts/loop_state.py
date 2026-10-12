@@ -27,9 +27,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any
+
+import loop_lock
 
 SENTINEL_TTL_SECONDS = 24 * 60 * 60
 
@@ -124,25 +128,50 @@ def sticky_state_path() -> Path:
     return state_dir() / "state.json"
 
 
-def load_sticky_state() -> dict[str, Any]:
+def load_sticky_state(*, strict: bool = False) -> dict[str, Any]:
     path = sticky_state_path()
-    if not path.exists():
-        return {}
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        if strict:
+            raise RuntimeError(f"cannot update unreadable review-loop state: {path}") from exc
         return {}
     # state.json must be a JSON object. A valid-but-non-dict payload (a list or
     # scalar from corruption or hand-editing) would crash callers that do
     # .values()/.items() on the result. Guard centrally here so every caller —
     # any_active_run, find_active_run, and the rest — is safe.
+    if not isinstance(data, dict) and strict:
+        raise RuntimeError(f"cannot update non-object review-loop state: {path}")
     return data if isinstance(data, dict) else {}
 
 
+def state_transaction(function):
+    """Serialize the complete local read/modify/write operation, never network I/O."""
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with loop_lock.file_lock(sticky_state_path().with_suffix(".json.lock")):
+            load_sticky_state(strict=True)
+            return function(*args, **kwargs)
+    return locked
+
+
+@state_transaction
 def save_sticky_state(state: dict[str, Any]) -> None:
     path = sticky_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(state, indent=2, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def safe_int(value: Any) -> int:

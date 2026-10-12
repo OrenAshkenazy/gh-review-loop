@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Concurrent local runs cannot race publication and re-review.** A per-PR lock covers verification, push, and the publisher's automatic review request; standalone requests share it. State mutations serialize and replace the file atomically, preserve other PRs, and refuse corrupt existing state. Failed requests after push retain the confirmed publication result.
+
 - **Copilot re-requests work for PR authors through GraphQL `rerequestReviews`.** The loop reads PR and bot IDs from GitHub and preserves its head, pending-review, cap, and uncertain-result guards. Copilot findings embedded in review summaries are actionable, and publication honors per-run cap overrides and rejects non-regular files before reading them.
 
 - **The scratch directory is no longer a predictable path in `/tmp`.** The

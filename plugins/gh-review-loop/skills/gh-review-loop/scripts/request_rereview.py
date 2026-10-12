@@ -23,6 +23,7 @@ import judge
 import review_vendors
 import reviewer_resolver
 
+import loop_lock
 import loop_state  # noqa: E402 — sibling module, stdlib-only
 
 
@@ -287,7 +288,7 @@ def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
 REQUEST_MATCH_WINDOW_SECONDS = 180
 
 
-def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) -> list[str]:
+def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) -> list[str] | None:
     """When this loop posted a review request for ``vendor`` on this PR.
 
     The cap bounds what the loop posts, not what the member clicks. Both act
@@ -298,7 +299,7 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
     """
     state = load_state()
     entry = state.get(state_key_for(state, repo, pr))
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
         # No record for this PR, or a POST whose record could not be written:
         # the history is unknown, not empty. An empty list would be taken as
         # authoritative and report zero requests used, which would let every
@@ -313,18 +314,47 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
             continue
         if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
             continue
+        if item.get("initial_review") is True:
+            continue
         at = item.get("at")
         if isinstance(at, str) and at:
             out.append(at)
     return sorted(out)
 
 
+@loop_state.state_transaction
+def _mark_request_in_flight(repo: str, pr: int, pending: dict[str, Any] | None) -> None:
+    state = load_state()
+    key = state_key_for(state, repo, pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    if pending is None:
+        entry.pop("review_request_in_flight", None)
+    else:
+        if entry.get("review_request_in_flight"):
+            raise RuntimeError("reconcile the previous review request before requesting again")
+        entry["review_request_in_flight"] = pending
+    state[key] = entry
+    loop_state.save_sticky_state(state)
+
+
+def _record_posted_payload(args: argparse.Namespace, payload: dict[str, Any], reviewer: str | None = None, *, initial_review: bool = False) -> None:
+    try:
+        record_rereview_posted(args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"), comment_id=payload.get("comment_id"), initial_review=initial_review)
+    except (RuntimeError, OSError) as exc:
+        payload.update(status="state_record_failed", posted=True, recording_error=str(exc),
+                       message="Review was posted, but local recording failed. Reconcile its in-flight marker before requesting again.")
+
+
+@loop_state.state_transaction
 def record_rereview_posted(
     repo: str,
     pr: int,
     *,
     reviewer: str | None = None,
     requested_at: str | None = None,
+    comment_id: int | None = None,
+    initial_review: bool = False,
 ) -> None:
     """Stamp the cycle transition this re-review request completes.
 
@@ -336,10 +366,9 @@ def record_rereview_posted(
     reflects history that outlives ``clear_run_tracking()``. This write is the
     event itself — local, script-owned, exactly once per posted request.
 
-    Fails open: a state write failure must never block the re-review that was
-    already posted. The ordinal simply holds instead of drifting.
+    A state failure raises to the caller, which preserves the known POST
+    result. An existing in-flight marker remains until reconciliation.
     """
-    path = state_path()
     state = load_state()
     key = state_key_for(state, repo, pr)
     entry = state.get(key)
@@ -355,12 +384,17 @@ def record_rereview_posted(
         # cap must outlive a single loop run on the PR.
         requests = entry.get("review_requests")
         requests = list(requests) if isinstance(requests, list) else []
-        requests.append({"reviewer": reviewer, "at": requested_at or utc_now_iso()})
+        receipt = {"reviewer": reviewer, "at": requested_at or utc_now_iso()}
+        if type(comment_id) is int:
+            receipt["comment_id"] = comment_id
+        if initial_review:
+            receipt["initial_review"] = True
+        requests.append(receipt)
         entry["review_requests"] = requests
     state[key] = entry
+    entry.pop("review_request_in_flight", None)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        loop_state.save_sticky_state(state)
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
         # The request was posted but is now unrecorded, so the local history is
@@ -376,9 +410,10 @@ def record_rereview_posted(
                 existing = dict(existing) if isinstance(existing, dict) else {}
                 existing["review_requests_incomplete"] = True
                 marked[key_now] = existing
-                path.write_text(json.dumps(marked, indent=2, sort_keys=True), encoding="utf-8")
+                loop_state.save_sticky_state(marked)
             except OSError:
                 pass
+        raise
 
 
 def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
@@ -562,12 +597,33 @@ def count_agent_pings(
         return None
     pattern = _trigger_re(trigger)
     count = 0
+    observed_ids = set()
     for comment in comments:
         if not isinstance(comment, dict):
             continue
         if (comment.get("user") or {}).get("login") != agent_login:
             continue
         if pattern.search(comment.get("body") or ""):
+            count += 1
+            if type(comment.get("id")) is int:
+                observed_ids.add(comment["id"])
+    vendor = review_vendors.vendor_for(trigger)
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    if not isinstance(entry, dict):
+        return count
+    if entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        return None
+    for receipt in entry.get("review_requests") or []:
+        if not isinstance(receipt, dict):
+            continue
+        reviewer = receipt.get("reviewer") or ""
+        if not isinstance(reviewer, str):
+            continue
+        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
+        if matches and receipt.get("comment_id") not in observed_ids:
+            # Add local successful posts missing from this GitHub snapshot.
+            # Missing IDs cannot establish overlap; conservatively count them.
             count += 1
     return count
 
@@ -979,12 +1035,15 @@ def post_rereview(
     if not isinstance(created_at, str) or not created_at:
         raise RuntimeError("gh api response missing created_at")
 
-    return {
+    payload = {
         "created_at": created_at,
         "repo": repo,
         "pr": pr,
         "phrase": phrase,
     }
+    if type(response.get("id")) is int:
+        payload["comment_id"] = response["id"]
+    return payload
 
 
 def request_review(
@@ -1143,10 +1202,9 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
         print(f"[loop] {payload['message']}")
 
 
-def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
+def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> dict[str, Any]:
     """The review_request path (spec §3): resolve state, dedupe, cap, POST, stamp."""
     reviewer = vendor.request_login
-    json_output = args.json_output
     if args.phrase is not None or args.reviewer_mention:
         print(
             f"warning: {vendor.display_name} is re-reviewed through a review "
@@ -1155,17 +1213,13 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
         )
     state = request_state(args.repo, args.pr, vendor)
     if state is None:
-        _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
-        return 0
+        return state_unreadable_payload(args.repo, args.pr, reviewer)
     if args.expect_head and args.expect_head != state["head"]:
-        _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
-        return 0
+        return head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"])
     if state["state"] == "COMPLETED_HEAD":
-        _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
-        return 0
+        return already_reviewed_payload(args.repo, args.pr, reviewer, state["head"])
     if state["state"] == "PENDING":
-        _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
-        return 0
+        return review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"])
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
     # needs. With no completed vendor review there is nothing to count: zero
     # would mean "no first review", not "no re-reviews", and a cap of 0 or an
@@ -1176,23 +1230,21 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
             args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]
         )
         if used is None:
-            _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
-            return 0
+            return uncountable_count_payload(args.repo, args.pr, cap)
         if used >= cap:
-            _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
-            return 0
+            return capped_payload(args.repo, args.pr, used, cap)
     # The open request is withdrawn only once the cap has cleared, so a refusal
     # never leaves the PR with nothing pending. A dry run withdraws nothing.
     if state["state"] == "STALE_PENDING" and not args.dry_run:
         if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head):
-            _emit(
-                stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"]),
-                json_output=json_output,
-            )
-            return 0
+            return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
+    if not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso()})
     try:
         payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"))
     except ReviewRequestRejected as exc:
+        if exc.reason != "uncertain" and not args.dry_run:
+            _mark_request_in_flight(args.repo, args.pr, None)
         if exc.reason == "uncertain" and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at
         ):
@@ -1206,29 +1258,16 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
                 "confirmed_after_uncertain": True,
             }
         else:
-            _emit(rejected_payload(args.repo, args.pr, reviewer, exc), json_output=json_output)
-            return 0
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+            return rejected_payload(args.repo, args.pr, reviewer, exc)
     payload["state"] = state["state"]
     payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
     if payload.get("dry_run"):
         payload["would_post"] = True
-    else:
-        record_rereview_posted(
-            args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at")
-        )
-    if json_output:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    elif payload.get("dry_run"):
-        print(
-            f"[loop] dry run — would request a review from {reviewer} on "
-            f"{args.repo}#{args.pr} (state {state['state']})"
-        )
-    else:
-        print(f"[loop] {vendor.display_name} review requested at {payload['created_at']}")
-    return 0
+    elif payload.get("posted") is not False:
+        _record_posted_payload(args, payload, reviewer, initial_review=not state["first_completed_review_at"])
+    elif not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, None)
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1299,30 +1338,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 2
-        return code
-
-    try:
-        parse_repo(args.repo)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
+def _request(args: argparse.Namespace) -> dict[str, Any]:
     if args.no_safe_trigger:
         reviewer_login = args.reviewer_login or (
             args.reviewer_mention.lstrip("@") if args.reviewer_mention else "unknown reviewer"
         )
         payload = no_safe_trigger_payload(reviewer_login)
-        if args.json_output:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            print(f"[loop] {payload['message']}")
-        return 0
+        return payload
 
     # Review-request vendors (Copilot) never get a comment; resolve the vendor
     # from the login before the comment path's no-safe-trigger logic runs.
@@ -1334,105 +1356,128 @@ def main(argv: list[str] | None = None) -> int:
     )
     vendor = review_vendors.vendor_for(reviewer_login)
     if vendor is not None and vendor.trigger_kind == "review_request":
-        return run_review_request(args, vendor)
+        return _review_request(args, vendor)
 
     # The comment path honors --expect-head too: the ping is what buys the
     # review, so it must not be posted against a head GitHub has not seen yet.
     if args.expect_head:
         head = current_head(args.repo, args.pr)
         if head is None:
-            _emit(state_unreadable_payload(args.repo, args.pr, reviewer_login or "the reviewer"),
-                  json_output=args.json_output)
-            return 0
+            return state_unreadable_payload(args.repo, args.pr, reviewer_login or "the reviewer")
         if head != args.expect_head:
-            _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, head),
-                  json_output=args.json_output)
-            return 0
+            return head_mismatch_payload(args.repo, args.pr, args.expect_head, head)
 
+    trigger = None
+    if args.phrase is not None:
+        phrase = args.phrase
+        trigger = args.reviewer_mention
+    else:
+        trigger, reviewer_login = resolve_review_trigger(
+            repo=args.repo,
+            pr=args.pr,
+            reviewer_login=args.reviewer_login,
+            reviewer_mention=args.reviewer_mention,
+        )
+        if trigger is None:
+            payload = no_safe_trigger_payload(reviewer_login)
+            return payload
+        # Known vendors accept an exact phrase (Codex matches "@codex
+        # review" literally); everything else gets the generic sentence.
+        phrase = (
+            reviewer_resolver.phrase_for(reviewer_login)
+            or reviewer_resolver.phrase_for(trigger)
+            or build_default_phrase(trigger)
+        )
+    # The cap is the loop's only guarantee that it cannot spam a PR, so it
+    # is enforced here at the write itself rather than trusted to a caller.
+    if not args.no_cap_check:
+        cap = effective_cap(args.max_rereview_requests)
+        # Count by mention, never by the full sentence: a ping worded
+        # differently in an earlier cycle is still a ping.
+        countable = trigger or mention_in(phrase)
+        if countable is None:
+            # No mention to count by. Refuse rather than post uncounted:
+            # an uncountable write is an uncapped write.
+            payload = {
+                "status": "uncountable_trigger",
+                "posted": False,
+                "repo": args.repo,
+                "pr": args.pr,
+                "message": (
+                    "Cannot count prior re-review requests: --phrase contains "
+                    "no @mention to match on. Pass --reviewer-mention so the "
+                    "cap can be enforced, or --no-cap-check to bypass it."
+                ),
+            }
+            return payload
+        used = count_agent_pings(args.repo, args.pr, countable, gh_login())
+        if used is None:
+            # The count could not be established (gh login unresolved, the
+            # comments query failed, or its output was unparseable). Posting
+            # anyway would make the cap advisory exactly when it matters, so
+            # refuse for the same reason as an uncountable trigger.
+            payload = uncountable_count_payload(args.repo, args.pr, cap)
+            return payload
+        if used >= cap:
+            payload = capped_payload(args.repo, args.pr, used, cap)
+            return payload
+    if not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer_login, "at": utc_now_iso()})
+    payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
+    # A dry run posts nothing, so it closes no cycle.
+    if payload.get("posted") is not False and not payload.get("dry_run"):
+        _record_posted_payload(args, payload, trigger or mention_in(phrase) or reviewer_login)
+    elif not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, None)
+    return payload
+
+
+def request_rereview(repo: str, pr: int, expect_head: str, max_rereview_requests: int | None = None) -> dict[str, Any]:
+    """Structured API for publishing callers; shares the standalone PR lock."""
+    argv = ["--repo", repo, "--pr", str(pr), "--expect-head", expect_head]
+    if max_rereview_requests is not None:
+        argv.extend(["--max-rereview-requests", str(max_rereview_requests)])
+    return _locked_request(build_parser().parse_args(argv))
+
+
+def _locked_request(args: argparse.Namespace) -> dict[str, Any]:
+    parse_repo(args.repo)
     try:
-        trigger = None
-        if args.phrase is not None:
-            phrase = args.phrase
-            trigger = args.reviewer_mention
-        else:
-            trigger, reviewer_login = resolve_review_trigger(
-                repo=args.repo,
-                pr=args.pr,
-                reviewer_login=args.reviewer_login,
-                reviewer_mention=args.reviewer_mention,
-            )
-            if trigger is None:
-                payload = no_safe_trigger_payload(reviewer_login)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            # Known vendors accept an exact phrase (Codex matches "@codex
-            # review" literally); everything else gets the generic sentence.
-            phrase = (
-                reviewer_resolver.phrase_for(reviewer_login)
-                or reviewer_resolver.phrase_for(trigger)
-                or build_default_phrase(trigger)
-            )
-        # The cap is the loop's only guarantee that it cannot spam a PR, so it
-        # is enforced here at the write itself rather than trusted to a caller.
-        if not args.no_cap_check:
-            cap = effective_cap(args.max_rereview_requests)
-            # Count by mention, never by the full sentence: a ping worded
-            # differently in an earlier cycle is still a ping.
-            countable = trigger or mention_in(phrase)
-            if countable is None:
-                # No mention to count by. Refuse rather than post uncounted:
-                # an uncountable write is an uncapped write.
-                payload = {
-                    "status": "uncountable_trigger",
-                    "posted": False,
-                    "repo": args.repo,
-                    "pr": args.pr,
-                    "message": (
-                        "Cannot count prior re-review requests: --phrase contains "
-                        "no @mention to match on. Pass --reviewer-mention so the "
-                        "cap can be enforced, or --no-cap-check to bypass it."
-                    ),
-                }
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            used = count_agent_pings(args.repo, args.pr, countable, gh_login())
-            if used is None:
-                # The count could not be established (gh login unresolved, the
-                # comments query failed, or its output was unparseable). Posting
-                # anyway would make the cap advisory exactly when it matters, so
-                # refuse for the same reason as an uncountable trigger.
-                payload = uncountable_count_payload(args.repo, args.pr, cap)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            if used >= cap:
-                payload = capped_payload(args.repo, args.pr, used, cap)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
-        # A dry run posts nothing, so it closes no cycle.
-        if payload.get("posted") is not False and not payload.get("dry_run"):
-            record_rereview_posted(args.repo, args.pr)
+        with loop_lock.pr_lock(args.repo, args.pr):
+            state = loop_state.load_sticky_state(strict=True)
+            entry = state.get(state_key_for(state, args.repo, args.pr))
+            if isinstance(entry, dict) and entry.get("review_request_in_flight"):
+                return {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr,
+                        "message": "A previous review request is not fully recorded. Reconcile its in-flight marker before requesting again."}
+            return _request(args)
+    except loop_lock.LockBusy:
+        return {"status": "busy", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Another local publish/re-review owns this PR; retry after it finishes."}
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+    try:
+        payload = _locked_request(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
     if args.json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
+    elif "message" in payload:
+        _emit(payload, json_output=False)
+    elif payload.get("kind") == "review_request":
+        if payload.get("dry_run"):
+            print(f"[loop] dry run — would request a review from {payload['reviewer']} on {args.repo}#{args.pr} (state {payload['state']})")
+        else:
+            vendor = review_vendors.vendor_for(payload["reviewer"])
+            print(f"[loop] {vendor.display_name} review requested at {payload['created_at']}")
     elif payload.get("dry_run"):
         print(f"[loop] dry run — would post to {payload['repo']}#{payload['pr']}: {payload['phrase']}")
     else:

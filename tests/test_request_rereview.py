@@ -1967,20 +1967,21 @@ class TestProvenanceFailsClosed:
         # The next POST lands, but the write that would record it fails. The
         # follow-up marker write succeeds, which is the realistic transient
         # case (a full disk clearing, a lock released).
-        real_write = request_rereview.Path.write_text
+        real_write = request_rereview.loop_state.save_sticky_state
         calls = {"n": 0}
 
-        def flaky_write(self, *args, **kwargs):
+        def flaky_write(*args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError("read-only file system")
-            return real_write(self, *args, **kwargs)
+            return real_write(*args, **kwargs)
 
-        monkeypatch.setattr(request_rereview.Path, "write_text", flaky_write)
-        request_rereview.record_rereview_posted(
-            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T17:00:00Z"
-        )
-        monkeypatch.setattr(request_rereview.Path, "write_text", real_write)
+        monkeypatch.setattr(request_rereview.loop_state, "save_sticky_state", flaky_write)
+        with pytest.raises(OSError):
+            request_rereview.record_rereview_posted(
+                "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T17:00:00Z"
+            )
+        monkeypatch.setattr(request_rereview.loop_state, "save_sticky_state", real_write)
 
         # One request is now unrecorded, so the history can no longer be
         # trusted as complete: unknown, not "one request".

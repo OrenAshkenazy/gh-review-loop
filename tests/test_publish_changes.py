@@ -48,6 +48,7 @@ def checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(rr, "gh_login", lambda: "agent")
     monkeypatch.setattr(rr, "count_agent_pings", lambda *args: 0)
     monkeypatch.setattr(rr, "effective_cap", lambda *args: 3)
+    monkeypatch.setattr(rr, "request_rereview", lambda *args: {"posted": True, "created_at": "2026-10-12T20:00:00Z"})
     return root, remote, head, info, profile
 
 
@@ -76,6 +77,51 @@ def test_dry_run_verifies_without_staging_committing_or_pushing(checkout):
     assert pc.git(checkout[0], "rev-parse", "HEAD").strip() == checkout[2]
     assert pc.git(checkout[0], "diff", "--cached", "--name-only") == ""
     assert_not_pushed(checkout)
+
+
+def test_publish_holds_pr_lock_through_request_and_forwards_head_cap(checkout, monkeypatch):
+    import concurrent.futures
+    import loop_lock
+
+    calls = []
+
+    def contender():
+        with loop_lock.pr_lock("OWNER/REPO", 1):
+            pytest.fail("the publisher must still own the PR lock")
+
+    def request(repo, pr, head, cap):
+        assert pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() == head
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            with pytest.raises(TimeoutError):
+                executor.submit(contender).result()
+        # Nested request calls in the publishing thread must be reentrant.
+        with loop_lock.pr_lock(repo, pr):
+            calls.append((repo, pr, head, cap))
+        return {"posted": True, "created_at": "2026-10-12T20:00:00Z"}
+
+    monkeypatch.setattr(rr, "request_rereview", request)
+    result = publish(checkout, max_rereview_requests=6)
+    assert calls == [("owner/repo", 1, result["head"], 6)]
+    assert result["review_request"]["posted"] is True
+
+
+def test_dry_run_never_requests_review(checkout, monkeypatch):
+    monkeypatch.setattr(rr, "request_rereview", lambda *args: pytest.fail("dry run cannot request review"))
+    assert "review_request" not in publish(checkout, dry_run=True)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_request_failure_preserves_confirmed_publication(checkout, monkeypatch, failure):
+    def request(*args):
+        if failure:
+            raise RuntimeError("transport failed after push")
+        return {"posted": False, "status": "review_pending"}
+
+    monkeypatch.setattr(rr, "request_rereview", request)
+    result = publish(checkout)
+    assert result["published"] is True
+    assert result["review_request"]["status"] == ("request_failed" if failure else "review_pending")
+    assert pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() == result["head"]
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX named pipes")

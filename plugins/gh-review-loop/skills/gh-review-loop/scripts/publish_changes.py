@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import judge
+import loop_lock
 import loop_state
 import request_rereview as rr
 import review_vendors
@@ -145,6 +146,8 @@ def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozen
 def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None) -> None:
     state = rr.load_state()
     entry = state.get(rr.state_key_for(state, repo, pr))
+    if isinstance(entry, dict) and entry.get("review_request_in_flight"):
+        raise PublishError("reconcile the previous in-flight review request before publishing")
     tracking = entry.get("run") if isinstance(entry, dict) else None
     if not isinstance(tracking, dict) or loop_state.safe_int(tracking.get("update_seq")) <= 0 or loop_state.summary_is_stale(tracking):
         raise PublishError("fetch this PR, then emit and relay --cycle-summary before publishing")
@@ -189,6 +192,11 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
 
 
 def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None) -> dict:
+    with loop_lock.pr_lock(repo, pr):
+        return _publish(repo, pr, root, paths, message, remote, dry_run, max_rereview_requests)
+
+
+def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None) -> dict:
     root = root.resolve()
     if not message.strip() or remote.startswith("-") or not remote:
         raise PublishError("provide a commit message and a named Git remote")
@@ -232,6 +240,10 @@ def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remo
     if len(tip) != 2 or tip[0] != commit:
         raise PublishError("push could not be confirmed; local commit preserved")
     payload.update(status="published", published=True, head=commit)
+    try:
+        payload["review_request"] = rr.request_rereview(repo, pr, commit, max_rereview_requests)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        payload["review_request"] = {"status": "request_failed", "posted": None, "error": str(exc)}
     return payload
 
 

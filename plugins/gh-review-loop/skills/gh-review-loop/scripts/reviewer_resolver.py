@@ -230,6 +230,10 @@ def counted_review_requests(
             if _within(event["created_at"], posted_at, match_window_seconds):
                 out.append(unmatched.pop(index))
                 break
+        else:
+            # A successful local POST consumes its slot even before GitHub's
+            # timeline reflects it. Each timestamp still counts exactly once.
+            out.append({"created_at": posted_at, "reviewer_login": vendor.login, "actor_login": agent_login})
     out.sort(key=lambda event: event["created_at"])
     return out
 

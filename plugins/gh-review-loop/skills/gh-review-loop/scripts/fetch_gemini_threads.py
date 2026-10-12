@@ -37,6 +37,7 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     save_sticky_state,
     sentinel_path,
     state_dir,
+    state_transaction,
     sticky_state_path,  # noqa: F401 — re-exported; hooks/tests import via this module
     summary_is_stale,  # noqa: F401 — re-exported; hooks/tests import via this module
     touch_sentinel,
@@ -1633,7 +1634,7 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
     entry = load_sticky_state().get(_state_key(pr), {})
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
         return None
     requests = entry.get("review_requests")
     if not isinstance(requests, list):
@@ -1646,6 +1647,8 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
         if not isinstance(item, dict):
             continue
         if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        if item.get("initial_review") is True:
             continue
         at = item.get("at")
         if isinstance(at, str) and at:
@@ -1664,6 +1667,7 @@ def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
     return dict(reviewer)
 
 
+@state_transaction
 def save_reviewer_selection(pr: PullRequest, reviewer: dict[str, Any]) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -1674,6 +1678,7 @@ def save_reviewer_selection(pr: PullRequest, reviewer: dict[str, Any]) -> None:
     save_sticky_state(state)
 
 
+@state_transaction
 def clear_reviewer_selection(pr: PullRequest) -> bool:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -1705,6 +1710,7 @@ def read_render_baseline(pr: PullRequest, author: str) -> dict[str, str]:
     return {k: v for k, v in fps.items() if isinstance(k, str) and isinstance(v, str)}
 
 
+@state_transaction
 def save_render_baseline(pr: PullRequest, author: str, fps: dict[str, str]) -> None:
     """Replace the (pr, author) render baseline with this cycle's fingerprints.
 
@@ -1813,6 +1819,7 @@ def resolve_reviewer_selection(args: argparse.Namespace, pr: PullRequest) -> dic
     return state
 
 
+@state_transaction
 def update_run_tracking(
     pr: PullRequest,
     findings: list[tuple[str, str | None]],
@@ -1912,6 +1919,7 @@ def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
     return load_sticky_state().get(_state_key(pr), {}).get("run", {})
 
 
+@state_transaction
 def clear_run_tracking(pr: PullRequest) -> None:
     """Tear down the run accumulator and the delta baseline for this PR.
 
@@ -1936,6 +1944,7 @@ def clear_run_tracking(pr: PullRequest) -> None:
         clear_sentinel()
 
 
+@state_transaction
 def begin_wait_chunk(pr: PullRequest, after_iso: str | None) -> dict[str, Any]:
     """Open one wait chunk: load cross-chunk wait state, applying the reset rule.
 
@@ -1974,6 +1983,7 @@ def read_wait_state(pr: PullRequest) -> dict[str, Any]:
     return dict(wait) if isinstance(wait, dict) else {}
 
 
+@state_transaction
 def _update_wait_state(pr: PullRequest, updates: dict[str, Any]) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -2003,6 +2013,7 @@ def save_wait_snapshot(pr: PullRequest, snapshot: dict[str, Any]) -> None:
     _update_wait_state(pr, {"last_snapshot": dict(snapshot)})
 
 
+@state_transaction
 def clear_wait_state(pr: PullRequest) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -2183,6 +2194,7 @@ def run_wait_chunk(
         time.sleep(min(interval_seconds, max(0.0, chunk_deadline - time.monotonic())))
 
 
+@state_transaction
 def accumulate_fixed_markers(
     pr: PullRequest,
     *,
@@ -2237,6 +2249,7 @@ def read_fixed_markers(pr: PullRequest) -> dict[str, set[str]]:
     }
 
 
+@state_transaction
 def accumulate_swept_patterns(pr: PullRequest, signatures: list[str]) -> None:
     """Union agent-supplied --swept-pattern signatures into run tracking.
 
@@ -2500,6 +2513,7 @@ def count_likely_fixed_remaining(states: dict[str, str]) -> int:
     return sum(1 for state in states.values() if state in LIKELY_FIXED_FINDING_STATES)
 
 
+@state_transaction
 def track_finding_fingerprints(pr: PullRequest, current_fps: set[str]) -> dict[str, set[str]]:
     """Snapshot the prior cycle's finding fingerprints, then union the current.
 
@@ -2543,6 +2557,7 @@ def prior_finding_fingerprints(pr: PullRequest) -> set[str]:
     return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
 
+@state_transaction
 def track_pattern_signatures(pr: PullRequest, current_sigs: set[str]) -> dict[str, set[str]]:
     """Pattern-granularity twin of track_finding_fingerprints.
 
@@ -2578,6 +2593,7 @@ def prior_pattern_signatures(pr: PullRequest) -> set[str]:
     return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
 
+@state_transaction
 def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
     """True when the actionable thread fingerprint is unchanged from last cycle.
 
@@ -2617,6 +2633,7 @@ def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
     )
 
 
+@state_transaction
 def stamp_summary_emitted(pr: PullRequest) -> None:
     """Record that a summary covering the current run state was just emitted.
 
@@ -2642,6 +2659,7 @@ def stamp_summary_emitted(pr: PullRequest) -> None:
     save_sticky_state(state)
 
 
+@state_transaction
 def accumulate_judge_results(
     pr: PullRequest, judge_results: dict[str, dict[str, Any]]
 ) -> None:
@@ -2699,6 +2717,7 @@ def resolve_judge_phase(explicit_phase: str | None, *, record_run: bool) -> str:
     return "complete" if record_run else "cycle"
 
 
+@state_transaction
 def record_cycle(
     pr: PullRequest,
     started_at: str,
@@ -2777,6 +2796,17 @@ def find_existing_sticky_comment(pr: PullRequest) -> int | None:
     return None
 
 
+@state_transaction
+def _save_receipt_state(pr: PullRequest, receipt: dict[str, Any]) -> None:
+    state = load_sticky_state()
+    key = _state_key(pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    entry.update({field: receipt[field] for field in ("comment_id", "started_at", "updated_at") if field in receipt})
+    state[key] = entry
+    save_sticky_state(state)
+
+
 def post_or_update_sticky_receipt(
     pr: PullRequest, body: str, *, dry_run: bool = False
 ) -> int | None:
@@ -2848,8 +2878,7 @@ def post_or_update_sticky_receipt(
         entry["started_at"] = _now_iso()
         entry["updated_at"] = entry["started_at"]
 
-    state[key] = entry
-    save_sticky_state(state)
+    _save_receipt_state(pr, entry)
     return comment_id
 
 

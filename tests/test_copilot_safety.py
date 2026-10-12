@@ -60,7 +60,7 @@ def test_copilot_rechecks_open_pr_after_cap_reads(monkeypatch, capsys, state, ch
     assert payload["posted"] is False
     assert payload["status"] == ("stale_request_not_replaced" if state == "STALE_PENDING" else "review_request_rejected")
     assert len(calls) == 1
-    assert not rr.state_path().exists()
+    assert not rr.load_state().get("acme/widget#159", {})
 
 
 def test_copilot_rechecks_head_after_cancelling_stale_request(monkeypatch, capsys):
@@ -82,7 +82,7 @@ def test_copilot_rechecks_head_after_cancelling_stale_request(monkeypatch, capsy
     assert payload["posted"] is False
     assert payload["reason"] == "head_mismatch"
     assert writes == ["DELETE"]
-    assert not rr.state_path().exists()
+    assert not rr.load_state().get("acme/widget#159", {})
 
 
 def test_copilot_matching_head_posts_native_request_and_records_provenance(monkeypatch, capsys):
