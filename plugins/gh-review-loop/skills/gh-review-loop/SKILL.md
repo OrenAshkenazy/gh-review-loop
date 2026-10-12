@@ -20,6 +20,7 @@ This file holds the every-cycle happy path. Read the referenced file **at the po
 | File | Load when |
 |---|---|
 | `references/reviewer-selection.md` | No persisted reviewer; discovery returns `none_configured`/`partial`/`confirmation_required`; reviewer switch/reset |
+| `references/user-decisions.md` | User choice or human judgment needed |
 | `references/verification-profile.md` | First run for a repo (edit gate blocks until a profile decision); customize/un-skip/re-detect |
 | `references/sweep-internals.md` | Receipt shows a multi-site pattern (`count >= 2`), a multi-line ranged finding, or a `Clustering:` advisory |
 | `references/write-safety.md` | Resolving beyond the auto-resolve set; write constraints; is a push safe; what the bundled hooks enforce |
@@ -91,7 +92,7 @@ An opt-in, read-only OpenAI judge can classify findings. **Off by default; nothi
 
 ## Stopping Conditions
 
-Stop and report instead of pushing or re-asking when any is true: **1. Cap reached.** **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — remaining threads are informational, duplicate, contradictory, or need a human call (includes `ADDRESSED_BY_REPLY`). **4. Test regression** — failure not clearly caused by the finding-addressing change. **5. No progress** — the script prints `[loop] no_progress: …` (unchanged actionable fingerprint): stop immediately with `--record-run --outcome no_progress`; do not push or re-request.
+Stop or pause instead of pushing or re-asking when any is true: **1. Cap reached.** **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — ask; pause publication until answered. **4. Test regression** — failure not clearly caused by the finding-addressing change. **5. No progress** — the script prints `[loop] no_progress: …` (unchanged actionable fingerprint): stop immediately with `--record-run --outcome no_progress`; do not push or re-request.
 
 At the cap still run cleanup, terminal classification, metrics recording, and the final summary. Re-invocation at the cap is usually a resume signal — load `references/resume-and-recovery.md` before declaring a hard stop.
 

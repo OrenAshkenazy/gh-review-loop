@@ -6,6 +6,7 @@ Load this when deciding whether a push is safe or when the user requests thread 
 
 - Resolution is off by default for every state. An outdated location does not establish that a defect was fixed.
 - **ADDRESSED_BY_REPLY** requires a reply whose first line is `/review-loop defer`, after the latest selected-reviewer comment, from a GitHub `OWNER` or `COLLABORATOR`. Ordinary objections, acknowledgments, quoted markers, organization membership alone, bots, and missing association data do not defer a finding.
+- A user choosing "Defer and record on GitHub" authorizes that reply in the identified thread, not thread resolution. Follow [User decisions](user-decisions.md#recording-a-deferral) to ask, post the marker, and verify recognition; a chat answer alone does not set `ADDRESSED_BY_REPLY`.
 - Explicit user opt-in enables `--resolve-outdated` or `--resolve-addressed-by-reply`. `--dry-run` previews intended resolutions without GraphQL writes.
 - **UNRESOLVED** threads are never resolved without an explicit user request.
 
