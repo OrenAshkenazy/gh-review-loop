@@ -134,7 +134,7 @@ def test_invalid_pr_fails(capsys):
     assert "positive integer" in captured.err
 
 
-def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
+def test_gh_failure_without_http_status_reports_unknown_and_retains_marker(capsys):
     def runner(argv, **kwargs):  # noqa: ARG001
         return subprocess.CompletedProcess(
             args=argv,
@@ -150,15 +150,16 @@ def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
 
     request_rereview.post_rereview = failing_post
     try:
-        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11"])
+        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11", "--json"])
     finally:
         request_rereview.post_rereview = original
 
     captured = capsys.readouterr()
-    assert rc != 0
-    assert captured.out == ""
-    assert "gh api failed" in captured.err
-    assert "permission denied" in captured.err
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "review_request_uncertain"
+    assert payload["posted"] is None and "permission denied" in payload["message"]
+    assert request_rereview.load_state()["OrenAshkenazy/AegisLocal#11"]["review_request_in_flight"]
 
 
 def test_default_phrase_is_used_when_omitted(monkeypatch, capsys):
@@ -709,7 +710,7 @@ class TestMentionExtraction:
             return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
 
         monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
-        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
 
         rc = request_rereview.main(
@@ -1351,6 +1352,8 @@ class TestReviewRequestMain:
         not prove abandonment, so the open request is explicitly cancelled
         first — never left live alongside a second one (PR #116 review)."""
         self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        states = [request_rereview.request_state(), {**request_rereview.request_state(), "state": "ABSENT"}]
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: states.pop(0))
         cancelled = {}
         monkeypatch.setattr(
             request_rereview, "cancel_review_request",
@@ -1758,10 +1761,7 @@ class TestStateReadFailure:
 
 
 class TestFreeInitialRequest:
-    """Cycle 0 is free, so it must not be gated on the cap or on the reads the
-    cap needs: with `max_rereview_requests: 0`, or with `gh api user` failing,
-    a PR Copilot has never reviewed still gets its first request (PR #116
-    review)."""
+    """Cycle 0 is free, but a known actor is needed to recover uncertain writes."""
 
     @staticmethod
     def _state(**overrides):
@@ -1795,19 +1795,17 @@ class TestFreeInitialRequest:
         assert requested["login"] == COPILOT_REQUEST
         assert json.loads(capsys.readouterr().out)["kind"] == "review_request"
 
-    def test_an_unresolvable_login_does_not_block_the_first_request(self, monkeypatch, capsys, tmp_path):
+    def test_an_unresolvable_login_blocks_the_first_request_for_recovery(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: self._state())
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
-        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
-            "created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
-            "reviewer": login, "posted": True,
-        })
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("unknown actor must not post"))
 
         assert request_rereview.main([
             "--repo", "acme/widget", "--pr", "159", "--reviewer-login", COPILOT_LOGIN, "--json",
         ]) == 0
-        assert json.loads(capsys.readouterr().out)["posted"] is True
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "uncountable_actor" and payload["posted"] is False
 
     def test_once_a_review_exists_the_cap_applies_again(self, monkeypatch, capsys):
         monkeypatch.setattr(

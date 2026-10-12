@@ -77,10 +77,14 @@ def test_copilot_rechecks_head_after_cancelling_stale_request(monkeypatch, capsy
         return subprocess.CompletedProcess(cmd, 0, json.dumps(remote), "")
 
     monkeypatch.setattr(rr.subprocess, "run", runner)
+    monkeypatch.setattr(rr, "request_state", lambda *args: {
+        "state": "STALE_PENDING" if not writes else "ABSENT", "head": remote["head"]["sha"],
+        "pending_since": "2026-10-07T15:50:00Z", "first_completed_review_at": "2026-10-07T16:00:00Z",
+    })
     assert request() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["posted"] is False
-    assert payload["reason"] == "head_mismatch"
+    assert payload["status"] == "head_mismatch"
     assert writes == ["DELETE"]
     assert not rr.load_state().get("acme/widget#159", {})
 
@@ -92,7 +96,8 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "open", "head": {"sha": HEAD}}), "")
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "open", "head": {"sha": HEAD},
+                                                             "requested_reviewers": [{"login": review_vendors.COPILOT.request_login}]}), "")
 
     monkeypatch.setattr(rr.subprocess, "run", runner)
     assert request() == 0

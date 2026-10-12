@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,8 @@ class ReviewRequestRejected(RuntimeError):
         http_status: int | None = None,
         retryable: bool = False,
         requested_at: str | None = None,
+        outcome_unknown: bool | None = None,
+        allow_timeline_confirmation: bool = True,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
@@ -106,6 +109,8 @@ class ReviewRequestRejected(RuntimeError):
         self.http_status = http_status
         self.retryable = retryable
         self.requested_at = requested_at
+        self.outcome_unknown = (reason == "uncertain" or (http_status is not None and http_status >= 500)) if outcome_unknown is None else outcome_unknown
+        self.allow_timeline_confirmation = allow_timeline_confirmation
 
 
 _HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
@@ -214,17 +219,15 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
         "retryable": exc.retryable,
         "requested_at": exc.requested_at,
         "message": (
-            f"The review request for `{reviewer}` returned no HTTP status ({detail}), "
-            "and no matching request was visible on the PR timeline yet, so whether "
-            "GitHub accepted it is unknown. Do not request again immediately: the "
-            "timeline can lag by seconds. Re-read the PR state in a minute and "
-            "request again only if no review request from this agent appears."
+            f"The review request for `{reviewer}` could not be confirmed ({detail}). "
+            "The outcome is unknown: GitHub may have accepted it. Do not post again; run this helper with "
+            "--reconcile in a minute to check GitHub evidence and record it once."
         ),
     }
 
 
 def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
-    if exc.reason == "uncertain":
+    if exc.outcome_unknown:
         return uncertain_payload(repo, pr, reviewer, exc)
     detail = (exc.detail or "").strip() or "no detail from GitHub"
     hints = {
@@ -408,9 +411,13 @@ def record_rereview_posted(
                 key_now = state_key_for(marked, repo, pr)
                 existing = marked.get(key_now)
                 existing = dict(existing) if isinstance(existing, dict) else {}
-                existing["review_requests_incomplete"] = True
-                marked[key_now] = existing
-                loop_state.save_sticky_state(marked)
+                # The durable marker already protects this particular lost
+                # receipt and can be reconciled. Preserve older unknown
+                # history, but do not add an irrecoverable flag for this POST.
+                if not existing.get("review_request_in_flight"):
+                    existing["review_requests_incomplete"] = True
+                    marked[key_now] = existing
+                    loop_state.save_sticky_state(marked)
             except OSError:
                 pass
         raise
@@ -1003,8 +1010,12 @@ def post_rereview(
         }
 
     if expect_head is not None:
-        ensure_expected_head(repo, pr, expect_head, runner)
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except RuntimeError as exc:
+            raise ReviewRequestRejected(str(exc), reason="head_mismatch") from exc
 
+    requested_at = utc_now_iso()
     cmd = [
         "gh",
         "api",
@@ -1017,23 +1028,24 @@ def post_rereview(
     try:
         result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not run gh api: {exc}") from exc
+        raise ReviewRequestRejected(f"could not run gh api: {exc}", requested_at=requested_at) from exc
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"gh api failed{suffix}")
+        reason, http_status, retryable = classify_gh_failure(detail)
+        raise ReviewRequestRejected(detail or "gh api failed", reason=reason, http_status=http_status,
+                                    retryable=retryable, requested_at=requested_at)
 
     try:
         response = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise RuntimeError("gh api returned invalid JSON") from exc
+        raise ReviewRequestRejected("gh api returned invalid JSON", requested_at=requested_at) from exc
     if not isinstance(response, dict):
-        raise RuntimeError("gh api returned non-object JSON")
+        raise ReviewRequestRejected("gh api returned non-object JSON", requested_at=requested_at)
 
     created_at = response.get("created_at")
     if not isinstance(created_at, str) or not created_at:
-        raise RuntimeError("gh api response missing created_at")
+        raise ReviewRequestRejected("gh api response missing created_at", requested_at=requested_at)
 
     payload = {
         "created_at": created_at,
@@ -1046,6 +1058,21 @@ def post_rereview(
     return payload
 
 
+def _registered_review(repo: str, pr: int, request_login: str, expect_head: str | None, runner: Any) -> bool:
+    owner, repo_name = parse_repo(repo)
+    data = _gh_json(["gh", "api", "graphql", "-f", f"query={STATE_QUERY}",
+                     "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"], runner)
+    try:
+        pull = data["data"]["repository"]["pullRequest"]
+        if data.get("errors") or (expect_head is not None and pull.get("headRefOid") != expect_head):
+            return False
+        return any(isinstance(node, dict) and isinstance(reviewer := node.get("requestedReviewer"), dict)
+                   and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
+                   for node in pull["reviewRequests"]["nodes"])
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
 def request_review(
     repo: str,
     pr: int,
@@ -1054,6 +1081,7 @@ def request_review(
     dry_run: bool = False,
     expect_head: str | None = None,
     rerequest_ids: tuple[str, str] | None = None,
+    registration_head: str | None = None,
 ) -> dict[str, Any]:
     """Add ``request_login`` as a requested reviewer and return the result payload.
 
@@ -1125,6 +1153,24 @@ def request_review(
                 raise ValueError("missing mutation result or GraphQL errors")
         except (ValueError, AttributeError, TypeError) as exc:
             raise ReviewRequestRejected("GraphQL re-request outcome uncertain", reason="uncertain", requested_at=requested_at) from exc
+    else:
+        try:
+            data = json.loads(result.stdout)
+            registered = any(isinstance(reviewer, dict)
+                             and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
+                             for reviewer in data["requested_reviewers"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            registered = False
+        if not registered:
+            for attempt in range(2):
+                if attempt:
+                    time.sleep(1)
+                if _registered_review(repo, pr, request_login, registration_head or expect_head, runner):
+                    registered = True
+                    break
+        if not registered:
+            raise ReviewRequestRejected("REST accepted the call but selected reviewer registration is unconfirmed",
+                                        requested_at=requested_at, allow_timeline_confirmation=False)
     return {
         "created_at": requested_at,
         "repo": repo,
@@ -1238,15 +1284,30 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
     if state["state"] == "STALE_PENDING" and not args.dry_run:
         if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head):
             return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
+        refreshed = request_state(args.repo, args.pr, vendor)
+        if refreshed is None:
+            return state_unreadable_payload(args.repo, args.pr, reviewer)
+        if args.expect_head and refreshed["head"] != args.expect_head:
+            return head_mismatch_payload(args.repo, args.pr, args.expect_head, refreshed["head"])
+        if refreshed["state"] == "COMPLETED_HEAD":
+            return already_reviewed_payload(args.repo, args.pr, reviewer, refreshed["head"])
+        if refreshed["state"] != "ABSENT":
+            return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
+    actor = gh_login() if not args.dry_run else None
+    if not args.dry_run and not actor:
+        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
     if not args.dry_run:
-        _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso()})
+        _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso(), "head": state["head"],
+                                                  "actor": actor, "kind": "review_request",
+                                                  "initial_review": not state["first_completed_review_at"]})
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"))
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"])
     except ReviewRequestRejected as exc:
-        if exc.reason != "uncertain" and not args.dry_run:
+        if not exc.outcome_unknown and not args.dry_run:
             _mark_request_in_flight(args.repo, args.pr, None)
-        if exc.reason == "uncertain" and confirm_posted_after_uncertain(
-            args.repo, args.pr, vendor, gh_login(), exc.requested_at
+        if exc.outcome_unknown and exc.allow_timeline_confirmation and confirm_posted_after_uncertain(
+            args.repo, args.pr, vendor, actor, exc.requested_at
         ):
             payload = {
                 "created_at": exc.requested_at,
@@ -1328,6 +1389,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-safe-trigger",
         action="store_true",
         help="Do not post; emit a controlled no_safe_trigger result instead.",
+    )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Confirm and record an in-flight request from GitHub evidence, without posting again.",
     )
     parser.add_argument(
         "--json",
@@ -1421,9 +1487,19 @@ def _request(args: argparse.Namespace) -> dict[str, Any]:
         if used >= cap:
             payload = capped_payload(args.repo, args.pr, used, cap)
             return payload
+    actor = gh_login() if not args.dry_run else None
+    if not args.dry_run and not actor:
+        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
     if not args.dry_run:
-        _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer_login, "at": utc_now_iso()})
-    payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
+        _mark_request_in_flight(args.repo, args.pr, {"reviewer": trigger or mention_in(phrase) or reviewer_login,
+                                                  "at": utc_now_iso(), "actor": actor, "kind": "comment", "phrase": phrase})
+    try:
+        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
+    except ReviewRequestRejected as exc:
+        if not exc.outcome_unknown and not args.dry_run:
+            _mark_request_in_flight(args.repo, args.pr, None)
+        return rejected_payload(args.repo, args.pr, reviewer_login or trigger or "the reviewer", exc)
     # A dry run posts nothing, so it closes no cycle.
     if payload.get("posted") is not False and not payload.get("dry_run"):
         _record_posted_payload(args, payload, trigger or mention_in(phrase) or reviewer_login)
@@ -1440,12 +1516,63 @@ def request_rereview(repo: str, pr: int, expect_head: str, max_rereview_requests
     return _locked_request(build_parser().parse_args(argv))
 
 
+def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
+    payload = {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr,
+               "message": "No matching GitHub evidence yet; the marker is retained. Reconcile again later; do not repost."}
+    if not isinstance(marker, dict) or not marker:
+        payload.update(status="no_request_in_flight", posted=False, message="No in-flight request to reconcile; nothing was posted.")
+        return payload
+    reviewer, at, actor = marker.get("reviewer"), marker.get("at"), marker.get("actor")
+    if not isinstance(reviewer, str) or _parse_iso(at) is None or not isinstance(actor, str) or not actor:
+        return payload
+    vendor = review_vendors.vendor_for(reviewer)
+    confirmed = {"created_at": at, "repo": args.repo, "pr": args.pr, "reviewer": reviewer,
+                 "posted": True, "reconciled": True}
+    if marker.get("kind") == "review_request" and vendor is not None:
+        head = marker.get("head")
+        if not isinstance(head, str) or (args.expect_head and args.expect_head != head):
+            return payload
+        state = request_state(args.repo, args.pr, vendor)
+        if state is None or state["head"] != head or not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
+            return payload
+        if state["state"] not in ("PENDING", "STALE_PENDING"):
+            reviews = _all_reviews(args.repo, args.pr, subprocess.run)
+            if reviews is None or not any(review_vendors.vendor_for(_review_author(review)) is vendor
+                                          and review.get("state") != "PENDING" and _review_commit(review) == head
+                                          and _review_submitted_at(review) >= at for review in reviews):
+                return payload
+        confirmed["kind"] = "review_request"
+    elif marker.get("kind") == "comment" and isinstance(marker.get("phrase"), str):
+        owner, repo_name = parse_repo(args.repo)
+        comments = _gh_json(["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{args.pr}/comments"], subprocess.run)
+        if not isinstance(comments, list):
+            return payload
+        match = next((comment for comment in comments if isinstance(comment, dict)
+                      and isinstance(comment.get("user"), dict) and comment["user"].get("login") == actor
+                      and comment.get("body") == marker["phrase"] and _parse_iso(comment.get("created_at")) is not None
+                      and comment["created_at"] >= at and type(comment.get("id")) is int), None)
+        if match is None:
+            return payload
+        confirmed.update(created_at=match["created_at"], comment_id=match["id"], phrase=marker["phrase"])
+    else:
+        return payload
+    if args.dry_run:
+        confirmed.update(posted=False, dry_run=True, would_record=True, message="GitHub confirms the request; dry run recorded nothing.")
+        return confirmed
+    _record_posted_payload(args, confirmed, reviewer, initial_review=marker.get("initial_review") is True)
+    if confirmed.get("status") != "state_record_failed":
+        confirmed.update(status="request_reconciled", message="Confirmed the previous request from GitHub and recorded it once; no new request was posted.")
+    return confirmed
+
+
 def _locked_request(args: argparse.Namespace) -> dict[str, Any]:
     parse_repo(args.repo)
     try:
         with loop_lock.pr_lock(args.repo, args.pr):
             state = loop_state.load_sticky_state(strict=True)
             entry = state.get(state_key_for(state, args.repo, args.pr))
+            if args.reconcile:
+                return _reconcile_request(args, entry.get("review_request_in_flight") if isinstance(entry, dict) else None)
             if isinstance(entry, dict) and entry.get("review_request_in_flight"):
                 return {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr,
                         "message": "A previous review request is not fully recorded. Reconcile its in-flight marker before requesting again."}
