@@ -78,6 +78,23 @@ def test_dry_run_verifies_without_staging_committing_or_pushing(checkout):
     assert_not_pushed(checkout)
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX named pipes")
+def test_existing_fifo_is_rejected_before_reading(tmp_path):
+    os.mkfifo(tmp_path / "pipe")
+    with pytest.raises(pc.PublishError, match="not a regular file"):
+        pc.approved_paths(tmp_path, ["pipe"])
+
+
+def test_missing_path_still_allows_verified_deletion(checkout):
+    root = checkout[0]
+    (root / "fix.txt").unlink()
+    checkout[4]["checks"][0]["command"] = [sys.executable, "-c", "from pathlib import Path; assert not Path('fix.txt').exists()"]
+    result = publish(checkout)
+
+    assert result["published"] is True
+    assert pc.git(root, "ls-tree", "--name-only", result["head"]).strip() == ""
+
+
 @pytest.mark.parametrize("profile", [None, {}, {"source": "skipped"}, {"source": "confirmed", "checks": []}, {"source": "confirmed", "checks": [{"required": False, "command": ["python", "-V"]}]}, {"source": "confirmed", "checks": [{"required": "true", "command": ["python", "-V"]}]}])
 def test_incomplete_or_optional_only_profile_blocks(checkout, monkeypatch, profile):
     monkeypatch.setattr(pc.judge, "get_profile", lambda repo: profile)

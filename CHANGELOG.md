@@ -22,7 +22,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
-- **Copilot re-requests work for PR authors through GraphQL `rerequestReviews`.** The loop reads PR and bot IDs from GitHub and preserves its head, pending-review, cap, and uncertain-result guards. Copilot findings embedded in review summaries are actionable, and publication honors per-run cap overrides.
+- **Copilot re-requests work for PR authors through GraphQL `rerequestReviews`.** The loop reads PR and bot IDs from GitHub and preserves its head, pending-review, cap, and uncertain-result guards. Copilot findings embedded in review summaries are actionable, and publication honors per-run cap overrides and rejects non-regular files before reading them.
 
 - **The scratch directory is no longer a predictable path in `/tmp`.** The
   per-user path introduced for cross-call stability could be pre-created — or

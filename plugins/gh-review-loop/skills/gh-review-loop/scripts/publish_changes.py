@@ -68,7 +68,7 @@ def approved_paths(root: Path, paths: list[str]) -> list[str]:
         if not raw or "\\" in raw or ":" in raw or "\0" in raw or path.is_absolute() or path.as_posix() != raw or any(part in {"..", ".git"} for part in path.parts):
             raise PublishError(f"invalid repository-relative file path: {raw!r}")
         target = root / raw
-        if target.is_symlink() or not target.resolve().is_relative_to(root) or target.is_dir():
+        if target.is_symlink() or not target.resolve().is_relative_to(root) or (target.exists() and not target.is_file()):
             raise PublishError(f"file path escapes the checkout or is not a regular file: {raw!r}")
     return paths
 
