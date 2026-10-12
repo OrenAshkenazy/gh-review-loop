@@ -26,7 +26,7 @@ import metrics  # noqa: E402 — sibling module, pure/stdlib-only
 import cluster_findings  # noqa: E402 — sibling module, pure/stdlib-only
 import reviewer_resolver  # noqa: E402 — sibling module, pure/stdlib-only
 import review_vendors  # noqa: E402 — sibling module, pure/stdlib-only
-from loop_color import color_loop, colors_enabled  # noqa: E402 — sibling module
+from loop_color import color_loop, colors_enabled, configure_utf8_output  # noqa: E402 — sibling module
 from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     any_active_run,
     clear_sentinel,
@@ -4809,4 +4809,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_utf8_output()
     raise SystemExit(main())

@@ -1408,4 +1408,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from loop_color import configure_utf8_output
+    configure_utf8_output()
     raise SystemExit(main())

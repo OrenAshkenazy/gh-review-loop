@@ -322,6 +322,8 @@ def _profile_checks(profile: Any) -> list[dict[str, Any]]:
         if not isinstance(check, dict):
             continue
         command = check.get("command")
+        if isinstance(command, list) and command and all(isinstance(arg, str) and "\0" not in arg for arg in command):
+            command = json.dumps(command, ensure_ascii=False)
         if not isinstance(command, str) or not command.strip():
             continue
         name = check.get("name")
