@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Copilot re-reviews require readable PR and bot IDs.** Missing or ambiguous IDs stop before stale-request cancellation, and refreshed IDs are checked again before posting; completed reviews never silently fall back to the initial REST request endpoint.
+
 - **Public receipts keep verification commands local.** GitHub comments show check names and results without machine-specific command paths or private arguments; detailed local verification records are retained.
 
 - **Native request recovery survives later PR pushes.** A fresh matching request-event ID records the prior accepted request at GitHub's timestamp even after the head changes; legacy completion evidence keeps its head checks. The README distinguishes initial REST requests from GraphQL re-requests.

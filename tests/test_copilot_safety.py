@@ -18,6 +18,7 @@ def stub_request_state(monkeypatch, state="ABSENT"):
     monkeypatch.setattr(rr, "request_state", lambda *args: {
         "state": state, "head": HEAD, "pending_since": "2026-10-07T15:50:00Z",
         "first_completed_review_at": "2026-10-07T16:00:00Z",
+        "rerequest_ids": ("PR_target", "BOT_copilot"),
     })
     monkeypatch.setattr(rr, "gh_login", lambda: "agent")
     monkeypatch.setattr(rr, "effective_cap", lambda *args: 3)
@@ -107,6 +108,7 @@ def test_copilot_rechecks_head_after_cancelling_stale_request(monkeypatch, capsy
     monkeypatch.setattr(rr, "request_state", lambda *args: {
         "state": "STALE_PENDING" if not writes else "ABSENT", "head": remote["head"]["sha"],
         "pending_since": "2026-10-07T15:50:00Z", "first_completed_review_at": "2026-10-07T16:00:00Z",
+        "rerequest_ids": ("PR_target", "BOT_copilot"),
     })
     assert request() == 0
     payload = json.loads(capsys.readouterr().out)
@@ -123,6 +125,8 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
+        if "graphql" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}}), "")
         return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "open", "head": {"sha": HEAD},
                                                              "requested_reviewers": [{"login": review_vendors.COPILOT.request_login}]}), "")
 
@@ -132,7 +136,50 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
     assert payload["posted"] is True and payload["kind"] == "review_request"
     assert calls == [
         ["gh", "api", "repos/acme/widget/pulls/159"],
-        ["gh", "api", "repos/acme/widget/pulls/159/requested_reviewers", "--method", "POST",
-         "--raw-field", "reviewers[]=copilot-pull-request-reviewer[bot]"],
+        ["gh", "api", "graphql", "-f",
+         "query=mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }",
+         "-f", "pr=PR_target", "-f", "bot=BOT_copilot"],
     ]
     assert rr.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [payload["created_at"]]
+
+
+@pytest.mark.parametrize("state", ["ABSENT", "STALE_PENDING"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("no_cap_check", [False, True])
+def test_missing_rerequest_ids_stop_before_cancellation_or_post(monkeypatch, capsys, state, dry_run, no_cap_check):
+    stub_request_state(monkeypatch, state)
+    monkeypatch.setattr(rr, "request_state", lambda *args: {
+        "state": state, "head": HEAD, "pending_since": None,
+        "first_completed_review_at": "2026-10-07T16:00:00Z", "rerequest_ids": None,
+    })
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *args: 0)
+    monkeypatch.setattr(rr, "cancel_review_request", lambda *a, **kw: pytest.fail("missing IDs must not cancel a request"))
+    monkeypatch.setattr(rr, "request_review", lambda *a, **kw: pytest.fail("missing IDs must not fall back to REST"))
+    monkeypatch.setattr(rr, "_mark_request_in_flight", lambda *a: pytest.fail("missing IDs must not create recovery state"))
+    argv = ["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "copilot", "--json"]
+    assert rr.main(argv + (["--dry-run"] if dry_run else []) + (["--no-cap-check"] if no_cap_check else [])) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "uncountable_rerequest_ids" and payload["posted"] is False
+    assert not rr.load_state().get("acme/widget#159", {})
+
+
+@pytest.mark.parametrize("first_completed", [None, "2026-10-07T16:00:00Z"])
+def test_refreshed_missing_ids_do_not_fall_back_to_rest(monkeypatch, capsys, first_completed):
+    stub_request_state(monkeypatch, "STALE_PENDING")
+    states = iter([
+        {"state": "STALE_PENDING", "head": HEAD, "pending_since": None,
+         "first_completed_review_at": first_completed, "rerequest_ids": ("PR_target", "BOT_copilot")},
+        {"state": "ABSENT", "head": HEAD, "pending_since": None,
+         "first_completed_review_at": "2026-10-07T16:00:00Z", "rerequest_ids": None},
+    ])
+    monkeypatch.setattr(rr, "request_state", lambda *args: next(states))
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *args: 0)
+    cancelled = []
+    monkeypatch.setattr(rr, "cancel_review_request", lambda *a, **kw: cancelled.append(kw["expect_head"]) or True)
+    monkeypatch.setattr(rr, "request_review", lambda *a, **kw: pytest.fail("refreshed missing IDs must not fall back to REST"))
+    monkeypatch.setattr(rr, "_mark_request_in_flight", lambda *a: pytest.fail("refreshed missing IDs must not create recovery state"))
+    assert request() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "uncountable_rerequest_ids" and payload["posted"] is False
+    assert cancelled == [HEAD]
+    assert not rr.load_state().get("acme/widget#159", {})

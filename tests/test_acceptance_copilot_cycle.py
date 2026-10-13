@@ -147,7 +147,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
     monkeypatch.setattr(
         request_rereview, "request_state",
         lambda *a, **k: {"state": "ABSENT", "head": NEW_HEAD, "pending_since": None,
-                         "first_completed_review_at": "2026-10-07T15:46:14Z"},
+                         "first_completed_review_at": "2026-10-07T15:46:14Z", "rerequest_ids": ("PR_target", "BOT_copilot")},
     )
     monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
     requested = {}

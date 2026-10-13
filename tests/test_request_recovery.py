@@ -166,6 +166,7 @@ def test_fast_completion_requires_new_selected_bot_and_request_provenance(proble
 def test_unknown_actor_prevents_stale_request_cancellation(monkeypatch, first_completed):
     monkeypatch.setattr(rr, "request_state", lambda *a: {
         "state": "STALE_PENDING", "head": HEAD, "pending_since": AT, "first_completed_review_at": first_completed,
+        "rerequest_ids": ("PR_target", "BOT_copilot"),
     })
     monkeypatch.setattr(rr, "gh_login", lambda: None)
     monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)

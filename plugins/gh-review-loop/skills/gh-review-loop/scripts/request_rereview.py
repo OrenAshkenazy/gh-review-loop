@@ -1311,6 +1311,11 @@ def stale_not_replaced_payload(repo: str, pr: int, reviewer: str, pending_since:
     }
 
 
+def missing_rerequest_ids_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    return {"status": "uncountable_rerequest_ids", "posted": False, "repo": repo, "pr": pr, "reviewer": reviewer,
+            "message": "Cannot establish PR and bot IDs for re-review; no request was posted. Restore readable, unambiguous IDs before retrying."}
+
+
 def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1350,6 +1355,8 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
             return uncountable_count_payload(args.repo, args.pr, cap)
         if used >= cap:
             return capped_payload(args.repo, args.pr, used, cap)
+    if state["first_completed_review_at"] and not state.get("rerequest_ids"):
+        return missing_rerequest_ids_payload(args.repo, args.pr, reviewer)
     actor = gh_login() if not args.dry_run else None
     if not args.dry_run and not actor:
         return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
@@ -1379,6 +1386,8 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
                 return uncountable_count_payload(args.repo, args.pr, cap)
             if used >= cap:
                 return capped_payload(args.repo, args.pr, used, cap)
+        if refreshed["first_completed_review_at"] and not refreshed.get("rerequest_ids"):
+            return missing_rerequest_ids_payload(args.repo, args.pr, reviewer)
         state = refreshed
     if not args.dry_run:
         _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso(), "head": state["head"],

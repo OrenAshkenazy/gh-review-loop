@@ -32,7 +32,7 @@ Claude Code additionally runs three state-gated hooks, which fail open. Codex re
 
 For Copilot, both publication and re-review count native requests matched to the loop's locally recorded timestamps. Manual reviewer requests do not consume the loop's cap. Clearing local state removes that provenance; ambiguous history blocks further publication. Comment vendors continue to count the agent's mention comments.
 
-Copilot re-requests use GraphQL `rerequestReviews` with the PR ID and the bot ID from its completed reviews. Initial requests use the REST requested-reviewers endpoint. These operations can have different permissions: a PR author's re-request can succeed when a REST request or `requestReviewsByLogin` is denied. An uncertain mutation result is reconciled against the timeline before recording success; it is never retried through another transport.
+Copilot re-requests use GraphQL `rerequestReviews` with PR and completed-review bot IDs; missing or ambiguous IDs block cancellation and POST, including after a stale-request refresh. Initial requests use REST. Permissions can differ: a PR author's re-request can succeed when REST or `requestReviewsByLogin` is denied. Uncertain mutations are reconciled against the timeline, never retried through another transport.
 
 | Event | Script | Guarantee |
 |---|---|---|

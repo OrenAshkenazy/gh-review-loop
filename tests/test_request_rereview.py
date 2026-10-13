@@ -1235,6 +1235,7 @@ class TestReviewRequestMain:
             lambda *a, **k: None if state is None else {
                 "state": state, "head": head, "pending_since": pending_since,
                 "first_completed_review_at": T_FIRST_REVIEW,
+                "rerequest_ids": ("PR_target", "BOT_copilot"),
             },
         )
         monkeypatch.setattr(
@@ -1593,6 +1594,7 @@ class TestExplicitMentionOverridesPersistedVendor:
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: {
             "state": "ABSENT", "head": "abc1234def", "pending_since": None,
             "first_completed_review_at": T_FIRST_REVIEW,
+            "rerequest_ids": ("PR_target", "BOT_copilot"),
         })
         monkeypatch.setattr(
             request_rereview, "post_rereview",
