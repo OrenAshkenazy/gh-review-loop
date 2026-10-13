@@ -187,16 +187,29 @@ class Cluster:
 
 
 def _severity(thread: Any) -> str:
-    body = _first_body(thread)
-    match = _SEVERITY_RE.search(body)
-    if match:
-        return match.group(1).lower()
-    codex_match = _CODEX_PRIORITY_RE.search(body)
-    if codex_match:
-        return _CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
-    plain_match = _PLAIN_PRIORITY_RE.match(body)
-    if plain_match:
-        return _CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
+    """Match thread_severity's selection of the first marked comment."""
+    if not isinstance(thread, dict):
+        return "unknown"
+    comments = thread.get("comments")
+    if isinstance(comments, dict):
+        comments = comments.get("nodes")
+    if not isinstance(comments, list):
+        return "unknown"
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        match = _SEVERITY_RE.search(body)
+        if match:
+            return match.group(1).lower()
+        codex_match = _CODEX_PRIORITY_RE.search(body)
+        if codex_match:
+            return _CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+        plain_match = _PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return _CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
     return "unknown"
 
 

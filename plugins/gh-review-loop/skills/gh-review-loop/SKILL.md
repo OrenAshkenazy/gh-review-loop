@@ -38,7 +38,7 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 
 - **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
 - **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
-- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from the reviewer's severity badges.
+- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from recognized severity images (Codex/Gemini) or reviewer-leading plain-text `[P0]`–`[P3]` markers; unsupported formats remain `unknown`.
 
 ## Cycle Counting
 

@@ -72,11 +72,11 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 |---|---|---|---|
 | Codex (`chatgpt-codex-connector`) | Built-in, full support. Offered first on an unconfigured PR because it reviews on request, so accepting starts a cycle immediately | `@codex review` | `P0`–`P3`, normalized |
 | Gemini Code Assist | Built-in, full support. Needs the **enterprise** GitHub app ([consumer app shut down](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review)) | `@gemini-code-assist please review…` | `critical` / `high` / `medium` / `low` |
-| CodeRabbit, Copilot, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | **Not parsed** — findings carry `unknown` severity |
+| CodeRabbit, Copilot, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
 
 `--list-reviewers` discovers which bots have commented on your PR; `--reviewer` persists your choice per PR.
 
-**Severity caveat, stated plainly:** only two marker conventions are parsed today — Codex's `![P0]`–`![P3]` and the `![critical]`–`![low]` alt-text form Gemini uses. For any other bot every finding is `unknown`, so `--min-severity high` keeps everything and `--drop-unknown-severity` drops everything. Use severity filtering only with a bot whose format is parsed.
+**Severity caveat, stated plainly:** three marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, and reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers). Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
 
 ## Why this exists
 

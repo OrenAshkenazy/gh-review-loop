@@ -2449,6 +2449,7 @@ def finding_fingerprint(thread: dict[str, Any]) -> str:
     comments = _iter_comments(thread)
     first_comment = comments[0].get("body") if comments and isinstance(comments[0], dict) else None
     body = first_comment if isinstance(first_comment, str) else ""
+    body = PLAIN_PRIORITY_RE.sub("", body, count=1)  # drop leading text priority
     body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)  # drop severity image
     body = re.sub(r"\s+", " ", body).strip().lower()
     return hashlib.sha1(f"{path}\n{body[:1000]}".encode()).hexdigest()[:16]
