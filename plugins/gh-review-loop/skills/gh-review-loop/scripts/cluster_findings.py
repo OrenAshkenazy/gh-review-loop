@@ -26,7 +26,7 @@ import sweep_siblings
 # collapses the Patterns block's severity ordering.
 _SEVERITY_RE = re.compile(r"!\[(critical|high|medium|low)\]", re.IGNORECASE)
 _CODEX_PRIORITY_RE = re.compile(r"!\[(P[0-3])(?:\s+Badge)?\]", re.IGNORECASE)
-_PLAIN_PRIORITY_RE = re.compile(r"\A[ \t\r\n]*\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
+_PLAIN_PRIORITY_RE = re.compile(r"\A(?:[ \t]*\r?\n)* {0,3}\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
 _CODEX_PRIORITY_TO_SEVERITY = {"p0": "critical", "p1": "high", "p2": "medium", "p3": "low"}
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
@@ -201,15 +201,15 @@ def _severity(thread: Any) -> str:
         body = comment.get("body")
         if not isinstance(body, str):
             continue
+        plain_match = _PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return _CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
         match = _SEVERITY_RE.search(body)
         if match:
             return match.group(1).lower()
         codex_match = _CODEX_PRIORITY_RE.search(body)
         if codex_match:
             return _CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
-        plain_match = _PLAIN_PRIORITY_RE.match(body)
-        if plain_match:
-            return _CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
     return "unknown"
 
 
