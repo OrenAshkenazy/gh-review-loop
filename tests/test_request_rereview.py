@@ -1450,7 +1450,7 @@ class TestReviewRequestMain:
             raise request_rereview.ReviewRequestRejected("connection reset", reason="uncertain", http_status=None, retryable=False, requested_at=CREATED_AT)
 
         monkeypatch.setattr(request_rereview, "request_review", rejecting)
-        monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: {"created_at": CREATED_AT})
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -1468,7 +1468,7 @@ class TestReviewRequestMain:
             raise request_rereview.ReviewRequestRejected("connection reset", reason="uncertain", http_status=None, retryable=False, requested_at=CREATED_AT)
 
         monkeypatch.setattr(request_rereview, "request_review", rejecting)
-        monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: None)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 

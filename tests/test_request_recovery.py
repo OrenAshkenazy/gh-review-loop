@@ -70,6 +70,150 @@ def test_old_pending_after_cancellation_does_not_certify_or_post_a_replacement(m
     assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
 
 
+def completed_review():
+    return {"user": {"type": "Bot", "login": LOGIN}, "state": "COMMENTED", "commit_id": HEAD, "submitted_at": AT}
+
+
+def request_event():
+    return {"id": 100, "event": "review_requested", "actor": {"login": "agent"}, "requested_reviewer": {"login": LOGIN}, "created_at": AT}
+
+
+@pytest.mark.parametrize("clock_skew", [False, True])
+@pytest.mark.parametrize("event_is_new", [False, True])
+def test_fast_completed_initial_review_requires_new_event_and_records_once(monkeypatch, clock_skew, event_is_new):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [] if event_is_new else [100])
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "ABSENT", "head": HEAD, "pending_since": None, "first_completed_review_at": None,
+    })
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if "POST" in cmd:
+            return result(cmd, {"requested_reviewers": []})
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            data = registration()
+            data["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"] = []
+            return result(cmd, data)
+        if any("/reviews" in argument for argument in cmd):
+            review = completed_review()
+            if clock_skew:
+                review["submitted_at"] = "2026-10-12T19:59:59Z"
+            return result(cmd, [review])
+        if any("/timeline" in argument for argument in cmd):
+            event = request_event()
+            if clock_skew:
+                event["created_at"] = "2026-10-12T19:59:59Z"
+            return result(cmd, [event])
+        return result(cmd, {"state": "open", "head": {"sha": HEAD}})
+
+    monkeypatch.setattr(rr.subprocess, "run", runner)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
+    payload = rr._locked_request(args)
+    assert payload["posted"] is (True if event_is_new else None) and sum("POST" in cmd for cmd in calls) == 1
+    entry = rr.load_state()[KEY]
+    if not event_is_new:
+        assert entry["review_request_in_flight"]["request_event_ids"] == [100]
+        assert entry.get("run", {}).get("rereviews_posted", 0) == 0
+        assert rr._locked_request(args)["status"] == "request_in_flight"
+        assert sum("POST" in cmd for cmd in calls) == 1
+        return
+    assert "review_request_in_flight" not in entry and entry["run"]["rereviews_posted"] == 1
+    assert entry["review_requests"][0]["initial_review"] is True
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == []
+
+
+@pytest.mark.parametrize("problem", ["draft", "old_head", "wrong_bot", "alias_bot", "human", "missing_state", "missing_time", "old_review", "old_event", "wrong_actor", "no_event", "reviews_unreadable", "timeline_unreadable"])
+def test_fast_completion_requires_new_selected_bot_and_request_provenance(problem):
+    review = completed_review()
+    event = request_event()
+    if problem == "draft":
+        review["state"] = "PENDING"
+    elif problem == "old_head":
+        review["commit_id"] = "b" * 40
+    elif problem in ("wrong_bot", "alias_bot"):
+        review["user"]["login"] = "other[bot]" if problem == "wrong_bot" else "copilot[bot]"
+    elif problem == "human":
+        review["user"]["type"] = "User"
+    elif problem == "missing_state":
+        review.pop("state")
+    elif problem == "missing_time":
+        review.pop("submitted_at")
+    elif problem == "old_review":
+        review["submitted_at"] = "2026-10-12T19:59:59Z"
+    elif problem == "wrong_actor":
+        event["actor"]["login"] = "other"
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            data = registration()
+            data["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"] = []
+            return result(cmd, data)
+        if any("/reviews" in argument for argument in cmd):
+            return result(cmd, [review], 1 if problem == "reviews_unreadable" else 0)
+        assert any("/timeline" in argument for argument in cmd)
+        return result(cmd, [] if problem == "no_event" else [event], 1 if problem == "timeline_unreadable" else 0)
+
+    assert rr._registered_review("owner/repo", 1, LOGIN, HEAD, runner, actor="agent", request_event_ids=[100] if problem == "old_event" else []) is False
+    assert all("POST" not in cmd and "DELETE" not in cmd for cmd in calls)
+
+
+@pytest.mark.parametrize("first_completed", [None, "2026-10-12T19:00:00Z"])
+def test_unknown_actor_prevents_stale_request_cancellation(monkeypatch, first_completed):
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "STALE_PENDING", "head": HEAD, "pending_since": AT, "first_completed_review_at": first_completed,
+    })
+    monkeypatch.setattr(rr, "gh_login", lambda: None)
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
+    monkeypatch.setattr(rr, "cancel_review_request", lambda *a, **kw: pytest.fail("unknown actor must not DELETE"))
+    monkeypatch.setattr(rr, "request_review", lambda *a, **kw: pytest.fail("unknown actor must not POST"))
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
+    payload = rr._locked_request(args)
+    assert payload["status"] == "uncountable_actor" and payload["posted"] is False
+    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+
+
+@pytest.mark.parametrize("snapshot", [None, [], [{"event": "review_requested"}], [{"id": True, "event": "review_requested"}]])
+def test_request_event_snapshot_refuses_unreadable_or_missing_ids(monkeypatch, snapshot):
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: snapshot)
+    assert rr._snapshot_request_event_ids("owner/repo", 1) == ([] if snapshot == [] else None)
+
+
+def test_unknown_provenance_prevents_stale_cancellation_and_post(monkeypatch):
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "STALE_PENDING", "head": HEAD, "pending_since": AT, "first_completed_review_at": None,
+    })
+    monkeypatch.setattr(rr, "gh_login", lambda: "agent")
+    monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: None)
+    monkeypatch.setattr(rr, "cancel_review_request", lambda *a, **kw: pytest.fail("unknown snapshot must not DELETE"))
+    monkeypatch.setattr(rr, "request_review", lambda *a, **kw: pytest.fail("unknown snapshot must not POST"))
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
+    payload = rr._locked_request(args)
+    assert payload["status"] == "uncountable_provenance" and payload["posted"] is False
+    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+
+
+@pytest.mark.parametrize("new_event", [False, True])
+def test_reconciliation_uses_persisted_event_baseline_despite_clock_skew(monkeypatch, new_event):
+    marker = native_marker()
+    marker["request_event_ids"] = [99]
+    rr._mark_request_in_flight("owner/repo", 1, marker)
+    monkeypatch.setattr(rr, "request_state", lambda *a: {"state": "COMPLETED_HEAD", "head": HEAD})
+    event = request_event()
+    event.update(id=100 if new_event else 99, created_at="2026-10-12T19:59:59Z")
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [event])
+    review = completed_review()
+    review["submitted_at"] = event["created_at"]
+    monkeypatch.setattr(rr, "_all_reviews", lambda *a: [review])
+    payload = rr._locked_request(reconcile_args())
+    assert payload["posted"] is (True if new_event else None)
+    assert bool(rr.load_state()[KEY].get("review_request_in_flight")) is not new_event
+
+
 @pytest.mark.parametrize("failure,uncertain", [("HTTP 403", False), ("HTTP 422", False), ("HTTP 503", True), ("connection reset", True), ("malformed", True), ("head", False)])
 def test_comment_failures_keep_only_uncertain_markers_and_never_repost(monkeypatch, failure, uncertain):
     stub_cap_check_known_under_cap(monkeypatch)

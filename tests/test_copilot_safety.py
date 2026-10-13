@@ -21,6 +21,7 @@ def stub_request_state(monkeypatch, state="ABSENT"):
     })
     monkeypatch.setattr(rr, "gh_login", lambda: "agent")
     monkeypatch.setattr(rr, "effective_cap", lambda *args: 3)
+    monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *args: [])
     monkeypatch.setattr(rr, "count_agent_pings", lambda *args: pytest.fail("Copilot must not post or count mention comments"))
 
 

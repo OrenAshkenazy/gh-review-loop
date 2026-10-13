@@ -68,7 +68,8 @@ def stub_cap_check_known_under_cap(monkeypatch):
     `gh`. Since an unknown count now refuses to post (an uncountable write is
     an uncapped write), "inert" means a *known* count of zero, not an unknown
     one. Unit tests of the counter pass an explicit runner and still reach the
-    real function.
+    real function. Native write snapshots are neutralized in the same way;
+    explicit-runner tests retain the real reader.
     """
     import request_rereview
 
@@ -81,3 +82,11 @@ def stub_cap_check_known_under_cap(monkeypatch):
 
     monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
     monkeypatch.setattr(request_rereview, "count_agent_pings", count_or_zero)
+    real_snapshot = request_rereview._snapshot_request_event_ids
+
+    def snapshot_or_empty(repo, pr, runner=None):
+        if runner is None:
+            return []
+        return real_snapshot(repo, pr, runner=runner)
+
+    monkeypatch.setattr(request_rereview, "_snapshot_request_event_ids", snapshot_or_empty)

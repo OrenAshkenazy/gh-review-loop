@@ -891,6 +891,50 @@ def confirm_posted_after_uncertain(
     return False
 
 
+def _snapshot_request_event_ids(repo: str, pr: int, runner: Any = None) -> list[int] | None:
+    events = _timeline_events(repo, pr, runner or subprocess.run)
+    if events is None:
+        return None
+    ids = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        if event.get("event") == "review_requested":
+            if type(event.get("id")) is not int or event["id"] <= 0:
+                return None
+            ids.append(event["id"])
+    return sorted(set(ids))
+
+
+def _new_request_event(repo: str, pr: int, vendor: review_vendors.ReviewVendor, actor: str, baseline: Any, runner: Any) -> dict[str, Any] | None:
+    if not isinstance(baseline, list) or any(type(event_id) is not int or event_id <= 0 for event_id in baseline):
+        return None
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return None
+    prior = set(baseline)
+    for raw in events:
+        if not isinstance(raw, dict) or type(raw.get("id")) is not int or raw["id"] <= 0 or raw["id"] in prior:
+            continue
+        event = reviewer_resolver.normalize_request_event(raw)
+        if event and event["actor_login"] == actor and review_vendors.vendor_for(event["reviewer_login"]) is vendor and _parse_iso(event["created_at"]) is not None:
+            return event
+    return None
+
+
+def _completed_registration(reviews: list[dict[str, Any]], request_login: str, head: str, after: str) -> bool:
+    anchor = _parse_iso(after)
+    if anchor is None:
+        return False
+    return any(isinstance(review.get("user"), dict) and review["user"].get("type") == "Bot"
+               and review.get("state") in {"COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+               and isinstance(review["user"].get("login"), str)
+               and review["user"]["login"].casefold().removesuffix("[bot]") == request_login.casefold().removesuffix("[bot]")
+               and _review_commit(review) == head
+               and (submitted := _parse_iso(_review_submitted_at(review))) is not None and submitted >= anchor
+               for review in reviews if isinstance(review, dict))
+
+
 def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
     return {
         "status": "capped",
@@ -1058,7 +1102,7 @@ def post_rereview(
     return payload
 
 
-def _registered_review(repo: str, pr: int, request_login: str, expect_head: str | None, runner: Any) -> bool:
+def _registered_review(repo: str, pr: int, request_login: str, expect_head: str | None, runner: Any, *, actor: str | None = None, request_event_ids: list[int] | None = None) -> bool:
     owner, repo_name = parse_repo(repo)
     data = _gh_json(["gh", "api", "graphql", "-f", f"query={STATE_QUERY}",
                      "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"], runner)
@@ -1066,11 +1110,23 @@ def _registered_review(repo: str, pr: int, request_login: str, expect_head: str 
         pull = data["data"]["repository"]["pullRequest"]
         if data.get("errors") or (expect_head is not None and pull.get("headRefOid") != expect_head):
             return False
-        return any(isinstance(node, dict) and isinstance(reviewer := node.get("requestedReviewer"), dict)
-                   and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
-                   for node in pull["reviewRequests"]["nodes"])
+        if any(isinstance(node, dict) and isinstance(reviewer := node.get("requestedReviewer"), dict)
+               and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
+               for node in pull["reviewRequests"]["nodes"]):
+            return True
     except (KeyError, TypeError, AttributeError):
         return False
+    head = expect_head or pull.get("headRefOid")
+    vendor = review_vendors.vendor_for(request_login)
+    if not actor or request_event_ids is None or vendor is None or not isinstance(head, str) or not head:
+        return False
+    event = _new_request_event(repo, pr, vendor, actor, request_event_ids, runner)
+    if event is None:
+        return False
+    reviews = _all_reviews(repo, pr, runner)
+    if reviews is None:
+        return False
+    return _completed_registration(reviews, request_login, head, event["created_at"])
 
 
 def request_review(
@@ -1082,6 +1138,8 @@ def request_review(
     expect_head: str | None = None,
     rerequest_ids: tuple[str, str] | None = None,
     registration_head: str | None = None,
+    request_actor: str | None = None,
+    request_event_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Add ``request_login`` as a requested reviewer and return the result payload.
 
@@ -1165,7 +1223,7 @@ def request_review(
             for attempt in range(2):
                 if attempt:
                     time.sleep(1)
-                if _registered_review(repo, pr, request_login, registration_head or expect_head, runner):
+                if _registered_review(repo, pr, request_login, registration_head or expect_head, runner, actor=request_actor, request_event_ids=request_event_ids):
                     registered = True
                     break
         if not registered:
@@ -1268,8 +1326,8 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
         return review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"])
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
     # needs. With no completed vendor review there is nothing to count: zero
-    # would mean "no first review", not "no re-reviews", and a cap of 0 or an
-    # unresolvable `gh api user` would block the very first request.
+    # would mean "no first review", not "no re-reviews". The cap must not
+    # block the first request; actor and recovery prerequisites still apply.
     if not args.no_cap_check and state["first_completed_review_at"]:
         cap = effective_cap(args.max_rereview_requests)
         used = count_agent_review_requests(
@@ -1279,6 +1337,14 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
             return uncountable_count_payload(args.repo, args.pr, cap)
         if used >= cap:
             return capped_payload(args.repo, args.pr, used, cap)
+    actor = gh_login() if not args.dry_run else None
+    if not args.dry_run and not actor:
+        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
+    event_ids = _snapshot_request_event_ids(args.repo, args.pr) if not args.dry_run else None
+    if not args.dry_run and event_ids is None:
+        return {"status": "uncountable_provenance", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish request-event IDs for recovery; nothing was cancelled or posted."}
     # The open request is withdrawn only once the cap has cleared, so a refusal
     # never leaves the PR with nothing pending. A dry run withdraws nothing.
     if state["state"] == "STALE_PENDING" and not args.dry_run:
@@ -1293,22 +1359,18 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
             return already_reviewed_payload(args.repo, args.pr, reviewer, refreshed["head"])
         if refreshed["state"] != "ABSENT":
             return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
-    actor = gh_login() if not args.dry_run else None
-    if not args.dry_run and not actor:
-        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
-                "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
     if not args.dry_run:
         _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso(), "head": state["head"],
                                                   "actor": actor, "kind": "review_request",
+                                                  "request_event_ids": event_ids,
                                                   "initial_review": not state["first_completed_review_at"]})
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"])
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"], request_actor=actor, request_event_ids=event_ids)
     except ReviewRequestRejected as exc:
         if not exc.outcome_unknown and not args.dry_run:
             _mark_request_in_flight(args.repo, args.pr, None)
-        if exc.outcome_unknown and exc.allow_timeline_confirmation and confirm_posted_after_uncertain(
-            args.repo, args.pr, vendor, actor, exc.requested_at
-        ):
+        event = _new_request_event(args.repo, args.pr, vendor, actor, event_ids, subprocess.run) if exc.outcome_unknown and exc.allow_timeline_confirmation else None
+        if event is not None:
             payload = {
                 "created_at": exc.requested_at,
                 "repo": args.repo,
@@ -1533,13 +1595,26 @@ def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
         if not isinstance(head, str) or (args.expect_head and args.expect_head != head):
             return payload
         state = request_state(args.repo, args.pr, vendor)
-        if state is None or state["head"] != head or not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
+        if state is None or state["head"] != head:
+            return payload
+        event = None
+        if "request_event_ids" in marker:
+            event = _new_request_event(args.repo, args.pr, vendor, actor, marker["request_event_ids"], subprocess.run)
+            if event is None:
+                return payload
+        elif not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
             return payload
         if state["state"] not in ("PENDING", "STALE_PENDING"):
             reviews = _all_reviews(args.repo, args.pr, subprocess.run)
-            if reviews is None or not any(review_vendors.vendor_for(_review_author(review)) is vendor
-                                          and review.get("state") != "PENDING" and _review_commit(review) == head
-                                          and _review_submitted_at(review) >= at for review in reviews):
+            if reviews is None:
+                return payload
+            if event is not None:
+                completed = _completed_registration(reviews, reviewer, head, event["created_at"])
+            else:
+                completed = any(review_vendors.vendor_for(_review_author(review)) is vendor
+                                and review.get("state") != "PENDING" and _review_commit(review) == head
+                                and _review_submitted_at(review) >= at for review in reviews)
+            if not completed:
                 return payload
         confirmed["kind"] = "review_request"
     elif marker.get("kind") == "comment" and isinstance(marker.get("phrase"), str):
