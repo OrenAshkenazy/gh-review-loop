@@ -22,7 +22,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
-- **Review writes confirm registration and recover without duplicate requests.** Initial Copilot REST success is checked against the selected reviewer, with bounded GraphQL registration reads and completed-review/request-event evidence for fast reviews. Actor lookup precedes stale cancellation. Definite comment failures clear in-flight markers; uncertain writes retain them and can be recorded once using `--reconcile` and later GitHub evidence.
+- **Review writes confirm registration and recover without duplicate requests.** Initial Copilot REST success is checked against the selected reviewer, with bounded GraphQL registration reads and completed-review/request-event evidence for fast reviews. Actor lookup precedes stale cancellation, and refreshed PR state and implicit head guards protect its replacement. Definite comment failures clear in-flight markers; uncertain writes retain them and can be recorded once using `--reconcile` and new GitHub comment/event IDs without relying on the local clock. Windows state paths use the native user profile instead of MSYS `HOME`.
 
 - **Concurrent local runs cannot race publication and re-review.** A per-PR lock covers verification, push, and the publisher's automatic review request; standalone requests share it. State mutations serialize and replace the file atomically, preserve other PRs, and refuse corrupt existing state. Failed requests after push retain the confirmed publication result.
 

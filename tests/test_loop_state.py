@@ -94,11 +94,21 @@ class TestStateDirRename:
     def _home(monkeypatch, tmp_path):
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         return tmp_path / ".config"
 
     def test_env_override_wins(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path / "custom"))
         assert loop_state.state_dir() == tmp_path / "custom"
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_config_root_uses_native_windows_home_and_posix_home(self, tmp_path, monkeypatch, platform):
+        profile = tmp_path / "profile"
+        monkeypatch.setattr(loop_state.sys, "platform", platform)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: profile))
+        monkeypatch.setenv("HOME", "/c/Users/alice")
+        expected = profile if platform == "win32" else Path("/c/Users/alice")
+        assert loop_state._config_root() == expected / ".config"
 
     def test_fresh_install_resolves_to_new_name(self, tmp_path, monkeypatch):
         cfg = self._home(monkeypatch, tmp_path)
@@ -157,6 +167,7 @@ class TestStateDirRename:
         cfg = tmp_path / ".config"
         (cfg / "gh-gemini-review-loop").mkdir(parents=True)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path / "custom"))
         assert loop_state.migrate_legacy_state_dir() is False
         assert not (cfg / "gh-gemini-review-loop").is_symlink()
@@ -320,6 +331,7 @@ class TestSentinelTtl:
         # inspect it too — not just state_dir()'s preferred new dir.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         new_dir = tmp_path / ".config" / "gh-review-loop"
         legacy_dir = tmp_path / ".config" / "gh-gemini-review-loop"
         new_dir.mkdir(parents=True)
@@ -339,6 +351,7 @@ class TestSentinelTtl:
         # means a loop is active — the gate must NOT stand down.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         new_dir = tmp_path / ".config" / "gh-review-loop"
         legacy_dir = tmp_path / ".config" / "gh-gemini-review-loop"
         new_dir.mkdir(parents=True)
@@ -378,6 +391,7 @@ class TestSentinelTtl:
         # next hook fire once the stale marker is gone.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         new_dir = tmp_path / ".config" / "gh-review-loop"
         legacy_dir = tmp_path / ".config" / "gh-gemini-review-loop"
         new_dir.mkdir(parents=True)

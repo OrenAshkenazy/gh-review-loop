@@ -647,11 +647,23 @@ def _gh_json(cmd: list[str], runner: Any) -> Any:
     if result.returncode != 0:
         return None
     if "--paginate" in cmd:
+        if not (result.stdout or "").strip():
+            return None
         return parse_paginated_json(result.stdout)
     try:
         return json.loads(result.stdout or "null")
     except json.JSONDecodeError:
         return None
+
+
+def _snapshot_comment_ids(repo: str, pr: int, runner: Any = None) -> list[int] | None:
+    owner, repo_name = parse_repo(repo)
+    comments = _gh_json(["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{pr}/comments"], runner or subprocess.run)
+    if not isinstance(comments, list):
+        return None
+    if any(not isinstance(comment, dict) or type(comment.get("id")) is not int or comment["id"] <= 0 for comment in comments):
+        return None
+    return sorted({comment["id"] for comment in comments})
 
 
 def _review_author(review: Any) -> str | None:
@@ -1324,6 +1336,7 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
         return already_reviewed_payload(args.repo, args.pr, reviewer, state["head"])
     if state["state"] == "PENDING":
         return review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"])
+    original_state = state["state"]
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
     # needs. With no completed vendor review there is nothing to count: zero
     # would mean "no first review", not "no re-reviews". The cap must not
@@ -1348,7 +1361,7 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
     # The open request is withdrawn only once the cap has cleared, so a refusal
     # never leaves the PR with nothing pending. A dry run withdraws nothing.
     if state["state"] == "STALE_PENDING" and not args.dry_run:
-        if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head):
+        if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head or state["head"]):
             return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
         refreshed = request_state(args.repo, args.pr, vendor)
         if refreshed is None:
@@ -1359,13 +1372,21 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
             return already_reviewed_payload(args.repo, args.pr, reviewer, refreshed["head"])
         if refreshed["state"] != "ABSENT":
             return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
+        if not args.no_cap_check and refreshed["first_completed_review_at"] != state["first_completed_review_at"] and refreshed["first_completed_review_at"]:
+            cap = effective_cap(args.max_rereview_requests)
+            used = count_agent_review_requests(args.repo, args.pr, vendor, actor, refreshed["first_completed_review_at"])
+            if used is None:
+                return uncountable_count_payload(args.repo, args.pr, cap)
+            if used >= cap:
+                return capped_payload(args.repo, args.pr, used, cap)
+        state = refreshed
     if not args.dry_run:
         _mark_request_in_flight(args.repo, args.pr, {"reviewer": reviewer, "at": utc_now_iso(), "head": state["head"],
                                                   "actor": actor, "kind": "review_request",
                                                   "request_event_ids": event_ids,
                                                   "initial_review": not state["first_completed_review_at"]})
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head, rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"], request_actor=actor, request_event_ids=event_ids)
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head or state["head"], rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"], request_actor=actor, request_event_ids=event_ids)
     except ReviewRequestRejected as exc:
         if not exc.outcome_unknown and not args.dry_run:
             _mark_request_in_flight(args.repo, args.pr, None)
@@ -1382,8 +1403,8 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
             }
         else:
             return rejected_payload(args.repo, args.pr, reviewer, exc)
-    payload["state"] = state["state"]
-    payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
+    payload["state"] = original_state
+    payload["replaced_stale_request"] = original_state == "STALE_PENDING"
     if payload.get("dry_run"):
         payload["would_post"] = True
     elif payload.get("posted") is not False:
@@ -1553,9 +1574,14 @@ def _request(args: argparse.Namespace) -> dict[str, Any]:
     if not args.dry_run and not actor:
         return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
                 "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
+    comment_ids = _snapshot_comment_ids(args.repo, args.pr) if not args.dry_run else None
+    if not args.dry_run and comment_ids is None:
+        return {"status": "uncountable_provenance", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish comment IDs for recovery; nothing was posted."}
     if not args.dry_run:
         _mark_request_in_flight(args.repo, args.pr, {"reviewer": trigger or mention_in(phrase) or reviewer_login,
-                                                  "at": utc_now_iso(), "actor": actor, "kind": "comment", "phrase": phrase})
+                                                  "at": utc_now_iso(), "actor": actor, "kind": "comment", "phrase": phrase,
+                                                  "comment_ids": comment_ids})
     try:
         payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
     except ReviewRequestRejected as exc:
@@ -1618,6 +1644,9 @@ def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
                 return payload
         confirmed["kind"] = "review_request"
     elif marker.get("kind") == "comment" and isinstance(marker.get("phrase"), str):
+        baseline = marker.get("comment_ids")
+        if "comment_ids" in marker and (not isinstance(baseline, list) or any(type(comment_id) is not int or comment_id <= 0 for comment_id in baseline)):
+            return payload
         owner, repo_name = parse_repo(args.repo)
         comments = _gh_json(["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{args.pr}/comments"], subprocess.run)
         if not isinstance(comments, list):
@@ -1625,7 +1654,8 @@ def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
         match = next((comment for comment in comments if isinstance(comment, dict)
                       and isinstance(comment.get("user"), dict) and comment["user"].get("login") == actor
                       and comment.get("body") == marker["phrase"] and _parse_iso(comment.get("created_at")) is not None
-                      and comment["created_at"] >= at and type(comment.get("id")) is int), None)
+                      and type(comment.get("id")) is int and comment["id"] > 0
+                      and (comment["id"] not in baseline if "comment_ids" in marker else comment["created_at"] >= at)), None)
         if match is None:
             return payload
         confirmed.update(created_at=match["created_at"], comment_id=match["id"], phrase=marker["phrase"])

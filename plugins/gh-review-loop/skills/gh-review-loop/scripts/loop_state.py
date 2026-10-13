@@ -49,7 +49,7 @@ LEGACY_STATE_DIR_NAME = "gh-gemini-review-loop"
 
 
 def _config_root() -> Path:
-    home = os.environ.get("HOME")
+    home = os.environ.get("HOME") if sys.platform != "win32" else None
     return (Path(home) if home else Path.home()) / ".config"
 
 

@@ -1227,7 +1227,7 @@ class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 
     @staticmethod
-    def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def", pending_since=None):
+    def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def" * 4, pending_since=None):
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: used)
         monkeypatch.setattr(
@@ -1303,6 +1303,8 @@ class TestReviewRequestMain:
 
         def runner(cmd, **kwargs):
             calls.append(cmd)
+            if cmd == ["gh", "api", "repos/acme/widget/pulls/159"]:
+                return _completed(cmd, {"state": "open", "head": {"sha": state["head"]}})
             assert cmd[:3] == ["gh", "api", "graphql"]
             assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
             return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
@@ -1310,7 +1312,7 @@ class TestReviewRequestMain:
         monkeypatch.setattr(request_rereview.subprocess, "run", runner)
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["posted"] is True
-        assert len(calls) == 1 and self._stamped(tmp_path) == 1
+        assert len(calls) == 2 and self._stamped(tmp_path) == 1
 
     def test_pending_state_posts_nothing_and_skips_the_cap(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
@@ -1344,7 +1346,7 @@ class TestReviewRequestMain:
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "head_mismatch"
         assert payload["posted"] is False
-        assert payload["expected_head"] == "zzz9999" and payload["head"] == "abc1234def"
+        assert payload["expected_head"] == "zzz9999" and payload["head"] == "abc1234def" * 4
 
     def test_stale_pending_cancels_the_open_request_before_reposting(self, monkeypatch, capsys):
         """GraphQL still lists the request, and the design evidence records

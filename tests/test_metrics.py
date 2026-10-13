@@ -25,6 +25,7 @@ class TestHelpers:
         # the machine running the tests — a fresh install writes the new name.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         result = metrics.runs_log_path()
         assert result.name == "runs.jsonl"
         assert "gh-review-loop" in str(result)
@@ -34,6 +35,7 @@ class TestHelpers:
         # Pre-rename state dir, not yet migrated: existing data stays readable.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         (tmp_path / ".config" / "gh-gemini-review-loop").mkdir(parents=True)
         assert "gh-gemini-review-loop" in str(metrics.runs_log_path())
 

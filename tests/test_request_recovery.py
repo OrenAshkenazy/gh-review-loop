@@ -333,3 +333,114 @@ def test_failed_receipt_save_can_be_reconciled_without_poisoning_complete_histor
         assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == (None if older_incomplete else [AT])
     else:
         assert rr.count_agent_pings("owner/repo", 1, "@codex", "agent", runner=lambda cmd, **kw: result(cmd, [])) == (None if older_incomplete else 1)
+
+
+@pytest.mark.parametrize("used", [0, 3, None])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_stale_replacement_carries_refreshed_state_and_cap_into_post_and_recovery(monkeypatch, used, uncertain):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
+    new_head = "b" * 40
+    old = {"state": "STALE_PENDING", "head": HEAD, "pending_since": AT,
+           "first_completed_review_at": None, "rerequest_ids": ("OLD_PR", "OLD_BOT")}
+    refreshed = {"state": "ABSENT", "head": new_head, "pending_since": None,
+                 "first_completed_review_at": AT, "rerequest_ids": ("NEW_PR", "NEW_BOT")}
+    states = iter([old, refreshed])
+    monkeypatch.setattr(rr, "request_state", lambda *a: next(states))
+    cancelled, counted, posted = [], [], []
+    monkeypatch.setattr(rr, "cancel_review_request", lambda *a, **kw: cancelled.append(kw["expect_head"]) or True)
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: counted.append(a[3:]) or used)
+    monkeypatch.setattr(rr, "_new_request_event", lambda *a: None)
+
+    def post(*args, **kwargs):
+        posted.append(kwargs)
+        marker = rr.load_state()[KEY]["review_request_in_flight"]
+        assert marker["head"] == new_head and marker["initial_review"] is False
+        if uncertain:
+            raise rr.ReviewRequestRejected("connection lost", requested_at=AT)
+        return {"posted": True, "created_at": AT}
+
+    monkeypatch.setattr(rr, "request_review", post)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--max-rereview-requests", "3"])
+    payload = rr._locked_request(args)
+    assert cancelled == [HEAD] and counted == [("agent", AT)]
+    if used != 0:
+        assert payload["status"] == ("capped" if used == 3 else "uncountable_count")
+        assert not posted and not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+        return
+    assert posted[0]["expect_head"] == new_head and posted[0]["registration_head"] == new_head
+    assert posted[0]["rerequest_ids"] == ("NEW_PR", "NEW_BOT")
+    if uncertain:
+        assert payload["posted"] is None
+        monkeypatch.setattr(rr, "request_state", lambda *a: {"state": "PENDING", "head": new_head})
+        monkeypatch.setattr(rr, "_new_request_event", lambda *a: request_event())
+        assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
+    else:
+        assert payload["state"] == "STALE_PENDING" and payload["replaced_stale_request"] is True
+    entry = rr.load_state()[KEY]
+    assert len(posted) == 1 and "review_request_in_flight" not in entry
+    assert not entry["review_requests"][0].get("initial_review") and entry["run"]["rereviews_posted"] == 1
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == [AT]
+
+
+@pytest.mark.parametrize("problem", [None, "old_id", "actor", "phrase", "time", "id", "baseline"])
+def test_comment_id_recovery_tolerates_clock_skew_but_rejects_unrelated_evidence(monkeypatch, problem):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr, "_snapshot_comment_ids", lambda *a: [99])
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
+    posted = []
+
+    def post(*a, **kw):
+        posted.append(True)
+        raise rr.ReviewRequestRejected("connection lost", requested_at=AT)
+
+    monkeypatch.setattr(rr, "post_rereview", post)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "codex"])
+    assert rr._locked_request(args)["posted"] is None
+    marker = rr.load_state()[KEY]["review_request_in_flight"]
+    assert marker["comment_ids"] == [99]
+    assert rr._locked_request(args)["status"] == "request_in_flight" and len(posted) == 1
+    if problem == "baseline":
+        marker["comment_ids"] = [True]
+        state = rr.load_state()
+        state[KEY]["review_request_in_flight"] = marker
+        loop_state.save_sticky_state(state)
+    comment = {"id": 99 if problem == "old_id" else True if problem == "id" else 100,
+               "user": {"login": "other" if problem == "actor" else "agent"},
+               "body": "@codex other" if problem == "phrase" else "@codex review",
+               "created_at": "invalid" if problem == "time" else "2026-10-12T19:59:59Z"}
+    monkeypatch.setattr(rr, "_gh_json", lambda *a: [comment])
+    payload = rr._locked_request(reconcile_args())
+    if problem is not None:
+        assert payload["status"] == "request_in_flight" and rr.load_state()[KEY]["review_request_in_flight"]
+        return
+    assert payload["status"] == "request_reconciled" and payload["created_at"] == comment["created_at"]
+    entry = rr.load_state()[KEY]
+    assert entry["review_requests"][0]["comment_id"] == 100 and entry["run"]["rereviews_posted"] == 1
+    assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight" and len(posted) == 1
+
+
+@pytest.mark.parametrize("data", [[], [{"id": 2}, {"id": 1}, {"id": 2}], [{"id": True}], [{"id": 0}], [{}], [None], {}])
+def test_comment_snapshot_requires_complete_positive_ids(data):
+    snapshot = rr._snapshot_comment_ids("owner/repo", 1, runner=lambda cmd, **kw: result(cmd, data))
+    assert snapshot == ([] if data == [] else [1, 2] if len(data) == 3 else None)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("stdout", ["", " ", "[]\n[", "{}"])
+def test_provenance_snapshot_rejects_blank_or_malformed_paginated_output(native, stdout):
+    reader = rr._snapshot_request_event_ids if native else rr._snapshot_comment_ids
+    assert reader("owner/repo", 1, runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout, "")) is None
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unreadable_comment_snapshot_blocks_post_but_dry_run_skips_snapshot(monkeypatch, dry_run):
+    stub_cap_check_known_under_cap(monkeypatch)
+    snapshots, posts = [], []
+    monkeypatch.setattr(rr, "_snapshot_comment_ids", lambda *a: snapshots.append(True) or None)
+    monkeypatch.setattr(rr, "post_rereview", lambda *a, **kw: posts.append(kw) or {"posted": False, "dry_run": True})
+    argv = ["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "codex"] + (["--dry-run"] if dry_run else [])
+    payload = rr._locked_request(rr.build_parser().parse_args(argv))
+    assert len(snapshots) == (0 if dry_run else 1) and len(posts) == (1 if dry_run else 0)
+    assert payload.get("status") == (None if dry_run else "uncountable_provenance")
+    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")

@@ -104,6 +104,7 @@ def count(*a, **kw):
 rr.count_agent_pings = count
 rr.count_agent_review_requests = count
 rr._snapshot_request_event_ids = lambda *a: []
+rr._snapshot_comment_ids = lambda *a: []
 rr.request_state = lambda *a: {'head': 'abc', 'state': 'ABSENT', 'pending_since': None, 'first_completed_review_at': '2026-10-10T00:00:00Z'}
 def post(*a, **kw):
     time.sleep(.2)
@@ -192,6 +193,7 @@ def test_posted_request_with_stamp_failure_remains_known_and_blocks_retry(tmp_pa
     monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
     monkeypatch.setattr(rr, "gh_login", lambda: "agent")
     monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [])
+    monkeypatch.setattr(rr, "_snapshot_comment_ids", lambda *a: [])
     calls = []
 
     def post(*args, **kwargs):
