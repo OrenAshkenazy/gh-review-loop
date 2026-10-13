@@ -81,6 +81,8 @@ SEVERITY_RE = re.compile(r"!\[(critical|high|medium|low)\]", re.IGNORECASE)
 # Codex marks findings with a shields.io priority badge whose alt text is the
 # priority. Example: ![P2 Badge](https://img.shields.io/badge/P2-yellow...)
 CODEX_PRIORITY_RE = re.compile(r"!\[(P[0-3])(?:\s+Badge)?\]", re.IGNORECASE)
+# Some reviewers prefix findings with a plain [P0]–[P3] text marker.
+PLAIN_PRIORITY_RE = re.compile(r"\A[ \t\r\n]*\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
 CODEX_PRIORITY_TO_SEVERITY = {
     "p0": "critical",
     "p1": "high",
@@ -613,6 +615,9 @@ def thread_severity(thread: dict[str, Any]) -> str:
         codex_match = CODEX_PRIORITY_RE.search(body)
         if codex_match:
             return CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+        plain_match = PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
     return "unknown"
 
 
