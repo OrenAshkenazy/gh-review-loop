@@ -113,7 +113,7 @@ This plugin does not include telemetry.
 
 It does not send analytics, usage events, crash reports, repository names, usernames, prompts, PR content, or command output to the plugin author.
 
-Workflow metrics (the per-run summary and the `--stats` aggregate) are generated and stored locally by default and are never exported. There is no remote export path; any future remote export would require explicit user configuration.
+Detailed run records and the `--stats` aggregate are stored locally. Loop receipt summaries are posted to GitHub and include counts, repository-relative finding paths, verification check names, and results. Verification command lines and runner output remain local because they can contain machine paths or private arguments.
 
 ## User controls
 

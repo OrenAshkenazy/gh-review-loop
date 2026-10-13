@@ -656,10 +656,9 @@ def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
 def format_suite_block(verification_details: dict[str, Any] | None) -> str:
     """One line per detected verification check, or '' when none.
 
-    Surfaces the repo-aware test toolset (e.g. ``uv run pytest``) that
-    ``run_profile.py`` detected, so it is visible in the chat receipt instead
-    of buried in the collapsed profile-runner JSON. ``verification_details`` is
-    the parsed ``ProfileRunResult.to_details()`` dict.
+    Receipts publish check names and results. Command lines can contain local
+    paths or private arguments, so they stay in local verification details.
+    ``verification_details`` is the parsed ``ProfileRunResult.to_details()`` dict.
     """
     if not isinstance(verification_details, dict):
         return ""
@@ -670,11 +669,10 @@ def format_suite_block(verification_details: dict[str, Any] | None) -> str:
     for check in checks:
         if not isinstance(check, dict):
             continue
-        command = check.get("command", "?")
         name = check.get("name", "?")
         scope = "required" if check.get("required") else "optional"
         status = check.get("status", "?")
-        lines.append(f"  - {command}  ({name}, {scope}) → {status}")
+        lines.append(f"  - {name} ({scope}) → {status}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 

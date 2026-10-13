@@ -73,7 +73,7 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 |---|---|---|---|
 | Codex (`chatgpt-codex-connector`) | Built-in, full support. Offered first on an unconfigured PR because it reviews on request, so accepting starts a cycle immediately | `@codex review` | `P0`–`P3`, normalized |
 | Gemini Code Assist | Built-in, full support. Needs the **enterprise** GitHub app ([consumer app shut down](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review)) | `@gemini-code-assist please review…` | `critical` / `high` / `medium` / `low` |
-| GitHub Copilot (`copilot-pull-request-reviewer`) | Built-in, full support. The loop asks via the GitHub reviewer-request API, never a comment, and refuses to re-ask while a request is still pending or the current head is already reviewed | Review request (`gh api … /requested_reviewers`) | `High` / `Medium` / `Low` from the review overview, per head commit |
+| GitHub Copilot (`copilot-pull-request-reviewer`) | Built-in, full support. The loop asks via the GitHub reviewer-request API, never a comment, and refuses to re-ask while a request is still pending or the current head is already reviewed | Initial request: REST `/requested_reviewers`; re-review: GraphQL `rerequestReviews` | `High` / `Medium` / `Low` from the review overview, per head commit |
 | CodeRabbit (`coderabbitai`) | Built-in | `@coderabbitai review` | `Critical` / `Major` / `Minor`, normalized |
 | Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | **Not parsed** — findings carry `unknown` severity |
 

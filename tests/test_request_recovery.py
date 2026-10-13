@@ -444,3 +444,62 @@ def test_unreadable_comment_snapshot_blocks_post_but_dry_run_skips_snapshot(monk
     assert len(snapshots) == (0 if dry_run else 1) and len(posts) == (1 if dry_run else 0)
     assert payload.get("status") == (None if dry_run else "uncountable_provenance")
     assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("expected_head", [None, HEAD, "b" * 40])
+def test_fresh_native_event_reconciles_after_head_move_without_current_registration(monkeypatch, initial, expected_head):
+    marker = native_marker()
+    marker.update(request_event_ids=[99], initial_review=initial)
+    rr._mark_request_in_flight("owner/repo", 1, marker)
+    event = request_event()
+    event["created_at"] = "2026-10-12T19:59:59Z"
+    monkeypatch.setattr(rr, "request_state", lambda *a: pytest.fail("past request proof is independent of current PR state"))
+    monkeypatch.setattr(rr, "_all_reviews", lambda *a: pytest.fail("event proof needs no review-completion read"))
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [event])
+    args = reconcile_args(*(["--expect-head", expected_head] if expected_head else []))
+    payload = rr._locked_request(args)
+    assert payload["status"] == "request_reconciled" and payload["created_at"] == event["created_at"]
+    entry = rr.load_state()[KEY]
+    assert bool(entry["review_requests"][0].get("initial_review")) is initial
+    assert entry["run"]["rereviews_posted"] == 1 and "review_request_in_flight" not in entry
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([] if initial else [event["created_at"]])
+    assert rr._locked_request(args)["status"] == "no_request_in_flight"
+
+
+@pytest.mark.parametrize("problem", ["old_event", "actor", "vendor", "time", "baseline"])
+def test_fresh_native_reconciliation_requires_exact_provenance(monkeypatch, problem):
+    marker = native_marker()
+    marker["request_event_ids"] = [True] if problem == "baseline" else [100] if problem == "old_event" else [99]
+    rr._mark_request_in_flight("owner/repo", 1, marker)
+    event = request_event()
+    if problem == "actor":
+        event["actor"]["login"] = "other"
+    elif problem == "vendor":
+        event["requested_reviewer"]["login"] = "other[bot]"
+    elif problem == "time":
+        event["created_at"] = "invalid"
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [event])
+    monkeypatch.setattr(rr, "request_state", lambda *a: pytest.fail("do not fall back from malformed ID provenance"))
+    assert rr._locked_request(reconcile_args())["status"] == "request_in_flight"
+    assert rr.load_state()[KEY]["review_request_in_flight"] == marker
+
+
+def test_fresh_native_event_retains_marker_on_record_failure_and_records_once_on_retry(monkeypatch):
+    marker = native_marker()
+    marker.update(request_event_ids=[99], initial_review=False)
+    rr._mark_request_in_flight("owner/repo", 1, marker)
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [request_event()])
+    monkeypatch.setattr(rr, "request_state", lambda *a: pytest.fail("new event evidence must not read current head"))
+    real_save = loop_state.save_sticky_state
+
+    def fail_save(state):
+        raise OSError("simulated atomic replacement failure")
+
+    monkeypatch.setattr(loop_state, "save_sticky_state", fail_save)
+    assert rr._locked_request(reconcile_args())["status"] == "state_record_failed"
+    assert rr.load_state()[KEY]["review_request_in_flight"] == marker
+    monkeypatch.setattr(loop_state, "save_sticky_state", real_save)
+    assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
+    assert rr.load_state()[KEY]["run"]["rereviews_posted"] == 1
+    assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight"

@@ -1617,31 +1617,29 @@ def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
     confirmed = {"created_at": at, "repo": args.repo, "pr": args.pr, "reviewer": reviewer,
                  "posted": True, "reconciled": True}
     if marker.get("kind") == "review_request" and vendor is not None:
-        head = marker.get("head")
-        if not isinstance(head, str) or (args.expect_head and args.expect_head != head):
-            return payload
-        state = request_state(args.repo, args.pr, vendor)
-        if state is None or state["head"] != head:
-            return payload
-        event = None
         if "request_event_ids" in marker:
             event = _new_request_event(args.repo, args.pr, vendor, actor, marker["request_event_ids"], subprocess.run)
             if event is None:
                 return payload
-        elif not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
-            return payload
-        if state["state"] not in ("PENDING", "STALE_PENDING"):
-            reviews = _all_reviews(args.repo, args.pr, subprocess.run)
-            if reviews is None:
+            confirmed["created_at"] = event["created_at"]
+        else:
+            head = marker.get("head")
+            if not isinstance(head, str) or (args.expect_head and args.expect_head != head):
                 return payload
-            if event is not None:
-                completed = _completed_registration(reviews, reviewer, head, event["created_at"])
-            else:
+            state = request_state(args.repo, args.pr, vendor)
+            if state is None or state["head"] != head:
+                return payload
+            if not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
+                return payload
+            if state["state"] not in ("PENDING", "STALE_PENDING"):
+                reviews = _all_reviews(args.repo, args.pr, subprocess.run)
+                if reviews is None:
+                    return payload
                 completed = any(review_vendors.vendor_for(_review_author(review)) is vendor
                                 and review.get("state") != "PENDING" and _review_commit(review) == head
                                 and _review_submitted_at(review) >= at for review in reviews)
-            if not completed:
-                return payload
+                if not completed:
+                    return payload
         confirmed["kind"] = "review_request"
     elif marker.get("kind") == "comment" and isinstance(marker.get("phrase"), str):
         baseline = marker.get("comment_ids")

@@ -17,6 +17,8 @@ A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome
 
 **Automatic (the default since #86).** Every `--cycle-summary` and `--record-run` writes the full receipt into the sticky comment — one comment per PR, edited in place — and prints the one-line chat pointer. Status header: `RUNNING` per cycle, `DONE` at a clean terminal, `STOPPED` otherwise. No flag needed.
 
+Public verification summaries include check names, required/optional scope, and results. Command lines and runner output stay in local verification details; they can contain machine paths or private arguments.
+
 - The comment id is stored in `~/.config/gh-review-loop/state.json` (override dir with `GGRL_STATE_DIR`); subsequent invocations PATCH the same comment — no comment accretion.
 - Discovery fallback: if local state is missing, the script finds the receipt by its embedded marker and re-attaches.
 - Delivery fallback: if the comment write fails (network, permissions) or `--dry-run` is set, the full receipt prints to stdout instead — a receipt is never lost.
