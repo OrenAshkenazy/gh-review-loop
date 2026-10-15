@@ -104,7 +104,7 @@ def test_full_codex_cycle_fetches_fixes_re_asks_and_rechecks(loop, monkeypatch, 
 
     def fake_post(repo, pr, phrase, **kwargs):
         posted["phrase"] = phrase
-        return {"created_at": REREVIEW_AT, "repo": repo, "pr": pr, "phrase": phrase}
+        return {"created_at": REREVIEW_AT, "repo": repo, "pr": pr, "phrase": phrase, "comment_id": 2}
 
     monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
     assert request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--json"]) == 0

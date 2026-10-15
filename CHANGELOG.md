@@ -22,6 +22,10 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Publication checks use the validated push URL.** Separate fetch and push destinations no longer reject fork-only branches or falsely report a successful push as unconfirmed.
+
+- **Displayed comment-review capacity includes local receipts.** Collection and publication share comment-ID union logic, including full GitHub database IDs, while incomplete history and truncated comment pages are reported as incomplete counts.
+
 - **Event-confirmed uncertain requests record GitHub's timestamp.** Immediate native-request confirmation uses the matched timeline event time in the result and saved receipt, preserving cap accounting when the local clock differs.
 
 - **Copilot re-reviews require readable PR and bot IDs.** Missing or ambiguous IDs stop before stale-request cancellation, and refreshed IDs are checked again before posting; completed reviews never silently fall back to the initial REST request endpoint.

@@ -38,6 +38,8 @@ def checkout(tmp_path, monkeypatch):
     def local_git(root, *args):
         if args[:4] == ("remote", "get-url", "--push", "--all"):
             return "https://github.com/owner/fork.git\n"
+        if args[:3] == ("ls-remote", "--refs", "https://github.com/owner/fork.git"):
+            return original_git(root, *args[:2], str(remote), *args[3:])
         return original_git(root, *args)
 
     monkeypatch.setattr(pc, "git", local_git)
@@ -68,6 +70,22 @@ def test_publishes_only_verified_changes(checkout):
     assert result["head"] != head
     assert pc.git(root, "--git-dir", str(remote), "rev-parse", "refs/heads/fix").strip() == result["head"]
     assert pc.git(root, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("fetch_has_branch", [False, True])
+def test_separate_fetch_and_push_urls_validate_the_push_destination(checkout, tmp_path, fetch_has_branch):
+    root, push_remote, head, _, _ = checkout
+    fetch_remote = tmp_path / "fetch.git"
+    pc.git(root, "init", "--bare", str(fetch_remote))
+    if fetch_has_branch:
+        pc.git(root, "push", str(fetch_remote), "HEAD:refs/heads/fix")
+    pc.git(root, "remote", "set-url", "origin", str(fetch_remote))
+    pc.git(root, "remote", "set-url", "--push", "origin", str(push_remote))
+    result = publish(checkout)
+    assert result["published"] is True and result["head"] != head
+    assert pc.git(root, "--git-dir", str(push_remote), "rev-parse", "refs/heads/fix").strip() == result["head"]
+    fetch_tip = pc.git(root, "ls-remote", "--refs", str(fetch_remote), "refs/heads/fix").strip().split()
+    assert fetch_tip == ([head, "refs/heads/fix"] if fetch_has_branch else [])
 
 
 def test_dry_run_verifies_without_staging_committing_or_pushing(checkout):

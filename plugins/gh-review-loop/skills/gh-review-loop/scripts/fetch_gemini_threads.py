@@ -261,6 +261,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
       comments(last:100) {
         nodes {
           id
+          fullDatabaseId
           author { login __typename }
           body
           createdAt
@@ -935,7 +936,7 @@ def pagination_warnings(
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
     reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
-    if not review_request_count_complete(
+    if review_request_vendor and not review_request_count_complete(
         pull_request, review_request_vendor=review_request_vendor
     ):
         warnings.append(
@@ -1183,6 +1184,7 @@ def review_request_count_complete(
     review_request_vendor: bool = True,
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
+    comment_receipts: list[dict[str, Any]] | None | object = _PROVENANCE_UNSET,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1192,11 +1194,11 @@ def review_request_count_complete(
     look free and lets the loop run another fix/push cycle before
     request_rereview.py (which paginates) refuses the write.
 
-    Only review-request vendors count timeline events; a comment vendor's
-    count comes from PR comments, so for it this is always True.
+    Comment vendors need a complete PR-comment page and local receipt history.
     """
     if not review_request_vendor:
-        return True
+        comments = (pull_request.get("comments") or {}).get("nodes") or []
+        return comment_receipts is not None and len(comments) < PAGE_LIMIT_PR_COMMENTS
     # Provenance is the third thing the count rests on: without a local record
     # the loop cannot tell its own requests from the member's clicks. That only
     # makes the number a bound when there is something to attribute — with no
@@ -1428,6 +1430,7 @@ def rereview_requests(
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
     reviewer_login: str | None = None,
     loop_request_times: list[str] | None = None,
+    comment_receipts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The re-review requests the loop cap counts.
 
@@ -1464,7 +1467,7 @@ def rereview_requests(
             if login != agent_login:
                 continue
         out.append(comment)
-    return out
+    return reviewer_resolver.merge_comment_receipts(out, review_trigger_mention, comment_receipts)
 
 
 def gh_authenticated_login() -> str | None:
@@ -1654,6 +1657,16 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
         if isinstance(at, str) and at:
             out.append(at)
     return sorted(out)
+
+
+def loop_comment_receipts(pr: PullRequest) -> list[dict[str, Any]] | None:
+    state = load_sticky_state()
+    key = next((key for key in state if key.casefold() == _state_key(pr).casefold()), _state_key(pr))
+    entry = state.get(key, {})
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        return None
+    receipts = entry.get("review_requests", [])
+    return receipts if isinstance(receipts, list) else None
 
 
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
@@ -3383,11 +3396,12 @@ def render_markdown(
     baseline: dict[str, str] | None = None,
     full: bool = False,
     loop_requests: list[str] | None = None,
+    counted_requests: list[dict[str, Any]] | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
     # `loop_requests` is the local provenance record, supplied by the caller
     # that knows which PR this is; without it the count keeps the actor filter.
-    rereviews = rereview_requests(
+    rereviews = counted_requests if counted_requests is not None else rereview_requests(
         pr,
         review_trigger_mention=review_trigger_mention,
         reviewer_login=author,
@@ -4136,12 +4150,14 @@ def main() -> int:
                     "falling back to counting all re-review pings.",
                     file=sys.stderr,
                 )
+        comment_receipts = loop_comment_receipts(pr)
         rereviews = rereview_requests(
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=loop_request_times(pr, args.author),
+            comment_receipts=comment_receipts,
         )
         _limit_reached = len(rereviews) >= args.max_rereview_requests
         if args.resolve_outdated:
@@ -4191,6 +4207,8 @@ def main() -> int:
         review_request_vendor = (
             reviewer_resolver.trigger_kind_for(args.author) == "review_request"
         )
+        if not review_request_vendor and comment_receipts is None:
+            print("warning: local comment-request history is incomplete or in flight; re-review capacity is unknown.", file=sys.stderr)
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:
@@ -4350,6 +4368,7 @@ def main() -> int:
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=loop_request_times(pr, args.author),
+            comment_receipts=comment_receipts,
         )
         if len(rereviews) >= args.max_rereview_requests:
             print(
@@ -4747,6 +4766,7 @@ def main() -> int:
                             review_request_vendor=review_request_vendor,
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
+                            comment_receipts=comment_receipts,
                         ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
@@ -4796,6 +4816,7 @@ def main() -> int:
                 baseline=render_baseline,
                 full=args.full,
                 loop_requests=loop_request_times(pr, args.author),
+                counted_requests=rereviews,
             ),
             end="",
         )

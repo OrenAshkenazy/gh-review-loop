@@ -185,7 +185,7 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
     urls = git(root, "remote", "get-url", "--push", "--all", remote).splitlines()
     if len(urls) != 1 or remote_identity(urls[0]) != remote_identity(head_repo["html_url"]):
         raise PublishError("push remote must match the PR head repository exactly")
-    tip = git(root, "ls-remote", "--refs", remote, f"refs/heads/{branch}").strip().split()
+    tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
     if len(tip) != 2 or tip[0] != sha:
         raise PublishError("remote branch must match the PR head before publishing")
     return branch, sha
@@ -236,7 +236,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
         raise PublishError("push remote changed; local commit preserved, no push")
     loop_gate(repo, pr, max_rereview_requests)
     git(root, "push", remote, f"HEAD:refs/heads/{branch}")
-    tip = git(root, "ls-remote", "--refs", remote, f"refs/heads/{branch}").strip().split()
+    tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
     if len(tip) != 2 or tip[0] != commit:
         raise PublishError("push could not be confirmed; local commit preserved")
     payload.update(status="published", published=True, head=commit)

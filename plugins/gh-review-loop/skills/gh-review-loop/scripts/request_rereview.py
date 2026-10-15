@@ -603,36 +603,21 @@ def count_agent_pings(
     if comments is None:
         return None
     pattern = _trigger_re(trigger)
-    count = 0
-    observed_ids = set()
+    matching_comments = []
     for comment in comments:
         if not isinstance(comment, dict):
             continue
         if (comment.get("user") or {}).get("login") != agent_login:
             continue
         if pattern.search(comment.get("body") or ""):
-            count += 1
-            if type(comment.get("id")) is int:
-                observed_ids.add(comment["id"])
-    vendor = review_vendors.vendor_for(trigger)
+            matching_comments.append(comment)
     state = load_state()
     entry = state.get(state_key_for(state, repo, pr))
     if not isinstance(entry, dict):
-        return count
+        return len(reviewer_resolver.merge_comment_receipts(matching_comments, trigger, []))
     if entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
         return None
-    for receipt in entry.get("review_requests") or []:
-        if not isinstance(receipt, dict):
-            continue
-        reviewer = receipt.get("reviewer") or ""
-        if not isinstance(reviewer, str):
-            continue
-        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
-        if matches and receipt.get("comment_id") not in observed_ids:
-            # Add local successful posts missing from this GitHub snapshot.
-            # Missing IDs cannot establish overlap; conservatively count them.
-            count += 1
-    return count
+    return len(reviewer_resolver.merge_comment_receipts(matching_comments, trigger, entry.get("review_requests")))
 
 
 def _gh_json(cmd: list[str], runner: Any) -> Any:

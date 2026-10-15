@@ -180,6 +180,37 @@ def _parse_instant(value: str) -> _dt.datetime | None:
         return None
 
 
+def merge_comment_receipts(comments: list[dict[str, Any]], trigger: str, receipts: Any) -> list[dict[str, Any]]:
+    """Union filtered GitHub comments with successful local posts by database ID."""
+    out = []
+    observed_ids = set()
+    for comment in comments:
+        comment_id = comment.get("fullDatabaseId")
+        if isinstance(comment_id, str) and comment_id.isascii() and comment_id.isdecimal():
+            comment_id = int(comment_id)
+        if type(comment_id) is not int or comment_id <= 0:
+            comment_id = comment.get("id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if known_id and comment_id in observed_ids:
+            continue
+        out.append(comment)
+        if known_id:
+            observed_ids.add(comment_id)
+    vendor = review_vendors.vendor_for(trigger)
+    for receipt in receipts if isinstance(receipts, list) else []:
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("reviewer"), str):
+            continue
+        reviewer = receipt["reviewer"]
+        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
+        comment_id = receipt.get("comment_id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if matches and (not known_id or comment_id not in observed_ids):
+            out.append({"createdAt": receipt.get("at"), "localReceipt": True})
+            if known_id:
+                observed_ids.add(comment_id)
+    return out
+
+
 def counted_review_requests(
     events: Any,
     *,
