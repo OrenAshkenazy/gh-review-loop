@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **GraphQL re-requests confirm selected-reviewer registration.** A mutation returning the PR ID alone cannot record success or consume a completed request; unconfirmed registration retains an in-flight marker and blocks duplicate requests until reconciliation.
+
 - **Publication checks use the validated push URL.** Separate fetch and push destinations no longer reject fork-only branches or falsely report a successful push as unconfirmed.
 
 - **Displayed comment-review capacity includes local receipts.** Collection and publication share comment-ID union logic, including full GitHub database IDs, while incomplete history and truncated comment pages are reported as incomplete counts.

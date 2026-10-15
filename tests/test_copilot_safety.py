@@ -126,6 +126,10 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
     def runner(cmd, **kwargs):
         calls.append(cmd)
         if "graphql" in cmd:
+            if rr.STATE_QUERY in cmd[4]:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"data": {"repository": {"pullRequest": {
+                    "headRefOid": HEAD, "reviewRequests": {"nodes": [{"requestedReviewer": {"login": review_vendors.COPILOT.request_login}}]},
+                }}}}), "")
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}}), "")
         return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "open", "head": {"sha": HEAD},
                                                              "requested_reviewers": [{"login": review_vendors.COPILOT.request_login}]}), "")
@@ -134,12 +138,13 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
     assert request() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["posted"] is True and payload["kind"] == "review_request"
-    assert calls == [
+    assert calls[:2] == [
         ["gh", "api", "repos/acme/widget/pulls/159"],
         ["gh", "api", "graphql", "-f",
          "query=mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }",
          "-f", "pr=PR_target", "-f", "bot=BOT_copilot"],
     ]
+    assert len(calls) == 3 and rr.STATE_QUERY in calls[2][4]
     assert rr.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [payload["created_at"]]
 
 

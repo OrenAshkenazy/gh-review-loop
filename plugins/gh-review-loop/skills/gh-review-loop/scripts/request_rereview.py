@@ -1200,6 +1200,7 @@ def request_review(
             retryable=retryable,
             requested_at=requested_at,
         )
+    registered = False
     if rerequest_ids:
         try:
             data = json.loads(result.stdout)
@@ -1216,16 +1217,17 @@ def request_review(
                              for reviewer in data["requested_reviewers"])
         except (ValueError, KeyError, TypeError, AttributeError):
             registered = False
-        if not registered:
-            for attempt in range(2):
-                if attempt:
-                    time.sleep(1)
-                if _registered_review(repo, pr, request_login, registration_head or expect_head, runner, actor=request_actor, request_event_ids=request_event_ids):
-                    registered = True
-                    break
-        if not registered:
-            raise ReviewRequestRejected("REST accepted the call but selected reviewer registration is unconfirmed",
-                                        requested_at=requested_at, allow_timeline_confirmation=False)
+    if not registered:
+        for attempt in range(2):
+            if attempt:
+                time.sleep(1)
+            if _registered_review(repo, pr, request_login, registration_head or expect_head, runner, actor=request_actor, request_event_ids=request_event_ids):
+                registered = True
+                break
+    if not registered:
+        transport = "GraphQL re-request" if rerequest_ids else "REST"
+        raise ReviewRequestRejected(f"{transport} accepted the call but selected reviewer registration is unconfirmed",
+                                    requested_at=requested_at, allow_timeline_confirmation=False)
     return {
         "created_at": requested_at,
         "repo": repo,

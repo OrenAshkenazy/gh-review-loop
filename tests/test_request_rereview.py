@@ -1139,6 +1139,8 @@ class TestReviewRequestHelpers:
             if cmd[-1] == "repos/acme/widget/pulls/159":
                 return _completed(cmd, {"state": "open", "head": {"sha": "a" * 40}})
             assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head="a" * 40, pending=[COPILOT_REQUEST]))
             assert "rerequestReviews" in cmd[4]
             assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
             assert not kwargs.get("shell")
@@ -1150,7 +1152,7 @@ class TestReviewRequestHelpers:
         )
 
         assert result["posted"] is True
-        assert len(calls) == 2
+        assert len(calls) == 3
         calls.clear()
         result = request_rereview.request_review(
             "acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True,
@@ -1307,13 +1309,15 @@ class TestReviewRequestMain:
             if cmd == ["gh", "api", "repos/acme/widget/pulls/159"]:
                 return _completed(cmd, {"state": "open", "head": {"sha": state["head"]}})
             assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head=state["head"], pending=[COPILOT_REQUEST]))
             assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
             return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
 
         monkeypatch.setattr(request_rereview.subprocess, "run", runner)
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["posted"] is True
-        assert len(calls) == 2 and self._stamped(tmp_path) == 1
+        assert len(calls) == 3 and self._stamped(tmp_path) == 1
 
     def test_pending_state_posts_nothing_and_skips_the_cap(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)

@@ -27,6 +27,55 @@ def registration(login=LOGIN, head=HEAD):
             "reviewRequests": {"nodes": [{"requestedReviewer": {"login": login}}]}}}}}
 
 
+def native_write(cmd):
+    return "POST" in cmd or any(arg.startswith("query=mutation") for arg in cmd)
+
+
+@pytest.mark.parametrize("problem", ["absent", "wrong_reviewer", "wrong_head", "unreadable"])
+def test_graphql_pr_id_without_registration_stays_uncertain_and_cannot_repost(monkeypatch, problem):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "ABSENT", "head": HEAD, "pending_since": None,
+        "first_completed_review_at": "2026-10-12T19:00:00Z", "rerequest_ids": ("PR_target", "BOT_copilot"),
+    })
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
+    monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [99])
+    calls = []
+    read = registration("other" if problem == "wrong_reviewer" else LOGIN, "b" * 40 if problem == "wrong_head" else HEAD)
+    if problem == "absent":
+        read["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"] = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if native_write(cmd):
+            assert "rerequestReviews" in cmd[4], "an ambiguous write must not fall back to REST"
+            return result(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+        if "graphql" in cmd:
+            return result(cmd, {} if problem == "unreadable" else read)
+        if any("/timeline" in arg for arg in cmd):
+            return result(cmd, [])
+        return result(cmd, {"state": "open", "head": {"sha": HEAD}})
+
+    monkeypatch.setattr(rr.subprocess, "run", runner)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
+    payload = rr._locked_request(args)
+    assert payload["status"] == "review_request_uncertain" and payload["posted"] is None
+    entry = rr.load_state()[KEY]
+    assert entry["review_request_in_flight"] == {"reviewer": LOGIN, "at": AT, "head": HEAD, "actor": "agent",
+                                               "kind": "review_request", "request_event_ids": [99], "initial_review": False}
+    assert entry.get("run", {}).get("rereviews_posted", 0) == 0 and not entry.get("review_requests")
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) is None
+    for skip_cap in (False, True):
+        args.no_cap_check = skip_cap
+        assert rr._locked_request(args)["status"] == "request_in_flight"
+    args.reconcile = True
+    assert rr._locked_request(args)["status"] == "request_in_flight"
+    assert sum(native_write(cmd) for cmd in calls) == 1
+    assert sum("graphql" in cmd and not native_write(cmd) for cmd in calls) == 2
+
+
 @pytest.mark.parametrize("rest", [{}, [], {"requested_reviewers": []}, {"requested_reviewers": [{"login": "other"}]}])
 def test_rest_success_without_selected_registration_remains_uncertain(monkeypatch, rest):
     calls = []
@@ -43,19 +92,21 @@ def test_rest_success_without_selected_registration_remains_uncertain(monkeypatc
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize("rerequest", [False, True])
 @pytest.mark.parametrize("read", [registration("other"), {}, registration(head="b" * 40)])
-def test_rest_registration_recheck_is_bounded_and_can_observe_delayed_registration(monkeypatch, read):
+def test_registration_recheck_is_bounded_and_can_observe_delayed_registration(monkeypatch, read, rerequest):
     calls = []
     monkeypatch.setattr(rr.time, "sleep", lambda seconds: None)
-    responses = iter([{"requested_reviewers": []}, read, registration()])
+    responses = iter([{"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}} if rerequest else {"requested_reviewers": []}, read, registration()])
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
         return result(cmd, next(responses))
 
-    payload = rr.request_review("owner/repo", 1, LOGIN, runner=runner, registration_head=HEAD)
+    payload = rr.request_review("owner/repo", 1, LOGIN, runner=runner, registration_head=HEAD,
+                                rerequest_ids=("PR_target", "BOT_copilot") if rerequest else None)
     assert payload["posted"] is True
-    assert sum("POST" in cmd for cmd in calls) == 1 and len(calls) == 3
+    assert sum(native_write(cmd) for cmd in calls) == 1 and len(calls) == 3
 
 
 def test_old_pending_after_cancellation_does_not_certify_or_post_a_replacement(monkeypatch):
@@ -80,17 +131,23 @@ def request_event():
 
 @pytest.mark.parametrize("clock_skew", [False, True])
 @pytest.mark.parametrize("event_is_new", [False, True])
-def test_fast_completed_initial_review_requires_new_event_and_records_once(monkeypatch, clock_skew, event_is_new):
+@pytest.mark.parametrize("rerequest", [False, True])
+def test_fast_completed_review_requires_new_event_and_records_once(monkeypatch, clock_skew, event_is_new, rerequest):
     stub_cap_check_known_under_cap(monkeypatch)
     monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [] if event_is_new else [100])
     monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
     monkeypatch.setattr(rr, "request_state", lambda *a: {
-        "state": "ABSENT", "head": HEAD, "pending_since": None, "first_completed_review_at": None,
+        "state": "ABSENT", "head": HEAD, "pending_since": None,
+        "first_completed_review_at": "2026-10-12T19:00:00Z" if rerequest else None,
+        "rerequest_ids": ("PR_target", "BOT_copilot") if rerequest else None,
     })
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
     calls = []
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
+        if native_write(cmd) and rerequest:
+            return result(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
         if "POST" in cmd:
             return result(cmd, {"requested_reviewers": []})
         if cmd[:3] == ["gh", "api", "graphql"]:
@@ -112,17 +169,17 @@ def test_fast_completed_initial_review_requires_new_event_and_records_once(monke
     monkeypatch.setattr(rr.subprocess, "run", runner)
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
     payload = rr._locked_request(args)
-    assert payload["posted"] is (True if event_is_new else None) and sum("POST" in cmd for cmd in calls) == 1
+    assert payload["posted"] is (True if event_is_new else None) and sum(native_write(cmd) for cmd in calls) == 1
     entry = rr.load_state()[KEY]
     if not event_is_new:
         assert entry["review_request_in_flight"]["request_event_ids"] == [100]
         assert entry.get("run", {}).get("rereviews_posted", 0) == 0
         assert rr._locked_request(args)["status"] == "request_in_flight"
-        assert sum("POST" in cmd for cmd in calls) == 1
+        assert sum(native_write(cmd) for cmd in calls) == 1
         return
     assert "review_request_in_flight" not in entry and entry["run"]["rereviews_posted"] == 1
-    assert entry["review_requests"][0]["initial_review"] is True
-    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == []
+    assert entry["review_requests"][0].get("initial_review", False) is not rerequest
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([AT] if rerequest else [])
 
 
 @pytest.mark.parametrize("problem", ["draft", "old_head", "wrong_bot", "alias_bot", "human", "missing_state", "missing_time", "old_review", "old_event", "wrong_actor", "no_event", "reviews_unreadable", "timeline_unreadable"])
