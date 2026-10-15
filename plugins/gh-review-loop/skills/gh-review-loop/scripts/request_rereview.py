@@ -831,6 +831,10 @@ def count_agent_review_requests(
     """
     if not agent_login:
         return None
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    if isinstance(entry, dict) and (entry.get("review_requests_incomplete") or entry.get("review_request_in_flight")):
+        return None
     if runner is None:
         runner = subprocess.run
     events = _timeline_events(repo, pr, runner)

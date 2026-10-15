@@ -367,6 +367,40 @@ def test_normal_git_eol_conversion_can_be_published(checkout):
     assert publish(checkout)["published"] is True
 
 
+@pytest.mark.parametrize("prior_mode,expected_mode", [("120000", "100644"), ("100755", "100755")])
+def test_regular_file_uses_regular_mode_without_executable_bit_tracking(checkout, prior_mode, expected_mode):
+    root, remote, _, info, profile = checkout
+    pc.git(root, "config", "core.filemode", "false")
+    pc.git(root, "config", "core.symlinks", "true")
+    blob = pc.git(root, "rev-parse", "HEAD:fix.txt").strip()
+    pc.git(root, "update-index", "--cacheinfo", prior_mode, blob, "fix.txt")
+    pc.git(root, "commit", "-m", "record prior file mode")
+    pc.git(root, "push", "origin", "fix")
+    head = pc.git(root, "rev-parse", "HEAD").strip()
+    info["head"]["sha"] = head
+
+    result = publish((root, remote, head, info, profile))
+
+    assert result["published"] is True
+    assert pc.git(root, "--git-dir", str(remote), "ls-tree", result["head"], "fix.txt").split()[0] == expected_mode
+    assert pc.git(root, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("flag", ["review_requests_incomplete", "review_request_in_flight"])
+def test_explicit_unknown_native_history_blocks_publication_with_empty_timeline(checkout, monkeypatch, flag):
+    monkeypatch.setattr(rr, "load_state", lambda: {"owner/repo#1": {
+        "run": {"update_seq": 1, "last_summary_seq": 1}, "review_requests": [], flag: True,
+    }})
+    monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": rr.review_vendors.COPILOT.login})
+    monkeypatch.setattr(rr, "request_state", lambda *args: {"first_completed_review_at": "2026-10-07T16:00:00Z"})
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: [])
+    with pytest.raises(pc.PublishError, match="incomplete|in-flight"):
+        publish(checkout)
+    assert_not_pushed(checkout)
+    assert pc.git(checkout[0], "rev-parse", "HEAD").strip() == checkout[2]
+    assert pc.git(checkout[0], "diff", "--cached", "--name-only") == ""
+
+
 def test_unverified_staged_mode_is_not_committed(checkout, monkeypatch):
     original_git = pc.git
 
@@ -383,19 +417,53 @@ def test_unverified_staged_mode_is_not_committed(checkout, monkeypatch):
     assert_not_pushed(checkout)
 
 
-def test_failed_push_preserves_local_commit(checkout, monkeypatch):
+@pytest.mark.parametrize("push_landed", [False, True])
+def test_failed_push_preserves_local_commit(checkout, monkeypatch, push_landed):
     original_git = pc.git
+    pushes = []
 
     def fail_push(root, *args):
         if args[:1] == ("push",):
+            pushes.append(args)
+            if push_landed:
+                original_git(root, *args)
             raise pc.PublishError("push failed")
         return original_git(root, *args)
 
     monkeypatch.setattr(pc, "git", fail_push)
-    with pytest.raises(pc.PublishError, match="push failed"):
-        publish(checkout)
-    assert pc.git(checkout[0], "rev-parse", "HEAD").strip() != checkout[2]
-    assert_not_pushed(checkout)
+    monkeypatch.setattr(rr, "request_rereview", lambda *args: pytest.fail("an uncertain push cannot request review"))
+    result = publish(checkout)
+    assert result["status"] == "publication_unconfirmed" and result["published"] is None
+    assert result["head"] == pc.git(checkout[0], "rev-parse", "HEAD").strip() != checkout[2]
+    assert result["previous_head"] == checkout[2] and len(pushes) == 1
+    tip = pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip()
+    assert tip == (result["head"] if push_landed else checkout[2])
+
+
+@pytest.mark.parametrize("confirmation", ["error", "different_tip"])
+def test_cli_preserves_uncertain_publication_after_successful_push(checkout, monkeypatch, capsys, confirmation):
+    original_git = pc.git
+    pushes = []
+
+    def fail_confirmation(root, *args):
+        if args[:1] == ("push",):
+            result = original_git(root, *args)
+            pushes.append(args)
+            return result
+        if pushes and args[:2] == ("ls-remote", "--refs"):
+            if confirmation == "error":
+                raise pc.PublishError("confirmation failed")
+            return checkout[2] + "\trefs/heads/fix\n"
+        return original_git(root, *args)
+
+    monkeypatch.setattr(pc, "git", fail_confirmation)
+    monkeypatch.setattr(rr, "request_rereview", lambda *args: pytest.fail("unconfirmed publication cannot request review"))
+    status = pc.main(["--repo", "owner/repo", "--pr", "1", "--repo-root", str(checkout[0]), "--paths", "fix.txt", "--message", "fix review"])
+    result = json.loads(capsys.readouterr().out)
+    assert status == 1 and result["status"] == "publication_unconfirmed" and result["published"] is None
+    assert result["head"] == pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() != checkout[2]
+    assert result["previous_head"] == checkout[2] and result["verification"]["verification"] == "passed"
+    assert result["error"] and len(pushes) == 1
 
 
 @pytest.mark.parametrize("path", ["../outside", "/absolute", "a/../fix.txt", ".git/config", "C:/file", "dir\\file", "./fix.txt"])

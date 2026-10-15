@@ -119,6 +119,8 @@ def verified_blobs(root: Path, paths: list[str]) -> dict[str, tuple[str, frozens
         path = root / raw
         if path.exists():
             mode = ("100755" if path.stat().st_mode & 0o111 else "100644") if filemode else modes.get(raw, "100644")
+            if mode not in {"100644", "100755"}:
+                mode = "100644"
             hashes = {git(root, "hash-object", f"--path={raw}", "--", raw).strip()}
             # Git add preserves CRLF already present in the index, whereas
             # hash-object may normalize it. Both represent verified bytes.
@@ -148,6 +150,8 @@ def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None) -> N
     entry = state.get(rr.state_key_for(state, repo, pr))
     if isinstance(entry, dict) and entry.get("review_request_in_flight"):
         raise PublishError("reconcile the previous in-flight review request before publishing")
+    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
+        raise PublishError("local re-review history is incomplete; publishing blocked")
     tracking = entry.get("run") if isinstance(entry, dict) else None
     if not isinstance(tracking, dict) or loop_state.safe_int(tracking.get("update_seq")) <= 0 or loop_state.summary_is_stale(tracking):
         raise PublishError("fetch this PR, then emit and relay --cycle-summary before publishing")
@@ -235,10 +239,15 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     if len(urls) != 1 or remote_identity(urls[0]) != remote_identity((info.get("head", {}).get("repo") or {}).get("html_url", "")):
         raise PublishError("push remote changed; local commit preserved, no push")
     loop_gate(repo, pr, max_rereview_requests)
-    git(root, "push", remote, f"HEAD:refs/heads/{branch}")
-    tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
-    if len(tip) != 2 or tip[0] != commit:
-        raise PublishError("push could not be confirmed; local commit preserved")
+    try:
+        git(root, "push", remote, f"HEAD:refs/heads/{branch}")
+        tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
+        if len(tip) != 2 or tip[0] != commit:
+            raise PublishError("push could not be confirmed; local commit preserved")
+    except (PublishError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        payload.update(status="publication_unconfirmed", published=None, head=commit, previous_head=head, error=str(exc),
+                       message="The push may have updated the branch. Check the PR head and validated push destination before retrying; no review was requested.")
+        return payload
     payload.update(status="published", published=True, head=commit)
     try:
         payload["review_request"] = rr.request_rereview(repo, pr, commit, max_rereview_requests)
@@ -264,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "blocked", "published": False, "error": str(exc)}))
         return 1
     print(json.dumps(payload, indent=2))
-    return 0
+    return 1 if payload.get("status") == "publication_unconfirmed" else 0
 
 
 if __name__ == "__main__":

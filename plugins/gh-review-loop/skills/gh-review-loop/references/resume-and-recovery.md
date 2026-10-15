@@ -49,3 +49,9 @@ New commits pushed to the PR branch after the loop stopped:
 - Any commit touches files with `UNRESOLVED` or `ADDRESSED_BY_REPLY` threads → automatically resume the loop (subject to the cap).
 - Otherwise stay stopped. A self-reviewing bot picks up the new commit unattended; a ping-only bot will not review again until asked — the intended stop.
 - Doc-only commits (README, CLAUDE.md, comments) never resume the loop on their own.
+
+## Unconfirmed publication
+
+`publication_unconfirmed` exits nonzero with `published: null`, the new commit in `head`, its `previous_head`, verification details, and an error. A failed push transport or confirmation can follow a successful remote update; no review was requested. Do not automatically retry publication.
+
+Read the PR head and the branch at the validated push URL. If both equal `head`, use the standalone `request_rereview.py --expect-head <sha>` helper to recover the missing review request; do not republish. A different or unreadable remote requires investigation before any further push.

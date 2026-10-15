@@ -188,3 +188,14 @@ def test_refreshed_missing_ids_do_not_fall_back_to_rest(monkeypatch, capsys, fir
     assert payload["status"] == "uncountable_rerequest_ids" and payload["posted"] is False
     assert cancelled == [HEAD]
     assert not rr.load_state().get("acme/widget#159", {})
+
+
+@pytest.mark.parametrize("flag", [None, "review_requests_incomplete", "review_request_in_flight"])
+def test_native_counter_preserves_explicit_unknown_history_with_empty_timeline(monkeypatch, flag):
+    entry = {"review_requests": []}
+    if flag:
+        entry[flag] = True
+    monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: [])
+    count = rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:00:00Z")
+    assert count == (0 if flag is None else None)

@@ -113,4 +113,4 @@ After fixes and `--cycle-summary`, invoke the script using its installed absolut
 python "<plugin-root>/skills/gh-review-loop/scripts/publish_changes.py" --repo owner/repo --pr 42 --repo-root "<checkout-root>" --paths src/fix.py tests/test_fix.py --message "Fix reviewer findings"
 ```
 
-Use checkout-relative paths and an empty index. `--dry-run` only verifies. Forward cap overrides. Publication requests review under the PR lock: wait after `review_request.created_at`. After request failure, inspect `published` before retrying. `request_rereview.py --expect-head <sha>` recovers a missing request. See `write-safety.md`.
+Use checkout-relative paths and an empty index. `--dry-run` verifies only. Pass cap overrides. Wait after `review_request.created_at` on success. Inspect `published` before retrying; `request_rereview.py --expect-head <sha>` recovers a missing request. For `publication_unconfirmed`, see `resume-and-recovery.md`.

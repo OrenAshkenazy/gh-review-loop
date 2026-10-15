@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Publication preserves uncertain push results.** Failed push transport or confirmation retains the new and previous commit SHAs and verification details, reports `published: null`, and requests no review until the remote is checked.
+
+- **Native publication rejects explicitly incomplete history.** The publisher and shared request counter preserve unknown capacity even with no visible request events.
+
+- **Regular-file replacements do not inherit symlink modes.** With executable-bit tracking disabled, only existing regular-file modes are preserved.
+
 - **Publication preserves non-UTF-8 Git output.** Undecodable diff bytes survive snapshot comparison, verification, dry-run, and publication without lossy replacement or decoding failures.
 
 - **Native review capacity preserves explicit uncertainty.** In-flight or incomplete local history marks the count incomplete even when the request timeline is empty; JSON and Markdown warn that capacity is unknown.
