@@ -23,7 +23,7 @@ class PublishError(RuntimeError):
 
 
 def run(argv: list[str], root: Path) -> str:
-    result = subprocess.run(argv, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="strict", check=False)
+    result = subprocess.run(argv, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False)
     if result.returncode:
         raise PublishError(f"{argv[0]} failed: {(result.stderr or result.stdout).strip()}")
     return result.stdout

@@ -1194,11 +1194,14 @@ def review_request_count_complete(
     look free and lets the loop run another fix/push cycle before
     request_rereview.py (which paginates) refuses the write.
 
-    Comment vendors need a complete PR-comment page and local receipt history.
+    Explicitly incomplete local history makes either vendor's count uncertain.
+    Comment vendors also need a complete PR-comment page.
     """
+    if comment_receipts is None:
+        return False
     if not review_request_vendor:
         comments = (pull_request.get("comments") or {}).get("nodes") or []
-        return comment_receipts is not None and len(comments) < PAGE_LIMIT_PR_COMMENTS
+        return len(comments) < PAGE_LIMIT_PR_COMMENTS
     # Provenance is the third thing the count rests on: without a local record
     # the loop cannot tell its own requests from the member's clicks. That only
     # makes the number a bound when there is something to attribute — with no
@@ -4207,8 +4210,9 @@ def main() -> int:
         review_request_vendor = (
             reviewer_resolver.trigger_kind_for(args.author) == "review_request"
         )
-        if not review_request_vendor and comment_receipts is None:
-            print("warning: local comment-request history is incomplete or in flight; re-review capacity is unknown.", file=sys.stderr)
+        if comment_receipts is None:
+            history_kind = "native" if review_request_vendor else "comment"
+            print(f"warning: local {history_kind}-request history is incomplete or in flight; re-review capacity is unknown.", file=sys.stderr)
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:

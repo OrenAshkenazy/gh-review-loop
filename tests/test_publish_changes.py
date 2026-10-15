@@ -97,6 +97,28 @@ def test_dry_run_verifies_without_staging_committing_or_pushing(checkout):
     assert_not_pushed(checkout)
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_non_utf8_text_is_verified_and_preserved(checkout, dry_run):
+    root, remote, head, _, profile = checkout
+    content = b"after caf\xe9\n"
+    (root / "fix.txt").write_bytes(content)
+    profile["checks"][0]["command"] = [sys.executable, "-c", f"from pathlib import Path; assert Path('fix.txt').read_bytes() == {content!r}"]
+    diff, _ = pc.snapshot(root, ["fix.txt"])
+    assert b"+after caf\xe9\n" in diff.encode("utf-8", "surrogateescape")
+
+    result = publish(checkout, dry_run=dry_run)
+
+    assert result["verification"]["verification"] == "passed"
+    assert result["published"] is not dry_run
+    if dry_run:
+        assert pc.git(root, "rev-parse", "HEAD").strip() == head
+        assert pc.git(root, "diff", "--cached", "--name-only") == ""
+        assert_not_pushed(checkout)
+    else:
+        assert pc.git(root, "--git-dir", str(remote), "show", f"{result['head']}:fix.txt").encode("utf-8", "surrogateescape") == content
+        assert pc.git(root, "status", "--porcelain") == ""
+
+
 def test_publish_holds_pr_lock_through_request_and_forwards_head_cap(checkout, monkeypatch):
     import concurrent.futures
     import loop_lock

@@ -63,6 +63,33 @@ def test_a_full_comment_page_is_an_incomplete_count():
 
 @pytest.mark.parametrize("output_format", ["json", "markdown"])
 @pytest.mark.parametrize("flag", [None, "review_request_in_flight", "review_requests_incomplete"])
+def test_empty_native_timeline_keeps_explicit_history_uncertainty(monkeypatch, capsys, output_format, flag):
+    entry = {"review_requests": []}
+    if flag:
+        entry[flag] = True
+    loop_state.save_sticky_state({"owner/repo#1": entry})
+    payload = {"number": 1, "url": "https://github.com/owner/repo/pull/1", "reviews": {"nodes": []},
+               "reviewThreads": {"nodes": []}, "timelineItems": {"nodes": []}, "comments": {"nodes": []}}
+    reviewer = "copilot-pull-request-reviewer"
+    monkeypatch.setattr(fgt, "resolve_pr", lambda *a: PR)
+    monkeypatch.setattr(fgt, "fetch_threads", lambda *a: payload)
+    monkeypatch.setattr(fgt, "gh_authenticated_login", lambda: "agent")
+    monkeypatch.setattr(fgt, "repo_root", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["fetch_gemini_threads.py", "--pr", payload["url"], "--reviewer", reviewer,
+                                     "--reviewer-source", "confirmed", "--judge-mode", "off", "--format", output_format])
+    assert fgt.main() == 0
+    captured = capsys.readouterr()
+    if output_format == "json":
+        status = json.loads(captured.out)["loopStatus"]
+        assert status["reReviewRequests"] == 0
+        assert status["reReviewCountComplete"] is (flag is None)
+    else:
+        assert "Re-review requests: 0" in captured.out
+    assert ("local native-request history is incomplete or in flight" in captured.err) is (flag is not None)
+
+
+@pytest.mark.parametrize("output_format", ["json", "markdown"])
+@pytest.mark.parametrize("flag", [None, "review_request_in_flight", "review_requests_incomplete"])
 def test_main_reports_the_same_comment_capacity(monkeypatch, capsys, output_format, flag):
     entry = {"review_requests": [{"reviewer": REVIEWER, "at": AT, "comment_id": 100}]}
     if flag:
