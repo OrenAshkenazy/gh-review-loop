@@ -102,6 +102,45 @@ def test_a_copilot_that_left_findings_is_discovered_from_its_threads(loop, monke
     assert [(r["login"], r["source"]) for r in reviewers] == [(COPILOT, "thread")]
 
 
+@pytest.mark.parametrize("unparsed", [False, True])
+@pytest.mark.parametrize("linked", [False, True])
+def test_filtered_body_findings_only_block_clean_when_unparsed(loop, monkeypatch, capsys, unparsed, linked):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    payload["reviewThreads"] = {"nodes": []}
+    review = payload["reviews"]["nodes"][-1]
+    review["body"] = '''<!-- ccr-overview-v2 -->
+### 🟡 Changes recommended
+<summary><strong>0 open findings</strong></summary>
+<details><summary><picture><img alt="Low severity"></picture> Rename test</summary>
+`tests/example.py:1`
+The test name is misleading.
+</details>
+'''
+    if unparsed:
+        review["body"] += '<picture><img alt="Medium severity"></picture> Unrecognized markup'
+    if linked:
+        review["body"] = review["body"].replace('Rename test</summary>', '[Rename test](#discussion_r11)</summary>')
+        review["body"] = review["body"].replace('0 open findings', '2 open findings' if unparsed else '1 open findings')
+        if unparsed:
+            review["body"] = review["body"].replace('<picture><img alt="Medium severity"></picture> Unrecognized markup', 'Unparsed iconless finding')
+    loop["payload"] = payload
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed", "--min-severity", "high")
+    assert result["threads"] == []
+    assert result["loopStatus"]["cleanBlockedBy"] == ("overview_reports_open_findings" if unparsed else None)
+
+
+@pytest.mark.parametrize("initial_event", [True, False])
+def test_fetch_reconciles_unflagged_legacy_initial_receipts(loop, monkeypatch, capsys, initial_event):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    times = ["2026-10-07T15:30:00Z", "2026-10-07T16:20:00Z"]
+    payload["timelineItems"] = {"nodes": [{"__typename": "ReviewRequestedEvent", "actor": {"login": AGENT}, "requestedReviewer": {"login": COPILOT}, "createdAt": at} for at in (times if initial_event else times[1:])]}
+    fgt.save_sticky_state({"acme/widget#159": {"review_requests": [{"reviewer": COPILOT, "at": at} for at in times]}})
+    loop["payload"] = payload
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+    assert result["loopStatus"]["reReviewRequests"] == (1 if initial_event else 2)
+    assert result["loopStatus"]["reReviewCountComplete"] is initial_event
+
+
 def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatch, capsys):
     # 1. Select Copilot and fetch its first review. The human's click that
     #    started the review is not an agent re-review request.

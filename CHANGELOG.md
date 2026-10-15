@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Edited reviewer feedback invalidates stale deferrals.** Authorization must follow every reviewer's latest comment update; missing or invalid timestamps leave the finding actionable.
+
+- **Severity filtering accounts for parsed overview findings.** Intentionally filtered review-body findings allow a clean result while unparsed findings still block it.
+
+- **Legacy initial Copilot receipts remain free.** GitHub request events reconcile unflagged initial receipts; ambiguous or malformed history preserves unknown capacity and later requests remain charged.
+
 - **Publication preserves uncertain push results.** Failed push transport or confirmation retains the new and previous commit SHAs and verification details, reports `published: null`, and requests no review until the remote is checked.
 
 - **Native publication rejects explicitly incomplete history.** The publisher and shared request counter preserve unknown capacity even with no visible request events.

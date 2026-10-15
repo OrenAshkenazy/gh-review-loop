@@ -14,6 +14,52 @@ HEAD = "a" * 40
 OTHER_HEAD = "b" * 40
 
 
+@pytest.mark.parametrize("initial_event", [True, False])
+def test_legacy_initial_receipt_is_free_only_with_github_evidence(monkeypatch, initial_event):
+    initial = "2026-10-07T15:30:00Z"
+    later = "2026-10-07T16:20:00Z"
+    boundary = "2026-10-07T16:00:00Z"
+    entry = {"review_requests": [{"reviewer": "copilot", "at": at} for at in (initial, later)]}
+    monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
+    events = [{"event": "review_requested", "actor": {"login": "agent"}, "requested_reviewer": {"login": "copilot-pull-request-reviewer[bot]"}, "created_at": at} for at in ((initial, later) if initial_event else (later,))]
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: events)
+    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", boundary) == (1 if initial_event else None)
+
+
+def test_clock_skew_across_first_review_boundary_still_counts_rerequest(monkeypatch):
+    entry = {"review_requests": [{"reviewer": "copilot", "at": "2026-10-07T15:59:59Z"}]}
+    monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
+    event = {"event": "review_requested", "actor": {"login": "agent"}, "requested_reviewer": {"login": "copilot-pull-request-reviewer[bot]"}, "created_at": "2026-10-07T16:00:01Z"}
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: [event])
+    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:00:00Z") == 1
+
+
+def test_explicit_rereview_receipt_cannot_match_an_initial_event(monkeypatch):
+    import fetch_gemini_threads as fgt
+
+    entry = {"review_requests": [{"reviewer": "copilot", "at": "2026-10-07T15:59:59Z", "initial_review": False}]}
+    monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
+    event = {"event": "review_requested", "actor": {"login": "agent"}, "requested_reviewer": {"login": "copilot"}, "created_at": "2026-10-07T15:59:58Z"}
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: [event])
+    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:00:00Z") == 1
+    pr = {"timelineItems": {"nodes": [event]}, "reviews": {"nodes": [{"user": {"login": "copilot"}, "submitted_at": "2026-10-07T16:00:00Z", "state": "COMMENTED"}]}}
+    counted = fgt.rereview_requests(pr, "agent", reviewer_login="copilot", loop_request_times=[entry["review_requests"][0]["at"]], comment_receipts=entry["review_requests"])
+    assert len(counted) == 1 and not counted[0].get("provenance_unknown")
+
+
+@pytest.mark.parametrize("at", [None, "invalid", ""])
+def test_malformed_native_receipt_does_not_create_free_capacity(monkeypatch, at):
+    import fetch_gemini_threads as fgt
+
+    entry = {"review_requests": [{"reviewer": "copilot", "at": at}]}
+    monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
+    monkeypatch.setattr(rr, "_timeline_events", lambda *args: [])
+    monkeypatch.setattr(fgt, "load_sticky_state", lambda: {"acme/widget#159": entry})
+    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:00:00Z") is None
+    assert fgt.loop_request_times(fgt.PullRequest("acme", "widget", 159), "copilot") is None
+    assert not fgt.review_request_count_complete({}, loop_request_times=None, counted_requests=0, comment_receipts=entry["review_requests"])
+
+
 def stub_request_state(monkeypatch, state="ABSENT"):
     monkeypatch.setattr(rr, "request_state", lambda *args: {
         "state": state, "head": HEAD, "pending_since": "2026-10-07T15:50:00Z",

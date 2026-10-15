@@ -91,11 +91,11 @@ def make_thread(*, resolved=False, outdated=False, comments):
 
 
 def bot_comment(body="Use snake_case here."):
-    return {"author": {"login": BOT}, "body": body}
+    return {"author": {"login": BOT}, "body": body, "createdAt": "2026-10-15T10:00:00Z"}
 
 
 def human_comment(body, login="alice"):
-    return {"author": {"login": login, "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": body}
+    return {"author": {"login": login, "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": body, "createdAt": "2026-10-15T11:00:00Z"}
 
 
 # ---------------------------------------------------------------------------

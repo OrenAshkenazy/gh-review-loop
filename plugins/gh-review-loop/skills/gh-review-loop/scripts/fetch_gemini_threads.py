@@ -667,10 +667,16 @@ def is_addressed_by_reply(thread: dict[str, Any], bot_author: str) -> bool:
         return False
     reviewer_seen = False
     deferred = False
+    feedback_times = []
+    authorization_at = None
     for comment in comments.get("nodes") or []:
         author = comment.get("author") or {}
         login = author.get("login") or ""
         if login == bot_author:
+            feedback_at = _parse_iso_utc(comment.get("updatedAt") if "updatedAt" in comment else comment.get("createdAt"))
+            if feedback_at is None:
+                return False
+            feedback_times.append(feedback_at)
             reviewer_seen = True
             deferred = False
             continue
@@ -680,7 +686,8 @@ def is_addressed_by_reply(thread: dict[str, Any], bot_author: str) -> bool:
             continue
         body = comment.get("body") or ""
         deferred = bool(body.splitlines() and body.splitlines()[0] == ADDRESSED_BY_REPLY_MARKER)
-    return deferred
+        authorization_at = _parse_iso_utc(comment.get("createdAt"))
+    return bool(deferred and authorization_at and feedback_times and authorization_at > max(feedback_times))
 
 
 def filter_threads(
@@ -1172,6 +1179,9 @@ def review_body_findings(
         })
         if severity:
             findings[-1]["reviewerSeverity"] = severity.group(1).lower()
+            linked = COPILOT_FINDING_RE.search(badge.group())
+            if linked:
+                findings[-1]["reviewerDiscussionId"] = linked.group("id")
     return findings
 
 
@@ -1185,6 +1195,7 @@ def review_request_count_complete(
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
     comment_receipts: list[dict[str, Any]] | None | object = _PROVENANCE_UNSET,
+    ambiguous_receipts: bool = False,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1197,11 +1208,16 @@ def review_request_count_complete(
     Explicitly incomplete local history makes either vendor's count uncertain.
     Comment vendors also need a complete PR-comment page.
     """
-    if comment_receipts is None:
+    if comment_receipts is None or ambiguous_receipts:
         return False
     if not review_request_vendor:
         comments = (pull_request.get("comments") or {}).get("nodes") or []
         return len(comments) < PAGE_LIMIT_PR_COMMENTS
+    if loop_request_times is None and isinstance(comment_receipts, list):
+        for receipt in comment_receipts:
+            vendor = review_vendors.vendor_for(receipt.get("reviewer")) if isinstance(receipt, dict) else None
+            if vendor and vendor.trigger_kind == "review_request" and receipt.get("initial_review") is not True and _parse_iso_utc(receipt.get("at")) is None:
+                return False
     # Provenance is the third thing the count rests on: without a local record
     # the loop cannot tell its own requests from the member's clicks. That only
     # makes the number a bound when there is something to attribute — with no
@@ -1389,6 +1405,7 @@ def clean_blocked_by(
     *,
     review_request_vendor: bool,
     known_thread_ids: set[str] | None = None,
+    parsed_body_findings: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Why zero actionable threads is *not yet* clean for a review-request vendor.
 
@@ -1400,7 +1417,9 @@ def clean_blocked_by(
     review time, thread state is live, and the normal classification already
     decided those threads (spec §5.3). A reported finding the fetch never saw
     — no thread link, or a link to a thread that is not on the PR — still
-    blocks. Comment vendors have no overview gate.
+    blocks. Successfully parsed body findings are accounted for before
+    severity filtering; genuinely unparsed findings still block.
+    Comment vendors have no overview gate.
     """
     if threads or not review_request_vendor:
         return None
@@ -1408,20 +1427,22 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
-    if overview.get("unlinked_findings"):
+    body_links = {finding["reviewerDiscussionId"] for finding in parsed_body_findings or [] if finding.get("reviewerDiscussionId")}
+    unlinked_body = sum(not finding.get("reviewerDiscussionId") for finding in parsed_body_findings or [])
+    if (overview.get("unlinked_findings") or 0) > unlinked_body:
         return "overview_reports_open_findings"
     open_findings = overview.get("open_findings") or 0
     if open_findings > 0:
-        if known_thread_ids is None or overview.get("unlinked_findings"):
+        if known_thread_ids is None:
             return "overview_reports_open_findings"
         linked = overview.get("finding_ids") or []
         # `open_findings` is the authoritative count; `finding_ids` is only what
         # the parser could recognize. Fewer links than findings means one is
         # unaccounted for — a markup change that drops a severity icon must not
         # read as clean just because the links that did parse are known.
-        if len(linked) < open_findings:
+        if len(set(linked)) + unlinked_body < open_findings:
             return "overview_reports_open_findings"
-        if any(fid not in known_thread_ids for fid in linked):
+        if any(fid not in known_thread_ids and fid not in body_links for fid in linked):
             return "overview_reports_open_findings"
     return None
 
@@ -1457,6 +1478,7 @@ def rereview_requests(
             # with, so the displayed count and the enforced count agree. A
             # request the member clicked themselves is not the loop's.
             loop_request_times=loop_request_times,
+            known_rereview_times=reviewer_resolver.known_rereview_times(comment_receipts, vendor),
         )
     if not review_trigger_mention:
         return []
@@ -1657,8 +1679,9 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
         if item.get("initial_review") is True:
             continue
         at = item.get("at")
-        if isinstance(at, str) and at:
-            out.append(at)
+        if _parse_iso_utc(at) is None:
+            return None
+        out.append(at)
     return sorted(out)
 
 
@@ -4194,7 +4217,8 @@ def main() -> int:
         )
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
-        threads.extend(review_body_findings(pull_request, args.author))
+        body_findings = review_body_findings(pull_request, args.author)
+        threads.extend(body_findings)
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
         # an unparseable overview leaves every thread listed as `unknown`.
@@ -4210,7 +4234,7 @@ def main() -> int:
         review_request_vendor = (
             reviewer_resolver.trigger_kind_for(args.author) == "review_request"
         )
-        if comment_receipts is None:
+        if comment_receipts is None or (review_request_vendor and any(item.get("provenance_unknown") for item in rereviews)):
             history_kind = "native" if review_request_vendor else "comment"
             print(f"warning: local {history_kind}-request history is incomplete or in flight; re-review capacity is unknown.", file=sys.stderr)
         threads = sort_by_severity(threads)
@@ -4752,6 +4776,7 @@ def main() -> int:
                             threads, reviewer_overview,
                             review_request_vendor=review_request_vendor,
                             known_thread_ids=discussion_ids_on_pr(pull_request),
+                            parsed_body_findings=body_findings,
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -4771,6 +4796,7 @@ def main() -> int:
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
                             comment_receipts=comment_receipts,
+                            ambiguous_receipts=review_request_vendor and any(item.get("provenance_unknown") for item in rereviews),
                         ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
@@ -4845,6 +4871,7 @@ def main() -> int:
         blocked = clean_blocked_by(
             threads, reviewer_overview, review_request_vendor=review_request_vendor,
             known_thread_ids=discussion_ids_on_pr(pull_request),
+            parsed_body_findings=body_findings,
         )
         if blocked:
             print(

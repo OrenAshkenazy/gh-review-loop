@@ -320,8 +320,9 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
         if item.get("initial_review") is True:
             continue
         at = item.get("at")
-        if isinstance(at, str) and at:
-            out.append(at)
+        if _parse_iso(at) is None:
+            return None
+        out.append(at)
     return sorted(out)
 
 
@@ -390,8 +391,9 @@ def record_rereview_posted(
         receipt = {"reviewer": reviewer, "at": requested_at or utc_now_iso()}
         if type(comment_id) is int:
             receipt["comment_id"] = comment_id
-        if initial_review:
-            receipt["initial_review"] = True
+        vendor = review_vendors.vendor_for(reviewer)
+        if initial_review or (vendor and vendor.trigger_kind == "review_request"):
+            receipt["initial_review"] = initial_review
         requests.append(receipt)
         entry["review_requests"] = requests
     state[key] = entry
@@ -841,15 +843,18 @@ def count_agent_review_requests(
     if events is None:
         return None
     recorded = loop_request_times(repo, pr, vendor)
+    if recorded is None and isinstance(entry, dict) and "review_requests" in entry:
+        return None
     counted = reviewer_resolver.counted_review_requests(
         events,
         agent_login=agent_login,
         vendor=vendor,
         first_completed_review_at=first_completed_review_at,
         loop_request_times=recorded,
+        known_rereview_times=reviewer_resolver.known_rereview_times(entry.get("review_requests") if isinstance(entry, dict) else None, vendor),
         match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
     )
-    if recorded is None and counted:
+    if any(item.get("provenance_unknown") for item in counted) or (recorded is None and counted):
         # No local record, yet requests under this login exist after the
         # vendor's first review. They may be the loop's (a cleared state dir)
         # or the member's own clicks, and the two findings this resolves pull

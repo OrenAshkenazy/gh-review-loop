@@ -315,6 +315,32 @@ def test_counted_requests_is_empty_before_any_completed_review():
     ) == []
 
 
+def test_initial_event_cannot_free_a_later_receipt_near_boundary():
+    counted = reviewer_resolver.counted_review_requests(
+        [_gql_event("agent", "2026-10-07T15:59:59Z")], agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T16:00:00Z", loop_request_times=["2026-10-07T16:00:01Z"],
+    )
+    assert len(counted) == 1
+    assert counted[0]["created_at"] == "2026-10-07T16:00:01Z"
+
+
+def test_receipt_matching_events_on_both_sides_of_boundary_stays_unknown():
+    counted = reviewer_resolver.counted_review_requests(
+        [_gql_event("agent", "2026-10-07T15:59:58Z"), _gql_event("agent", "2026-10-07T16:00:01Z")],
+        agent_login="agent", vendor=review_vendors.COPILOT, first_completed_review_at="2026-10-07T16:00:00Z",
+        loop_request_times=["2026-10-07T15:59:59Z"],
+    )
+    assert len(counted) == 1 and counted[0]["provenance_unknown"] is True
+
+
+def test_lone_initial_event_cannot_free_a_near_boundary_legacy_receipt():
+    counted = reviewer_resolver.counted_review_requests(
+        [_gql_event("agent", "2026-10-07T15:59:58Z")], agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T16:00:00Z", loop_request_times=["2026-10-07T15:59:59Z"],
+    )
+    assert len(counted) == 1 and counted[0]["provenance_unknown"] is True
+
+
 def test_review_authors_and_pending_requests_are_candidates_too():
     """A Copilot review with zero findings has no thread comments, and a
     just-requested Copilot has nothing at all yet; both must be discoverable."""
