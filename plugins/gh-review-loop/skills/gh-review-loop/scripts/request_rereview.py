@@ -1402,7 +1402,7 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
         event = _new_request_event(args.repo, args.pr, vendor, actor, event_ids, subprocess.run) if exc.outcome_unknown and exc.allow_timeline_confirmation else None
         if event is not None:
             payload = {
-                "created_at": exc.requested_at,
+                "created_at": event["created_at"],
                 "repo": args.repo,
                 "pr": args.pr,
                 "kind": "review_request",

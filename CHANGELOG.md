@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Event-confirmed uncertain requests record GitHub's timestamp.** Immediate native-request confirmation uses the matched timeline event time in the result and saved receipt, preserving cap accounting when the local clock differs.
+
 - **Copilot re-reviews require readable PR and bot IDs.** Missing or ambiguous IDs stop before stale-request cancellation, and refreshed IDs are checked again before posting; completed reviews never silently fall back to the initial REST request endpoint.
 
 - **Public receipts keep verification commands local.** GitHub comments show check names and results without machine-specific command paths or private arguments; detailed local verification records are retained.

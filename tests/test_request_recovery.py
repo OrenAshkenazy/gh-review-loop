@@ -198,6 +198,38 @@ def test_unknown_provenance_prevents_stale_cancellation_and_post(monkeypatch):
     assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
 
 
+@pytest.mark.parametrize("local_time", ["2026-10-12T19:00:00Z", "2026-10-12T21:00:00Z"])
+@pytest.mark.parametrize("initial_review", [False, True])
+def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch, local_time, initial_review):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: local_time)
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "ABSENT", "head": HEAD, "pending_since": None,
+        "first_completed_review_at": None if initial_review else "2026-10-12T18:00:00Z",
+        "rerequest_ids": None if initial_review else ("PR_target", "BOT_copilot"),
+    })
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
+    monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [99])
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [request_event()])
+    calls = []
+
+    def post(*a, **kw):
+        calls.append(kw)
+        raise rr.ReviewRequestRejected("connection lost", requested_at=local_time)
+
+    monkeypatch.setattr(rr, "request_review", post)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
+    payload = rr._locked_request(args)
+    assert payload["posted"] is True and payload["confirmed_after_uncertain"] is True
+    assert payload["created_at"] == AT
+    entry = rr.load_state()[KEY]
+    assert len(calls) == 1 and "review_request_in_flight" not in entry
+    assert len(entry["review_requests"]) == 1 and entry["review_requests"][0]["at"] == AT
+    assert entry["review_requests"][0].get("initial_review", False) is initial_review
+    assert entry["run"]["rereviews_posted"] == 1
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([] if initial_review else [AT])
+
+
 @pytest.mark.parametrize("new_event", [False, True])
 def test_reconciliation_uses_persisted_event_baseline_despite_clock_skew(monkeypatch, new_event):
     marker = native_marker()
