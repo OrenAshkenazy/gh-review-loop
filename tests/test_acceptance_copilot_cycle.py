@@ -141,6 +141,30 @@ def test_fetch_reconciles_unflagged_legacy_initial_receipts(loop, monkeypatch, c
     assert result["loopStatus"]["reReviewCountComplete"] is initial_event
 
 
+@pytest.mark.parametrize("state", ["open", "resolved", "outdated", "deferred"])
+def test_linked_body_finding_preserves_live_thread_state(loop, monkeypatch, capsys, state):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    thread = payload["reviewThreads"]["nodes"][0]
+    payload["reviewThreads"]["nodes"] = [thread]
+    thread["isResolved"] = state == "resolved"
+    thread["isOutdated"] = state == "outdated"
+    if state == "deferred":
+        thread["comments"]["nodes"].append({"author": {"login": "maintainer", "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": "/review-loop defer", "createdAt": "2026-10-07T17:00:00Z"})
+    payload["reviews"]["nodes"][-1]["body"] = '''<!-- ccr-overview-v2 -->
+### 🟡 Changes recommended
+<summary><strong>1 open findings</strong></summary>
+<details><summary><picture><img alt="Low severity"></picture> [Existing finding](#discussion_r4208919854)</summary>
+`tests/example.py:1`
+This finding already has an inline thread.
+</details>
+'''
+    loop["payload"] = payload
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+    assert len(result["threads"]) == (1 if state == "open" else 0)
+    assert all(not finding.get("isReviewBodyFinding") for finding in result["threads"])
+    assert result["loopStatus"]["cleanBlockedBy"] is None
+
+
 def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatch, capsys):
     # 1. Select Copilot and fetch its first review. The human's click that
     #    started the review is not an agent re-review request.

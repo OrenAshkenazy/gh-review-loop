@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Linked Copilot summary findings follow live thread state.** Existing inline threads are not duplicated or reopened by synthetic summary findings after resolution, outdated classification, or explicit deferral.
+
 - **Edited reviewer feedback invalidates stale deferrals.** Authorization must follow every reviewer's latest comment update; missing or invalid timestamps leave the finding actionable.
 
 - **Severity filtering accounts for parsed overview findings.** Intentionally filtered review-body findings allow a clean result while unparsed findings still block it.

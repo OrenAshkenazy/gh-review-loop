@@ -4217,7 +4217,8 @@ def main() -> int:
         )
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
-        body_findings = review_body_findings(pull_request, args.author)
+        live_discussions = discussion_ids_on_pr(pull_request)
+        body_findings = [finding for finding in review_body_findings(pull_request, args.author) if finding.get("reviewerDiscussionId") not in live_discussions]
         threads.extend(body_findings)
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
