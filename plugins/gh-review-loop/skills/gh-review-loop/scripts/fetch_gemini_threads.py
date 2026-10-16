@@ -1310,7 +1310,7 @@ def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dic
     return sorted(
         (
             review for review in filter_reviews(pull_request, author)
-            if review.get("state") != "PENDING"
+            if review.get("state") not in ("PENDING", "DISMISSED")
         ),
         key=lambda review: review.get("submittedAt") or "",
     )
@@ -3086,7 +3086,8 @@ def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | N
         return None
     newest_request = newest_request_at(pull_request, author)
     for review in filter_reviews(pull_request, author):
-        if review.get("state") == "PENDING":
+        # A draft is not a review yet; a dismissed one was withdrawn.
+        if review.get("state") in ("PENDING", "DISMISSED"):
             continue
         if ((review.get("commit") or {}).get("oid") or "") != head:
             continue

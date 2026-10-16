@@ -490,12 +490,20 @@ def record_unconfirmed_request(
 
 
 def read_unconfirmed_request(repo: str, pr: int) -> dict[str, Any] | None:
+    """The saved unconfirmed request, None when there is none.
+
+    A record that exists but cannot be read is ``{"unreadable": True}``, not
+    None: it describes a request that may have landed, and treating it as
+    absent could post a duplicate.
+    """
     try:
         marker = json.loads(unconfirmed_path(repo, pr).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError):
-        return None
+        return {"unreadable": True}
     if not isinstance(marker, dict) or not isinstance(marker.get("at"), str):
-        return None
+        return {"unreadable": True}
     return marker
 
 
@@ -836,8 +844,11 @@ def request_state(
         review for review in reviews
         if review_vendors.vendor_for(_review_author(review)) is vendor
     ]
+    # Submitted reviews answered a request (pairing below). A dismissed one
+    # was withdrawn by a maintainer, so it no longer covers the head.
     completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
-    completed_head = any(_review_commit(review) == head for review in completed)
+    covering = [review for review in completed if review.get("state") != "DISMISSED"]
+    completed_head = any(_review_commit(review) == head for review in covering)
 
     requests = (pull.get("reviewRequests") or {}).get("nodes") or []
     listed = any(
@@ -866,14 +877,16 @@ def request_state(
                 break
     pending_since = unanswered[-1] if unanswered else None
     head_reviewed_at = max(
-        (_review_submitted_at(review) or "" for review in completed if _review_commit(review) == head),
+        (_review_submitted_at(review) or "" for review in covering if _review_commit(review) == head),
         default="",
     )
-    # A listed request newer than the head's review is a later cycle on the
-    # same head: wait for it rather than report the old review as current.
+    # An unanswered request newer than the head's review is a later cycle on
+    # the same head: wait for it if it is listed, and if it was withdrawn
+    # (the stale path, then a failed replacement) the old review still does
+    # not stand for the head, so a replacement may be posted (ABSENT).
     # ``>=``: GitHub stamps to the second, and pairing already gave the head
     # review its own request, so an unpaired one in the same second is newer.
-    newer_request = listed and pending_since is not None and pending_since >= head_reviewed_at
+    newer_request = pending_since is not None and pending_since >= head_reviewed_at
 
     if completed_head and not newer_request:
         state = "COMPLETED_HEAD"
@@ -1431,6 +1444,24 @@ def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
         handle.close()
 
 
+def unconfirmed_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    path = unconfirmed_path(repo, pr)
+    return {
+        "status": "unconfirmed_unreadable",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "path": str(path),
+        "message": (
+            f"The record of an earlier, unconfirmed review request on {repo}#{pr} cannot "
+            f"be read ({path}). That request may have landed, so nothing was posted. "
+            "Check the PR for a pending or completed review request, then delete that "
+            "file and run this again."
+        ),
+    }
+
+
 def state_unwritable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
     return {
         "status": "state_unwritable",
@@ -1577,6 +1608,9 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
         return 0
     marker = read_unconfirmed_request(args.repo, args.pr)
+    if marker is not None and marker.get("unreadable"):
+        _emit(unconfirmed_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
+        return 0
     if marker is not None and state["state"] != "ABSENT" and not args.dry_run:
         # A request is listed or the head is reviewed, so the state machine
         # below sees it. The marker is forgotten only once its provenance is

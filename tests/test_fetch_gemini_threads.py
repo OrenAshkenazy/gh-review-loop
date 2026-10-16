@@ -4367,6 +4367,13 @@ class TestHeadAnchoredWait:
         assert _fgt.head_review(pr, self.COPILOT) is None
         assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, "2026-10-07T16:30:00Z") is None
 
+    def test_a_dismissed_head_review_is_not_the_head_review(self):
+        pr = self._pr("d7efa49", ("DISMISSED", "2026-10-07T16:21:40Z", "d7efa49"))
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT) is None or \
+            _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is False
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]

@@ -1002,6 +1002,38 @@ class TestRequestState:
         assert state["state"] == "PENDING"
         assert state["pending_since"] == same
 
+    def test_a_withdrawn_newer_request_supersedes_the_old_head_review(self):
+        """The stale path withdrew a same-head request and its replacement
+        failed. The unanswered newer event still supersedes the old review,
+        so the next run may post the replacement instead of reporting
+        already_reviewed_head forever (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")],
+                events=[("agent", T_REQUEST), ("agent", "2026-10-07T16:30:00Z")],
+            ),
+            now=_at("2026-10-07T17:00:00Z"),
+        )
+
+        assert state["state"] == "ABSENT"
+
+    def test_a_dismissed_head_review_does_not_cover_the_head(self):
+        """A dismissed review is withdrawn by a maintainer; it must not block a
+        replacement request until the next push (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "DISMISSED", "2026-10-07T16:21:40Z", "d7efa49000")],
+                events=[("agent", T_REQUEST)],
+            ),
+            now=_at("2026-10-07T17:00:00Z"),
+        )
+
+        assert state["state"] == "ABSENT"
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
@@ -1796,6 +1828,23 @@ class TestReviewRequestMain:
         assert seen["marker"]["kind"] == "maybe" and seen["marker"]["countable"] is True
         assert self._marker() is None
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [CREATED_AT]
+
+    def test_an_unreadable_marker_refuses_to_post(self, monkeypatch, capsys, tmp_path):
+        """A corrupt record of an unconfirmed request is not an absent one:
+        posting could duplicate the request it describes (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        path = request_rereview.unconfirmed_path("acme/widget", 159)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"reviewer": "copilot-pull', encoding="utf-8")
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("corrupt marker: must not post"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unconfirmed_unreadable"
+        assert payload["posted"] is False
+        assert str(path) in payload["message"]
 
     def test_the_reservation_stays_when_nothing_durable_was_recorded(self, monkeypatch, capsys, tmp_path):
         """GitHub accepted the request but neither the log append nor the
