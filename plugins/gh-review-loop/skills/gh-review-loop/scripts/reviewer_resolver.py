@@ -177,6 +177,19 @@ def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     return -PROVENANCE_SKEW_SECONDS <= delta <= window_seconds
 
 
+def same_login(a: str | None, b: str | None) -> bool:
+    """GitHub logins are case-insensitive."""
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+def shift_iso(value: str, seconds: int) -> str:
+    """``value`` moved by ``seconds``, in GitHub's second-precision format."""
+    instant = _parse_instant(value)
+    if instant is None:
+        return value
+    return (instant + _dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def loop_request_times_from_entry(
     entry: Any,
     vendor: review_vendors.ReviewVendor,
@@ -263,7 +276,7 @@ def counted_review_requests(
     if loop_request_times is None:
         if agent_login is None:
             return candidates
-        return [event for event in candidates if event["actor_login"] == agent_login]
+        return [event for event in candidates if same_login(event["actor_login"], agent_login)]
 
     out: list[dict[str, Any]] = []
     unmatched = list(candidates)

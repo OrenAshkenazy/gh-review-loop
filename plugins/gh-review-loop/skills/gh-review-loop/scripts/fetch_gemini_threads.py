@@ -3037,14 +3037,29 @@ def review_activity_fingerprint(
 
 
 def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
-    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None."""
+    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
+
+    For a review-request vendor it must also answer the newest request: a
+    re-request on an unchanged head makes the earlier head review history,
+    or the waiter and the clean gate would take the old review for the new
+    one. Both times are GitHub's, and a same-second answer counts.
+    """
     head = pull_request.get("headRefOid") or ""
     if not head:
         return None
+    newest_request = ""
+    vendor = review_vendors.vendor_for(author)
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
+            event = reviewer_resolver.normalize_request_event(node)
+            if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
+                newest_request = max(newest_request, event["created_at"])
     for review in filter_reviews(pull_request, author):
         if review.get("state") == "PENDING":
             continue
-        if ((review.get("commit") or {}).get("oid") or "") == head:
+        if ((review.get("commit") or {}).get("oid") or "") != head:
+            continue
+        if (review.get("submittedAt") or "") >= newest_request:
             return review
     return None
 

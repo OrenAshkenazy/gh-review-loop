@@ -968,6 +968,23 @@ class TestRequestState:
         assert state["pending_since"] == "2026-10-07T16:20:00Z"
         assert state["state"] == "STALE_PENDING"
 
+    def test_a_listed_request_without_its_own_event_has_unknown_age(self):
+        """GraphQL lists the new request before the REST timeline shows it.
+        The only visible event is an old one that a review already answered,
+        so it must not age the new request into STALE_PENDING (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]),
+                reviews=[(COPILOT_LOGIN, "COMMENTED", "2026-10-07T15:10:00Z", "c0ffee0000")],
+                events=[("agent", "2026-10-07T15:00:00Z")],
+            ),
+            now=_at("2026-10-07T17:00:00Z"),
+        )
+
+        assert state["pending_since"] is None
+        assert state["state"] == "PENDING"
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
@@ -1226,6 +1243,24 @@ def test_a_review_after_someone_elses_request_is_not_the_loops():
     assert request_rereview.request_landed_since(
         "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner
     ) is None
+
+
+def test_settling_tolerates_a_fast_local_clock():
+    """``since`` is the local pre-POST time; the event is GitHub's. A local
+    clock a few seconds ahead must not hide the event (PR #116 review)."""
+    runner = _state_runner(_gql_pr("d7efa49000"), events=[("agent", "2026-10-07T16:19:55Z")])
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner
+    ) is True
+
+
+def test_settling_matches_the_login_case_insensitively():
+    runner = _state_runner(_gql_pr("d7efa49000"), events=[("Agent", "2026-10-07T16:20:01Z")])
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner
+    ) is True
 
 
 class TestReviewRequestMain:
@@ -1721,6 +1756,23 @@ class TestReviewRequestMain:
 
         capsys.readouterr()
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == []
+
+    def test_the_free_first_request_does_not_advance_the_cycle(self, monkeypatch, capsys, tmp_path):
+        """The first request is cycle 0. Stamping it as a cycle transition
+        puts the session ordinal one ahead (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: {"state": "ABSENT", "head": "abc1234def", "pending_since": None,
+                             "first_completed_review_at": None},
+        )
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert self._stamped(tmp_path) == 0
 
     def test_a_lagging_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
         """GraphQL can show the request pending before the REST timeline does.

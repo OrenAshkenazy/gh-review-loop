@@ -849,15 +849,18 @@ def request_state(
          if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor),
         key=lambda event: event["created_at"],
     )
-    completed_times = [_review_submitted_at(review) for review in completed]
-    pending_since = None
-    if vendor_events:
-        newest = vendor_events[-1]["created_at"]
-        # GitHub keeps one open request per reviewer and drops it when the
-        # reviewer submits, so a listed request is the newest request event,
-        # even if a review answering an earlier, overlapping one came later.
-        if listed or not any(submitted > newest for submitted in completed_times):
-            pending_since = newest
+    completed_times = sorted(_review_submitted_at(review) or "" for review in completed)
+    # Pair each completed review with the earliest open request before it;
+    # what is left unpaired is still waiting. Overlapping requests keep their
+    # own ages, and a listed request whose event the timeline does not show
+    # yet has an unknown age instead of borrowing an old, answered event's.
+    unanswered = [event["created_at"] for event in vendor_events]
+    for submitted in completed_times:
+        for index, requested in enumerate(unanswered):
+            if requested <= submitted:
+                unanswered.pop(index)
+                break
+    pending_since = unanswered[-1] if unanswered else None
     head_reviewed_at = max(
         (_review_submitted_at(review) or "" for review in completed if _review_commit(review) == head),
         default="",
@@ -963,7 +966,7 @@ def confirm_posted_after_uncertain(
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["actor_login"] == agent_login and event["created_at"] >= requested_at:
+        if reviewer_resolver.same_login(event["actor_login"], agent_login) and event["created_at"] >= requested_at:
             return True
     return False
 
@@ -991,6 +994,8 @@ def request_landed_since(
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
+    # ``since`` is the local clock; event and review times are GitHub's.
+    since = reviewer_resolver.shift_iso(since, -reviewer_resolver.PROVENANCE_SKEW_SECONDS)
     someone_else_asked = False
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
@@ -998,7 +1003,7 @@ def request_landed_since(
             continue
         if event["created_at"] < since:
             continue
-        if event["actor_login"] == agent_login:
+        if reviewer_resolver.same_login(event["actor_login"], agent_login):
             return True
         someone_else_asked = True
     reviews = _all_reviews(repo, pr, runner)
@@ -1702,7 +1707,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     else:
         record_rereview_posted(
             args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
-            countable=countable,
+            count_cycle=countable, countable=countable,
         )
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))

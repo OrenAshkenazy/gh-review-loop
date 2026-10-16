@@ -4337,6 +4337,27 @@ class TestHeadAnchoredWait:
         assert _fgt.head_review(self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3")), self.COPILOT) is None
         assert _fgt.head_review(self._pr("d7efa49", ("PENDING", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT) is None
 
+    @staticmethod
+    def _request_event(at, actor="agent"):
+        return {"__typename": "ReviewRequestedEvent", "createdAt": at, "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+
+    def test_a_re_request_on_the_same_head_waits_for_the_newer_review(self):
+        """Copilot reviewed the head, then was asked again on the unchanged
+        head. The old review must not end the wait or stand in for the new
+        one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, "2026-10-07T16:30:00Z") is None
+
+    def test_a_same_second_answer_to_the_newest_request_counts(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+
     def test_copilot_wait_is_not_ready_for_a_review_of_the_previous_head(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
 

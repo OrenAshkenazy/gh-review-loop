@@ -448,3 +448,16 @@ def test_a_fast_local_clock_still_matches_its_event():
     )
 
     assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:00Z"]
+
+
+def test_the_fallback_actor_filter_ignores_login_case():
+    """GitHub logins are case-insensitive; `--agent-login orenashkenazy` must
+    still count `OrenAshkenazy`'s requests when provenance is unknown (PR #116 review)."""
+    events = [_gql_event("OrenAshkenazy", "2026-10-07T16:20:05Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="orenashkenazy", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z", loop_request_times=None,
+    )
+
+    assert len(counted) == 1
