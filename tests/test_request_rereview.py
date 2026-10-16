@@ -1609,11 +1609,36 @@ class TestReviewRequestMain:
         assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
         assert self._marker() is not None
 
-    def test_a_pending_state_clears_the_marker(self, monkeypatch, capsys, tmp_path):
+    def test_a_lagging_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
+        """GraphQL can show the request pending before the REST timeline does.
+        Not-yet-visible provenance is not absence: the marker stays until the
+        request is seen or the settle logic proves it never landed (PR #116 review)."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._seed_marker(seconds_ago=10, kind="accepted")
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
         monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: False)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+        assert self._marker() is not None
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+    def test_settling_a_landed_request_rereads_the_state_before_posting(self, monkeypatch, capsys, tmp_path):
+        """The first snapshot said ABSENT, but the earlier request became
+        visible while it was being settled. Posting on the stale snapshot is
+        the duplicate the state machine exists to prevent (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=600, kind="maybe")
+        self._stub_reads(monkeypatch)
+        snapshots = iter(["ABSENT", "PENDING"])
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: {"state": next(snapshots), "head": "abc1234def", "pending_since": T_REQUEST,
+                             "first_completed_review_at": T_FIRST_REVIEW},
+        )
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("now pending: must not post"))
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 

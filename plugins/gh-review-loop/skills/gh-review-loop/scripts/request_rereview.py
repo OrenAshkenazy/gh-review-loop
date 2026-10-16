@@ -1533,28 +1533,33 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     if state is None:
         _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
         return 0
-    if args.expect_head and args.expect_head != state["head"]:
-        _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
-        return 0
     marker = read_unconfirmed_request(args.repo, args.pr)
     if marker is not None and state["state"] != "ABSENT" and not args.dry_run:
         # A request is listed or the head is reviewed, so the state machine
-        # below sees it. If the earlier request is what landed, record it for
-        # the cap before forgetting it, or later counts undercount it. An
-        # unreadable timeline keeps the marker for the next run.
-        landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"])
-        if landed is not None:
-            if landed:
-                record_rereview_posted(
-                    args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
-                    requested_at=marker["at"], count_cycle=False,
-                )
+        # below sees it. The marker is forgotten only once its provenance is
+        # visible (then recorded for the cap): GraphQL can list the request
+        # before the timeline shows it, and a not-yet-visible request is not
+        # an absent one. Otherwise it waits for the settle logic.
+        if request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"]):
+            record_rereview_posted(
+                args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
+                requested_at=marker["at"], count_cycle=False,
+            )
             clear_unconfirmed_request(args.repo, args.pr)
     elif marker is not None and not args.dry_run:
         settled = _settle_unconfirmed_request(args, vendor, marker)
         if settled is not None:
             _emit(settled, json_output=json_output)
             return 0
+        # Settling took reads and time; the earlier request may have become
+        # visible meanwhile. Never post on the snapshot taken before it.
+        state = request_state(args.repo, args.pr, vendor)
+        if state is None:
+            _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
+            return 0
+    if args.expect_head and args.expect_head != state["head"]:
+        _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
+        return 0
     if state["state"] == "COMPLETED_HEAD":
         _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
         return 0
