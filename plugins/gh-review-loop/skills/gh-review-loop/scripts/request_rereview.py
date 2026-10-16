@@ -25,6 +25,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows has no flock
     fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 import judge
 import review_vendors
@@ -1335,48 +1339,86 @@ def lock_path(repo: str, pr: int) -> Path:
     return loop_state.state_dir() / "locks" / f"{safe}.lock"
 
 
+def _try_lock(handle: Any) -> bool:
+    """One non-blocking attempt. Raises BlockingIOError/PermissionError when busy."""
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    return True
+
+
+def _unlock(handle: Any) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
-def pr_request_lock(repo: str, pr: int) -> Iterator[bool]:
+def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
     """Serialize the state-check/count/POST sequence per PR on this machine.
 
     GitHub does not dedupe review requests, so two loops that both read
     ABSENT (or the same remaining cap) would both POST and get two reviews.
     Yields True when the lock is held, False when another run kept it past
-    ``LOCK_WAIT_SECONDS``. Runs on other machines are not covered; the
-    pending-state dedupe is still the guard there. When no lock file can be
-    created (no flock, unwritable state dir) it yields True: the lock is a
-    guard against a race, and failing closed would block every request.
+    ``LOCK_WAIT_SECONDS``, and None when no lock can be established (no
+    flock/msvcrt, unwritable state dir). The caller posts only on True: an
+    unserialized run is exactly the duplicate this lock exists to prevent.
+    Runs on other machines are not covered; the pending-state dedupe and the
+    unconfirmed-request record are the guard there.
     """
-    if fcntl is None:
-        yield True
+    if fcntl is None and msvcrt is None:
+        yield None
         return
     try:
         path = lock_path(repo, pr)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         handle = open(path, "a+", encoding="utf-8")
-    except OSError:
-        yield True
+    except (OSError, ValueError):
+        yield None
         return
     try:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_lock(handle)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, PermissionError):
                 if time.monotonic() >= deadline:
                     yield False
                     return
                 time.sleep(0.5)
             except OSError:
-                yield True
+                yield None
                 return
         try:
             yield True
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock(handle)
     finally:
         handle.close()
+
+
+def lock_unavailable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    return {
+        "status": "lock_unavailable",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"Could not take the per-PR request lock for {repo}#{pr} (state directory "
+            "not writable, or no file locking on this platform), so nothing was posted: "
+            "without it two runs could post duplicate review requests. Fix the state "
+            "directory (GGRL_STATE_DIR) and run this again."
+        ),
+    }
 
 
 def request_in_progress_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
@@ -1462,6 +1504,12 @@ def _settle_unconfirmed_request(
 def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
     """The review_request path (spec §3), serialized per PR (see ``pr_request_lock``)."""
     with pr_request_lock(args.repo, args.pr) as held:
+        if held is None:
+            _emit(
+                lock_unavailable_payload(args.repo, args.pr, vendor.request_login),
+                json_output=args.json_output,
+            )
+            return 0
         if not held:
             _emit(
                 request_in_progress_payload(args.repo, args.pr, vendor.request_login),
@@ -1489,10 +1537,19 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
         return 0
     marker = read_unconfirmed_request(args.repo, args.pr)
-    if marker is not None and state["state"] != "ABSENT":
-        # A request is listed or the head is reviewed: whatever the earlier
-        # request did, the state machine below now sees it.
-        clear_unconfirmed_request(args.repo, args.pr)
+    if marker is not None and state["state"] != "ABSENT" and not args.dry_run:
+        # A request is listed or the head is reviewed, so the state machine
+        # below sees it. If the earlier request is what landed, record it for
+        # the cap before forgetting it, or later counts undercount it. An
+        # unreadable timeline keeps the marker for the next run.
+        landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"])
+        if landed is not None:
+            if landed:
+                record_rereview_posted(
+                    args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
+                    requested_at=marker["at"], count_cycle=False,
+                )
+            clear_unconfirmed_request(args.repo, args.pr)
     elif marker is not None and not args.dry_run:
         settled = _settle_unconfirmed_request(args, vendor, marker)
         if settled is not None:

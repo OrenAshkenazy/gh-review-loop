@@ -223,9 +223,13 @@ def counted_review_requests(
             return candidates
         return [event for event in candidates if event["actor_login"] == agent_login]
 
+    # A record from before the first completed review is the free cycle-0
+    # request. Inside the match window it could otherwise claim a manual
+    # re-request made right after that review and charge it to the cap.
+    post_review_times = [t for t in loop_request_times if t >= first_completed_review_at]
     out: list[dict[str, Any]] = []
     unmatched = list(candidates)
-    for posted_at in sorted(loop_request_times):
+    for posted_at in sorted(post_review_times):
         for index, event in enumerate(unmatched):
             if _within(event["created_at"], posted_at, match_window_seconds):
                 out.append(unmatched.pop(index))

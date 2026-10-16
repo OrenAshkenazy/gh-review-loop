@@ -1427,6 +1427,25 @@ class TestReviewRequestMain:
 
         assert json.loads(capsys.readouterr().out)["status"] == "request_in_progress"
 
+    @pytest.mark.parametrize("break_lock", ["no_lock_module", "unwritable_dir"])
+    def test_no_lock_means_no_post(self, monkeypatch, capsys, tmp_path, break_lock):
+        """Without serialization two runs can both read ABSENT and both POST,
+        so a run that cannot establish the lock posts nothing (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        if break_lock == "no_lock_module":
+            monkeypatch.setattr(request_rereview, "fcntl", None)
+            monkeypatch.setattr(request_rereview, "msvcrt", None)
+        else:
+            monkeypatch.setattr(request_rereview, "lock_path", lambda repo, pr: tmp_path / "missing" / "x" / "\0bad")
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("no lock: must not request"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "lock_unavailable"
+        assert payload["posted"] is False
+
     def test_lock_is_released_after_a_run(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._stub_reads(monkeypatch)
@@ -1564,10 +1583,37 @@ class TestReviewRequestMain:
         times = request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT)
         assert times == sorted([at, CREATED_AT])
 
+    def test_a_marker_that_shows_up_pending_is_recorded_for_the_cap(self, monkeypatch, capsys, tmp_path):
+        """The uncertain request became visible before this run: it was a real
+        loop request, so its time joins the provenance list before the marker
+        is cleared, or later cap checks undercount it (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        at = self._seed_marker(seconds_ago=30, kind="maybe")
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+        assert self._marker() is None
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [at]
+
+    def test_an_unreadable_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=30, kind="maybe")
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: None)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+        assert self._marker() is not None
+
     def test_a_pending_state_clears_the_marker(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._seed_marker(seconds_ago=10, kind="accepted")
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: False)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 

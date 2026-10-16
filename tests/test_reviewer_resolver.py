@@ -404,3 +404,22 @@ def test_an_unknown_reviewer_login_is_left_exactly_as_given():
     record = reviewer_resolver.make_reviewer_record("some-new-bot[bot]", source="explicit")
 
     assert record["login"] == "some-new-bot[bot]"
+
+
+def test_a_cycle_zero_record_never_claims_a_later_manual_request():
+    """The initial loop request predates the first completed review, so it is
+    free. If the first review and a manual re-request both land inside the
+    match window, the initial request's local record must not claim the
+    manual event and charge it to the cap (PR #116 review)."""
+    events = [
+        _gql_event("agent", "2026-10-07T15:42:27Z"),  # initial loop request
+        _gql_event("agent", "2026-10-07T15:44:00Z"),  # member clicks re-request in the UI
+    ]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:43:10Z",
+        loop_request_times=["2026-10-07T15:42:26Z"],
+    )
+
+    assert counted == []
