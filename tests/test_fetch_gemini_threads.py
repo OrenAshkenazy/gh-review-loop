@@ -242,6 +242,24 @@ class TestSeverity:
         t = make_thread(comments=[{"author": {"login": CODEX}, "body": body}])
         assert thread_severity(t) == expected
 
+    @pytest.mark.parametrize("marker,expected", [
+        ("P0", "critical"), ("P1", "high"),
+        ("P2", "medium"), ("P3", "low"),
+    ])
+    def test_leading_plain_priority(self, marker, expected):
+        for body in (f"[{marker}] Fix runtime verification", f" \n[{marker.lower()}] Fix runtime verification"):
+            thread = make_thread(comments=[bot_comment(body)])
+            assert thread_severity(thread) == expected
+
+    @pytest.mark.parametrize("body", [
+        "This prose mentions [P2] but does not set priority",
+        "```python\n[P2] do_not_treat_as_priority\n```",
+        "[P4] Invalid level", "[P2]Not separated",
+        "Quoted `[P2]` in ordinary prose",
+    ])
+    def test_plain_priority_requires_leading_marker(self, body):
+        assert thread_severity(make_thread(comments=[bot_comment(body)])) == "unknown"
+
     def test_handles_post_filter_flat_shape(self):
         # filter_threads flattens comments to a plain list; severity must still work
         flat = {"comments": [{"author": {"login": BOT}, "body": "![low](x)"}]}
