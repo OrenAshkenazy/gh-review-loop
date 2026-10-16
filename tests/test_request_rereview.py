@@ -1400,6 +1400,25 @@ def test_confirming_a_5xx_ignores_an_event_already_on_the_pr():
     ) is False
 
 
+def test_a_new_same_second_event_is_not_hidden_by_a_prior_one():
+    """The prior snapshot holds one event at T; the PR now holds two at T.
+    The second is new, so the request landed (PR #116 review)."""
+    runner = _state_runner(
+        _gql_pr("d7efa49000"),
+        events=[("agent", "2026-10-07T16:20:00Z"), ("agent", "2026-10-07T16:20:00Z")],
+    )
+    prior = {"events": ["2026-10-07T16:20:00Z"], "reviews": []}
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z",
+        runner=runner, prior=prior,
+    ) is True
+    assert request_rereview.confirm_posted_after_uncertain(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z",
+        runner=runner, prior=prior,
+    ) is True
+
+
 class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 
@@ -2045,6 +2064,26 @@ class TestReviewRequestMain:
         capsys.readouterr()
         assert self._marker() is None
         assert self._stamped(tmp_path) == stamped_before
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [at]
+
+    def test_replay_restores_a_missing_cycle_stamp(self, monkeypatch, capsys, tmp_path):
+        """A crash after the log append but before the cycle stamp leaves the
+        request logged and the cycle one behind. Replay stamps the cycle once,
+        without logging the request again (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        at = self._seed_marker(seconds_ago=30, kind="maybe")
+        marker = self._marker()
+        # Only the append happened.
+        request_rereview.loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": COPILOT_REQUEST, "at": at, "countable": True, "request_id": marker["id"]})
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert self._marker() is None
+        assert self._stamped(tmp_path) == 1
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [at]
 
     def test_a_lagging_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):

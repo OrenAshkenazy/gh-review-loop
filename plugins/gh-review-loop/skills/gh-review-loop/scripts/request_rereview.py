@@ -433,6 +433,19 @@ def record_rereview_posted(
             # cap falls back to counting by actor; nothing rewrites that file.
             print("warning: could not record the review request for the cap", file=sys.stderr)
             marked = loop_state.mark_provenance_incomplete(repo, pr)
+    stamp_cycle(repo, pr, request_id if count_cycle else None, count=count_cycle)
+    # Durable once the log took the record, or the incomplete marker did.
+    return logged or marked
+
+
+def stamp_cycle(repo: str, pr: int, request_id: str | None, *, count: bool = True) -> None:
+    """Advance the run's cycle ordinal for a posted re-review, once per request.
+
+    The request id is kept with the stamp so a replay (a crash between the
+    log append and this write) can restore a missing stamp without doubling
+    one that landed. ``count=False`` touches the entry without advancing.
+    Fails open: the ordinal holds rather than drifting.
+    """
     path = state_path()
     state = load_state()
     key = state_key_for(state, repo, pr)
@@ -440,10 +453,16 @@ def record_rereview_posted(
     entry = dict(entry) if isinstance(entry, dict) else {}
     run = entry.get("run")
     run = dict(run) if isinstance(run, dict) else {}
-    posted = run.get("rereviews_posted")
-    posted = posted if isinstance(posted, int) and not isinstance(posted, bool) else 0
-    if count_cycle:
+    if count:
+        stamped = run.get("stamped_request_ids")
+        stamped = list(stamped) if isinstance(stamped, list) else []
+        if request_id and request_id in stamped:
+            return
+        posted = run.get("rereviews_posted")
+        posted = posted if isinstance(posted, int) and not isinstance(posted, bool) else 0
         run["rereviews_posted"] = posted + 1
+        if request_id:
+            run["stamped_request_ids"] = stamped + [request_id]
         entry["run"] = run
     state[key] = entry
     try:
@@ -451,8 +470,14 @@ def record_rereview_posted(
         path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
-    # Durable once the log took the record, or the incomplete marker did.
-    return logged or marked
+
+
+def cycle_stamped(repo: str, pr: int, request_id: str) -> bool:
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    run = entry.get("run") if isinstance(entry, dict) else None
+    stamped = run.get("stamped_request_ids") if isinstance(run, dict) else None
+    return isinstance(stamped, list) and request_id in stamped
 
 
 # How long an unconfirmed review request may take to show up on the PR before
@@ -465,8 +490,7 @@ def unconfirmed_path(repo: str, pr: int) -> Path:
     """The unconfirmed-request record sits next to the PR's lock file, apart
     from state.json, so a state file that cannot be written does not take
     this guard down with it."""
-    lock = lock_path(repo, pr)
-    return lock.with_name(lock.stem + ".unconfirmed.json")
+    return loop_state.unconfirmed_request_path(repo, pr)
 
 
 def record_unconfirmed_request(
@@ -1000,6 +1024,23 @@ def count_agent_review_requests(
     return len(counted)
 
 
+class _Multiset:
+    """Timestamps saved with a reservation, consumed one occurrence at a time."""
+
+    def __init__(self, values: Any) -> None:
+        self._left: dict[str, int] = {}
+        for value in values or []:
+            if isinstance(value, str):
+                self._left[value] = self._left.get(value, 0) + 1
+
+    def take(self, value: str) -> bool:
+        """Consume one saved occurrence of ``value``; False when none is left."""
+        if self._left.get(value, 0) <= 0:
+            return False
+        self._left[value] -= 1
+        return True
+
+
 def confirm_posted_after_uncertain(
     repo: str,
     pr: int,
@@ -1024,14 +1065,14 @@ def confirm_posted_after_uncertain(
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return False
-    old_events = set((prior or {}).get("events") or [])
+    old_events = _Multiset((prior or {}).get("events") or [])
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None:
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["created_at"] in old_events:
+        if old_events.take(event["created_at"]):
             continue
         if reviewer_resolver.same_login(event["actor_login"], agent_login) and event["created_at"] >= requested_at:
             return True
@@ -1069,14 +1110,17 @@ def request_landed_since(
     # ``since`` is the local clock; event and review times are GitHub's.
     since = reviewer_resolver.shift_iso(since, -reviewer_resolver.PROVENANCE_SKEW_SECONDS)
     prior = prior if isinstance(prior, dict) else {}
-    old_events = set(prior.get("events") or [])
-    old_reviews = set(prior.get("reviews") or [])
+    # One prior occurrence hides one current occurrence of the same
+    # second-precision timestamp, never all of them: a new event in the same
+    # second as a saved one is still new.
+    old_events = _Multiset(prior.get("events") or [])
+    old_reviews = _Multiset(prior.get("reviews") or [])
     someone_else_asked = False
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None or review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["created_at"] < since or event["created_at"] in old_events:
+        if event["created_at"] < since or old_events.take(event["created_at"]):
             continue
         if reviewer_resolver.same_login(event["actor_login"], agent_login):
             return True
@@ -1088,7 +1132,7 @@ def request_landed_since(
         if review_vendors.vendor_for(_review_author(review)) is not vendor:
             continue
         submitted = _review_submitted_at(review) or ""
-        if submitted in old_reviews:
+        if old_reviews.take(submitted):
             continue
         if review.get("state") != "PENDING" and submitted >= since:
             # A review with no request event of ours is evidence only when no
@@ -1595,10 +1639,14 @@ def _record_settled_request(repo: str, pr: int, reviewer: str, marker: dict[str,
     """
     request_id = marker.get("id")
     logged = loop_state.read_request_log(repo, pr) or []
+    countable = marker.get("countable") is not False
     if request_id and any(item.get("request_id") == request_id for item in logged):
+        # The append happened; the cycle stamp after it may not have. It is
+        # idempotent per request id, so restoring it here cannot double one.
+        if countable and not cycle_stamped(repo, pr, request_id):
+            stamp_cycle(repo, pr, request_id)
         clear_unconfirmed_request(repo, pr)
         return
-    countable = marker.get("countable") is not False
     if record_rereview_posted(
         repo, pr, reviewer=marker.get("reviewer") or reviewer,
         requested_at=marker["at"], count_cycle=countable, countable=countable,

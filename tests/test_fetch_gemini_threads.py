@@ -4745,6 +4745,19 @@ class TestFetchProvenanceUnknown:
             provenance_incomplete=loop_state.provenance_incomplete("acme/widget", 159),
         ) is False
 
+    def test_an_open_reservation_makes_the_count_incomplete(self, monkeypatch, tmp_path):
+        """A reserved request that has not been logged yet is neither a record
+        nor an incomplete marker, but it may already be on GitHub; the count
+        is a bound until it is settled (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is False
+        path = loop_state.unconfirmed_request_path("acme/widget", 159)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"at": "2026-10-07T16:20:05Z", "kind": "maybe", "countable": true}', encoding="utf-8")
+
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is True
+
     def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
         """A crash mid-append can tear the last record. Skipping it would make
         the rest look complete and undercount the cap (PR #116 review)."""

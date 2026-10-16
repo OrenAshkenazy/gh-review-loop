@@ -200,6 +200,22 @@ def mark_provenance_incomplete(repo: str, pr: int) -> bool:
     return True
 
 
+def unconfirmed_request_path(repo: str, pr: int) -> Path:
+    """The record of a request whose outcome is not confirmed yet (a
+    reservation). Beside the PR's lock file, apart from state.json."""
+    return pr_scoped_path(repo, pr, "locks", ".unconfirmed.json")
+
+
+def cap_count_uncertain(repo: str, pr: int) -> bool:
+    """Is the local request history not a complete count right now?
+
+    True for an explicitly incomplete history, and while a reservation is
+    open: that request may already be on GitHub but is not in the log until
+    it is settled.
+    """
+    return provenance_incomplete(repo, pr) or unconfirmed_request_path(repo, pr).exists()
+
+
 def provenance_incomplete(repo: str, pr: int) -> bool:
     """Was a posted request explicitly left unrecorded (failed append, torn log,
     or the legacy state.json flag)?"""

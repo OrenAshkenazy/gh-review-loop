@@ -4862,7 +4862,7 @@ def main() -> int:
                             review_request_vendor=review_request_vendor,
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
-                            provenance_incomplete=loop_state.provenance_incomplete(
+                            provenance_incomplete=loop_state.cap_count_uncertain(
                                 f"{pr.owner}/{pr.repo}", pr.number
                             ),
                         ),
