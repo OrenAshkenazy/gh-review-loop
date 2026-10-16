@@ -1396,6 +1396,17 @@ def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head
     }
 
 
+def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The reviewer overview, for a review-request vendor (Copilot) only.
+
+    Only Copilot writes an overview; for comment reviewers (Codex, Gemini)
+    a head review would otherwise come back as a fabricated, unparseable one.
+    """
+    if reviewer_resolver.trigger_kind_for(author) != "review_request":
+        return None
+    return latest_reviewer_overview(pull_request, author)
+
+
 def latest_reviewer_overview(
     pull_request: dict[str, Any], author: str
 ) -> dict[str, Any] | None:
@@ -4255,7 +4266,7 @@ def main() -> int:
             pull_request, args.author
         )
         annotate_reviewer_severity(threads, overview_severities)
-        reviewer_overview = latest_reviewer_overview(pull_request, args.author)
+        reviewer_overview = reviewer_overview_for(pull_request, args.author)
         if reviewer_overview is not None:
             reviewer_overview["warnings"] = overview_warnings
         for warning in overview_warnings:

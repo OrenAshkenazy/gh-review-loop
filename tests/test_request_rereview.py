@@ -1051,6 +1051,21 @@ class TestRequestState:
         assert state["state"] == "PENDING"
         assert state["pending_since"] is None
 
+    def test_a_fresh_unanswered_request_is_pending_while_the_review_read_lags(self):
+        """Copilot just submitted: GraphQL already dropped the request but the
+        REST reviews read does not show the review yet. A fresh unanswered
+        request event is still pending, never ABSENT (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"), reviews=[OLD_REVIEW], events=[("agent", T_REQUEST)],
+            ),
+            now=_at("2026-10-07T16:25:00Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] == T_REQUEST
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
@@ -1358,6 +1373,20 @@ def test_settling_ignores_activity_that_predates_the_reservation():
         "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner,
         prior={"events": ["2026-10-07T16:19:00Z"], "reviews": ["2026-10-07T16:19:40Z"]},
     ) is False
+
+
+def test_explicitly_incomplete_history_is_unknown_even_with_no_events(monkeypatch, tmp_path):
+    """A request was posted but could not be logged, and its event has not
+    reached the timeline. Zero events must not read as zero used (PR #116 review)."""
+    monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
+    request_rereview.record_rereview_posted(
+        "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:20:05Z")
+    runner = _state_runner(_gql_pr("d7efa49000"), events=[])
+
+    assert request_rereview.count_agent_review_requests(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+    ) is None
 
 
 class TestReviewRequestMain:

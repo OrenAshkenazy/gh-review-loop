@@ -868,7 +868,7 @@ def request_state(
         and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
         for node in requests
     )
-    pending = listed or any(review.get("state") == "PENDING" for review in vendor_reviews)
+    draft = any(review.get("state") == "PENDING" for review in vendor_reviews)
 
     events = [reviewer_resolver.normalize_request_event(node) for node in raw_events]
     vendor_events = sorted(
@@ -888,6 +888,16 @@ def request_state(
                 unanswered.pop(index)
                 break
     pending_since = unanswered[-1] if unanswered else None
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    since_dt = _parse_iso(pending_since) if pending_since else None
+    # Right after Copilot submits, GraphQL can drop the request before the
+    # REST reviews read shows the review. A fresh unanswered request event is
+    # therefore still pending; only one older than the stale threshold, the
+    # kind this script withdraws, reads as absent once it is not listed.
+    fresh_unanswered = since_dt is not None and (
+        (now - since_dt).total_seconds() < STALE_REQUEST_SECONDS
+    )
+    pending = listed or draft or fresh_unanswered
     head_reviewed_at = max(
         (_review_submitted_at(review) or "" for review in covering if _review_commit(review) == head),
         default="",
@@ -909,10 +919,8 @@ def request_state(
         state = "COMPLETED_HEAD"
     elif pending:
         state = "PENDING"
-        since = _parse_iso(pending_since) if pending_since else None
-        if since is not None:
-            now = now or _dt.datetime.now(_dt.timezone.utc)
-            if (now - since).total_seconds() >= STALE_REQUEST_SECONDS:
+        if since_dt is not None:
+            if (now - since_dt).total_seconds() >= STALE_REQUEST_SECONDS:
                 state = "STALE_PENDING"
     else:
         state = "ABSENT"
@@ -935,6 +943,16 @@ def _timeline_events(repo: str, pr: int, runner: Any) -> list[Any] | None:
         runner,
     )
     return events if isinstance(events, list) else None
+
+
+def provenance_incomplete(repo: str, pr: int) -> bool:
+    """Was a posted request explicitly left unrecorded (failed append, torn log)?"""
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
+        return True
+    logged = loop_state.read_request_log(repo, pr) or []
+    return any(isinstance(item, dict) and item.get("incomplete") for item in logged)
 
 
 def count_agent_review_requests(
@@ -968,6 +986,10 @@ def count_agent_review_requests(
         loop_request_times=recorded,
         match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
     )
+    if provenance_incomplete(repo, pr):
+        # A posted request could not be logged. Its event may not have reached
+        # the timeline yet, so even zero matching events is not zero used.
+        return None
     if recorded is None and counted:
         # No local record, yet requests under this login exist after the
         # vendor's first review. They may be the loop's (a cleared state dir)

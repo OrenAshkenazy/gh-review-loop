@@ -4393,6 +4393,17 @@ class TestHeadAnchoredWait:
     def test_the_fetch_query_reads_listed_review_requests(self):
         assert "reviewRequests(first:" in _fgt.QUERY
 
+    def test_comment_reviewers_get_no_copilot_overview(self):
+        """Only Copilot writes an overview. A Codex head review must not be
+        turned into a fabricated one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"),
+                      author="chatgpt-codex-connector")
+
+        assert _fgt.reviewer_overview_for(pr, "chatgpt-codex-connector") is None
+        assert _fgt.reviewer_overview_for(
+            self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT
+        ) is not None
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
