@@ -932,6 +932,42 @@ class TestRequestState:
         assert state["head"] == "d7efa49000"
         assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
+    def test_a_newer_request_on_a_reviewed_head_is_pending(self):
+        """GitHub drops a reviewer from the requested list once it submits, so
+        a listed request newer than the head review is a later cycle. Reporting
+        COMPLETED_HEAD would let the loop read the old clean overview and stop
+        before the new review arrives (PR #116 review)."""
+        head_review = (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]),
+                reviews=[OLD_REVIEW, head_review],
+                events=[("agent", T_REQUEST), ("a-human", "2026-10-07T16:30:00Z")],
+            ),
+            now=_at("2026-10-07T16:31:00Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] == "2026-10-07T16:30:00Z"
+
+    def test_a_listed_request_keeps_its_age_after_an_overlapping_review(self):
+        """Two overlapping requests: a review answers the first, the second is
+        still listed. Its age must stay known, or it can never go stale and
+        be replaced if it is abandoned (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:25:00Z", "c0ffee0000")],
+                events=[("agent", "2026-10-07T16:10:00Z"), ("agent", "2026-10-07T16:20:00Z")],
+            ),
+            now=_at("2026-10-07T17:00:00Z"),
+        )
+
+        assert state["pending_since"] == "2026-10-07T16:20:00Z"
+        assert state["state"] == "STALE_PENDING"
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
@@ -1174,6 +1210,21 @@ def test_landed_check_is_unknown_without_the_agent_login():
 
     assert request_rereview.request_landed_since(
         "acme/widget", 159, review_vendors.COPILOT, None, "2026-10-07T16:00:00Z", runner=runner
+    ) is None
+
+
+def test_a_review_after_someone_elses_request_is_not_the_loops():
+    """The loop's request never landed, a teammate asked Copilot by hand, and
+    Copilot reviewed. That review answers the teammate; crediting it to the
+    loop would charge a free request to the cap (PR #116 review)."""
+    runner = _state_runner(
+        _gql_pr("d7efa49000"),
+        reviews=[(COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:30:00Z", "d7efa49000")],
+        events=[("a-human", "2026-10-07T16:25:00Z")],
+    )
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner
     ) is None
 
 

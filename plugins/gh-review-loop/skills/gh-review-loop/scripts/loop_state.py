@@ -176,22 +176,34 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
     return True
 
 
+# Returned inside the record list when the log cannot be trusted as complete.
+INCOMPLETE_LOG_RECORD: dict[str, Any] = {"incomplete": True}
+
+
 def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
-    """The PR's appended request records; None when there is no log yet."""
+    """The PR's appended request records; None when there is no log yet.
+
+    An unreadable log, or any malformed line (a crash can tear the last
+    append), yields ``[INCOMPLETE_LOG_RECORD]``: dropping a torn record would
+    make the rest look complete and undercount the cap.
+    """
     try:
         text = request_log_path(repo, pr).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
-        return None
+    except (OSError, ValueError):
+        return [dict(INCOMPLETE_LOG_RECORD)]
     records = []
     for line in text.splitlines():
+        if not line.strip():
+            continue
         try:
             item = json.loads(line)
         except ValueError:
-            continue  # a torn last line from a crash mid-append
-        if isinstance(item, dict):
-            records.append(item)
+            return [dict(INCOMPLETE_LOG_RECORD)]
+        if not isinstance(item, dict):
+            return [dict(INCOMPLETE_LOG_RECORD)]
+        records.append(item)
     return records
 
 

@@ -836,11 +836,12 @@ def request_state(
     completed_head = any(_review_commit(review) == head for review in completed)
 
     requests = (pull.get("reviewRequests") or {}).get("nodes") or []
-    pending = any(
+    listed = any(
         isinstance(node, dict)
         and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
         for node in requests
-    ) or any(review.get("state") == "PENDING" for review in vendor_reviews)
+    )
+    pending = listed or any(review.get("state") == "PENDING" for review in vendor_reviews)
 
     events = [reviewer_resolver.normalize_request_event(node) for node in raw_events]
     vendor_events = sorted(
@@ -852,10 +853,20 @@ def request_state(
     pending_since = None
     if vendor_events:
         newest = vendor_events[-1]["created_at"]
-        if not any(submitted > newest for submitted in completed_times):
+        # GitHub keeps one open request per reviewer and drops it when the
+        # reviewer submits, so a listed request is the newest request event,
+        # even if a review answering an earlier, overlapping one came later.
+        if listed or not any(submitted > newest for submitted in completed_times):
             pending_since = newest
+    head_reviewed_at = max(
+        (_review_submitted_at(review) or "" for review in completed if _review_commit(review) == head),
+        default="",
+    )
+    # A listed request newer than the head's review is a later cycle on the
+    # same head: wait for it rather than report the old review as current.
+    newer_request = listed and pending_since is not None and pending_since > head_reviewed_at
 
-    if completed_head:
+    if completed_head and not newer_request:
         state = "COMPLETED_HEAD"
     elif pending:
         state = "PENDING"
@@ -980,12 +991,16 @@ def request_landed_since(
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
+    someone_else_asked = False
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None or review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["actor_login"] == agent_login and event["created_at"] >= since:
+        if event["created_at"] < since:
+            continue
+        if event["actor_login"] == agent_login:
             return True
+        someone_else_asked = True
     reviews = _all_reviews(repo, pr, runner)
     if reviews is None:
         return None
@@ -993,7 +1008,9 @@ def request_landed_since(
         if review_vendors.vendor_for(_review_author(review)) is not vendor:
             continue
         if review.get("state") != "PENDING" and (_review_submitted_at(review) or "") >= since:
-            return True
+            # A review with no request event of ours is evidence only when no
+            # one else asked meanwhile; otherwise it may answer their request.
+            return None if someone_else_asked else True
     return False
 
 

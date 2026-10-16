@@ -4634,6 +4634,18 @@ class TestFetchProvenanceUnknown:
 
         assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
 
+    def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
+        """A crash mid-append can tear the last record. Skipping it would make
+        the rest look complete and undercount the cap (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T16:20:05Z", "countable": True})
+        with open(loop_state.request_log_path("acme/widget", 159), "a", encoding="utf-8") as handle:
+            handle.write('{"reviewer": "copilot-pull-req')
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
     def test_unknown_provenance_marks_the_count_incomplete(self):
         pr = self._pr_with_requests()
 

@@ -195,6 +195,8 @@ def loop_request_times_from_entry(
     """
     if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
         return None
+    if logged and any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return None
     stored = entry.get("review_requests") if isinstance(entry, dict) else None
     if not isinstance(stored, list) and logged is None:
         return None
