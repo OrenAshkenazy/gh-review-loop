@@ -101,8 +101,10 @@ COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
     # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
-    # is matched lazily up to the `](#discussion_r` that ends it.
-    r"\[(?P<title>[^\n]*?)\]\(#discussion_r(?P<id>\d+)\)",
+    # is matched lazily up to the `](…#discussion_r` that ends it. The link
+    # is a bare fragment in older overviews and an absolute PR URL in current
+    # ones (live, 2026-10-16), so an optional URL precedes the fragment.
+    r"\[(?P<title>[^\n]*?)\]\((?:https?://[^\s)#]+)?#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(

@@ -423,3 +423,24 @@ def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head()
 
     assert overview["covers_head"] is False
     assert clean_blocked_by([], overview, review_request_vendor=True) == "no_review_for_head"
+
+
+def test_absolute_discussion_links_are_parsed_too():
+    """Live Copilot overview, qizsecurity/local-dev#97 (2026-10-16): the
+    finding links are absolute PR URLs, not bare `#discussion_r` fragments.
+    Fragment-only matching left every finding unlinked and ungraded."""
+    body = (
+        "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\n"
+        "<summary><strong>2 open findings</strong></summary>\n\n"
+        '- <picture><img alt="High severity" width="62"></picture> '
+        "[Build and push research-tool with the session image tag]"
+        "(https://github.com/qizsecurity/local-dev/pull/97#discussion_r4298740956) · New\n"
+        '- <picture><img alt="Medium severity" width="62"></picture> '
+        "[Use portable sed output redirection](#discussion_r4298740999) · New\n"
+    )
+    parsed = parse_copilot_overview(body)
+
+    assert parsed["unlinked_findings"] == 0
+    assert [(f["severity"], f["discussion_id"]) for f in parsed["findings"]] == [
+        ("high", "4298740956"), ("medium", "4298740999"),
+    ]
