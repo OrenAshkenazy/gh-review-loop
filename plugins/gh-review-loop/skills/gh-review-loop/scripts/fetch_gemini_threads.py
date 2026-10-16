@@ -259,6 +259,9 @@ query($owner:String!, $repo:String!, $number:Int!) {
       headRefOid
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
+      reviewRequests(first:50) {
+        nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
+      }
       comments(last:100) {
         nodes {
           id
@@ -1407,11 +1410,13 @@ def latest_reviewer_overview(
     """
     head = pull_request.get("headRefOid") or ""
     newest_request = newest_request_at(pull_request, author)
+    listed = vendor_request_listed(pull_request, author)
     newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
 
     def current(review: dict[str, Any]) -> bool:
-        # Of the head, and not superseded by a later request on that head.
-        return bool(head) and (review.get("commit") or {}).get("oid") == head and (
+        # Of the head, and not superseded by a later request on that head,
+        # whether that request shows on the timeline yet or is only listed.
+        return bool(head) and not listed and (review.get("commit") or {}).get("oid") == head and (
             (review.get("submittedAt") or "") >= newest_request
         )
 
@@ -3078,6 +3083,23 @@ def newest_request_at(pull_request: dict[str, Any], author: str) -> str:
     return newest
 
 
+def vendor_request_listed(pull_request: dict[str, Any], author: str) -> bool:
+    """Is ``author``'s review-request vendor currently a requested reviewer?
+
+    GitHub drops a reviewer from this list when it submits, so a listed
+    request has not been answered by any existing review, even when its
+    timeline event has not surfaced yet.
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return False
+    return any(
+        isinstance(node, dict)
+        and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
+        for node in (pull_request.get("reviewRequests") or {}).get("nodes") or []
+    )
+
+
 def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
     """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
 
@@ -3087,7 +3109,7 @@ def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | N
     one. Both times are GitHub's, and a same-second answer counts.
     """
     head = pull_request.get("headRefOid") or ""
-    if not head:
+    if not head or vendor_request_listed(pull_request, author):
         return None
     newest_request = newest_request_at(pull_request, author)
     for review in filter_reviews(pull_request, author):

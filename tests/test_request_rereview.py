@@ -1034,6 +1034,23 @@ class TestRequestState:
 
         assert state["state"] == "ABSENT"
 
+    def test_a_listed_request_with_a_delayed_event_beats_the_old_head_review(self):
+        """GraphQL lists a new same-head request before the REST timeline
+        shows its event. Its age is unknown, but it is still pending, not
+        answered by the earlier head review (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:21:40Z", "d7efa49000")],
+                events=[("agent", T_REQUEST)],
+            ),
+            now=_at("2026-10-07T17:00:00Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] is None
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,

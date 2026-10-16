@@ -4377,6 +4377,22 @@ class TestHeadAnchoredWait:
         assert _fgt.latest_reviewer_overview(pr, self.COPILOT) is None or \
             _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is False
 
+    def test_a_listed_request_whose_event_lags_keeps_the_old_review_out(self):
+        """GraphQL lists the new same-head request before its timeline event
+        appears. GitHub drops a reviewer from the list once it submits, so the
+        old head review cannot answer it: wait, and do not call it clean
+        (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["reviewRequests"] = {"nodes": [{"requestedReviewer": {"__typename": "Bot", "login": self.COPILOT}}]}
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    def test_the_fetch_query_reads_listed_review_requests(self):
+        assert "reviewRequests(first:" in _fgt.QUERY
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]

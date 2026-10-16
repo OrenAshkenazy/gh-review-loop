@@ -898,7 +898,12 @@ def request_state(
     # not stand for the head, so a replacement may be posted (ABSENT).
     # ``>=``: GitHub stamps to the second, and pairing already gave the head
     # review its own request, so an unpaired one in the same second is newer.
-    newer_request = pending_since is not None and pending_since >= head_reviewed_at
+    # A listed request with no unpaired event is newer too: GitHub drops a
+    # reviewer from the list when it submits, so the head review cannot have
+    # answered it; its event has just not reached the timeline yet.
+    newer_request = (pending_since is not None and pending_since >= head_reviewed_at) or (
+        listed and pending_since is None
+    )
 
     if completed_head and not newer_request:
         state = "COMPLETED_HEAD"
