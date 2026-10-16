@@ -1495,7 +1495,7 @@ class TestReviewRequestMain:
         assert payload["status"] == "review_request_uncertain"
         assert payload["posted"] is None
         assert payload["withdrew_stale_request"] is True
-        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k != "id"} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_5xx_the_timeline_shows_landed_counts_as_posted(self, monkeypatch, capsys, tmp_path):
@@ -1661,7 +1661,7 @@ class TestReviewRequestMain:
         assert payload["reason"] == "registration_pending"
         assert payload["http_status"] == 201
         assert payload["posted"] is None
-        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k != "id"} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_settling_request_blocks_a_new_post(self, monkeypatch, capsys, tmp_path):
@@ -1920,6 +1920,27 @@ class TestReviewRequestMain:
 
         assert json.loads(capsys.readouterr().out)["posted"] is True
         assert self._stamped(tmp_path) == 0
+
+    def test_settling_an_already_logged_reservation_records_nothing_twice(self, monkeypatch, capsys, tmp_path):
+        """A crash after the log append but before the reservation was
+        cleared must not record the same request again on the next run
+        (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        at = self._seed_marker(seconds_ago=30, kind="maybe")
+        marker = self._marker()
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_REQUEST, requested_at=at, request_id=marker["id"],
+        )
+        stamped_before = self._stamped(tmp_path)
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert self._marker() is None
+        assert self._stamped(tmp_path) == stamped_before
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [at]
 
     def test_a_lagging_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
         """GraphQL can show the request pending before the REST timeline does.

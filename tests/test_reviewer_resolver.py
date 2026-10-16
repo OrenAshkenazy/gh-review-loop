@@ -461,3 +461,18 @@ def test_the_fallback_actor_filter_ignores_login_case():
     )
 
     assert len(counted) == 1
+
+
+def test_a_logged_re_review_in_the_first_review_second_counts():
+    """GitHub stamps to the second. A re-review recorded as countable whose
+    event shares the first review's second is still a re-review; the
+    cycle-zero cutoff belongs to the actor fallback only (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T15:46:14Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T15:46:13Z"],
+    )
+
+    assert len(counted) == 1

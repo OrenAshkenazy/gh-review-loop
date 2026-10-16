@@ -268,7 +268,14 @@ def counted_review_requests(
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["created_at"] <= first_completed_review_at:
+        # The actor fallback cannot tell the free first request from a
+        # re-review in the first review's second, so it excludes that second.
+        # Recorded times already exclude the free request (``countable``), so
+        # with them only events strictly before the first review are cycle 0.
+        if loop_request_times is None:
+            if event["created_at"] <= first_completed_review_at:
+                continue
+        elif event["created_at"] < first_completed_review_at:
             continue
         candidates.append(event)
     candidates.sort(key=lambda event: event["created_at"])
