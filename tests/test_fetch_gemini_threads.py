@@ -2768,6 +2768,9 @@ class TestDeriveOutcome:
 
     def test_clean_when_no_remaining_and_passed(self):
         assert _derive_outcome(0, "passed", cap_reached=False) == "clean"
+        # A Copilot clean gate that blocks (unparseable or stale overview)
+        # means zero threads is not clean, in the record too (PR #116 review).
+        assert _derive_outcome(0, "passed", cap_reached=False, clean_blocked="overview_unparseable") == "human"
 
     def test_human_fallback_when_remaining(self):
         assert _derive_outcome(2, "passed", cap_reached=False) == "human"

@@ -942,6 +942,7 @@ def _derive_outcome(
     *,
     gemini_confirmed: bool = True,
     likely_fixed_remaining: int = 0,
+    clean_blocked: str | None = None,
 ) -> str:
     """Best-effort outcome when the agent does not pass --outcome explicitly.
 
@@ -972,8 +973,12 @@ def _derive_outcome(
     likely_all_fixed = (
         remaining_actionable > 0 and likely_fixed_remaining >= remaining_actionable
     )
-    # No open threads and the suite passed — it *looks* resolved.
-    looks_resolved = remaining_actionable == 0 and verification == "passed"
+    # No open threads and the suite passed — it *looks* resolved. A blocking
+    # Copilot clean gate (``clean_blocked_by``) says zero threads is not
+    # clean yet, so the record must not say clean either.
+    looks_resolved = (
+        remaining_actionable == 0 and verification == "passed" and not clean_blocked
+    )
 
     # Final wait timed out (Gemini never re-confirmed) but state otherwise looks
     # fixed: never guess clean or capped — report pending confirmation.
@@ -4452,6 +4457,10 @@ def main() -> int:
                 cap_reached,
                 gemini_confirmed=args.gemini_confirmed,
                 likely_fixed_remaining=likely_fixed_remaining,
+                clean_blocked=clean_blocked_by(
+                    threads, reviewer_overview, review_request_vendor=review_request_vendor,
+                    known_thread_ids=discussion_ids_on_pr(pull_request),
+                ),
             )
             derived = derive_record_fields(
                 baseline_ids=baseline_ids,

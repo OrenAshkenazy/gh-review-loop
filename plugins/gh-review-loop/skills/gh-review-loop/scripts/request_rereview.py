@@ -473,7 +473,7 @@ def unconfirmed_path(repo: str, pr: int) -> Path:
 
 def record_unconfirmed_request(
     repo: str, pr: int, *, reviewer: str, at: str | None, kind: str, countable: bool = True,
-    request_id: str | None = None,
+    request_id: str | None = None, prior: dict[str, Any] | None = None,
 ) -> bool:
     """Remember a request whose outcome this run could not confirm; True if saved.
 
@@ -486,6 +486,9 @@ def record_unconfirmed_request(
     record = {
         "reviewer": reviewer, "at": at or utc_now_iso(), "kind": kind, "countable": countable,
         "id": request_id or uuid.uuid4().hex,
+        # Vendor activity already on the PR at reservation time; settling
+        # excludes it (see request_landed_since).
+        "prior": prior or {"events": [], "reviews": []},
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -913,6 +916,10 @@ def request_state(
         "head": head,
         "pending_since": pending_since,
         "first_completed_review_at": reviewer_resolver.first_completed_review_at(reviews, vendor),
+        # The vendor activity already on the PR, saved with a reservation so
+        # settling never mistakes it for the new request landing.
+        "vendor_event_times": [event["created_at"] for event in vendor_events],
+        "vendor_review_times": [_review_submitted_at(review) or "" for review in completed],
     }
 
 
@@ -1011,8 +1018,13 @@ def request_landed_since(
     agent_login: str | None,
     since: str,
     runner: Any = None,
+    prior: dict[str, Any] | None = None,
 ) -> bool | None:
     """Did a request posted at ``since`` ever land? None when the reads fail.
+
+    ``prior`` is the vendor activity already on the PR when the request was
+    reserved (``events``/``reviews`` timestamps). The skew allowance reaches
+    back before ``since``, so that activity is excluded by identity.
 
     Evidence is a request event for ``vendor`` by this agent at or after
     ``since``, or a submitted ``vendor`` review at or after it on any commit
@@ -1029,12 +1041,15 @@ def request_landed_since(
         return None
     # ``since`` is the local clock; event and review times are GitHub's.
     since = reviewer_resolver.shift_iso(since, -reviewer_resolver.PROVENANCE_SKEW_SECONDS)
+    prior = prior if isinstance(prior, dict) else {}
+    old_events = set(prior.get("events") or [])
+    old_reviews = set(prior.get("reviews") or [])
     someone_else_asked = False
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None or review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if event["created_at"] < since:
+        if event["created_at"] < since or event["created_at"] in old_events:
             continue
         if reviewer_resolver.same_login(event["actor_login"], agent_login):
             return True
@@ -1045,7 +1060,10 @@ def request_landed_since(
     for review in reviews:
         if review_vendors.vendor_for(_review_author(review)) is not vendor:
             continue
-        if review.get("state") != "PENDING" and (_review_submitted_at(review) or "") >= since:
+        submitted = _review_submitted_at(review) or ""
+        if submitted in old_reviews:
+            continue
+        if review.get("state") != "PENDING" and submitted >= since:
             # A review with no request event of ours is evidence only when no
             # one else asked meanwhile; otherwise it may answer their request.
             return None if someone_else_asked else True
@@ -1582,7 +1600,7 @@ def _settle_unconfirmed_request(
             args.repo, args.pr, reviewer,
             ReviewRequestRejected("earlier request not settled", reason="settling", requested_at=at),
         )
-    landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), at)
+    landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), at, prior=marker.get("prior"))
     if landed is None:
         return uncertain_payload(
             args.repo, args.pr, reviewer,
@@ -1648,7 +1666,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # visible (then recorded for the cap): GraphQL can list the request
         # before the timeline shows it, and a not-yet-visible request is not
         # an absent one. Otherwise it waits for the settle logic.
-        if request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"]):
+        if request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"], prior=marker.get("prior")):
             _record_settled_request(args.repo, args.pr, reviewer, marker)
     elif marker is not None and not args.dry_run:
         settled = _settle_unconfirmed_request(args, vendor, marker)
@@ -1698,9 +1716,13 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # append leaves this reservation, and the next run settles it. Taken
     # before any withdrawal, so a failed reservation leaves the PR untouched.
     request_id = uuid.uuid4().hex
+    prior = {
+        "events": list(state.get("vendor_event_times") or []),
+        "reviews": list(state.get("vendor_review_times") or []),
+    }
     if not args.dry_run and not record_unconfirmed_request(
         args.repo, args.pr, reviewer=reviewer, at=utc_now_iso(), kind="maybe", countable=countable,
-        request_id=request_id,
+        request_id=request_id, prior=prior,
     ):
         _emit(state_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
         return 0
@@ -1739,7 +1761,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             if maybe_landed:
                 saved = record_unconfirmed_request(
                     args.repo, args.pr, reviewer=reviewer, at=exc.requested_at,
-                    kind="maybe", countable=countable, request_id=request_id,
+                    kind="maybe", countable=countable, request_id=request_id, prior=prior,
                 )
                 refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:
@@ -1765,7 +1787,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             # the settle time has passed with nothing on the PR).
             saved = record_unconfirmed_request(
                 args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
-                kind="accepted", countable=countable, request_id=request_id,
+                kind="accepted", countable=countable, request_id=request_id, prior=prior,
             )
             unseen = uncertain_payload(
                 args.repo, args.pr, reviewer,
@@ -1780,7 +1802,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         if registered is None:
             saved = record_unconfirmed_request(
                 args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
-                kind="accepted", countable=countable, request_id=request_id,
+                kind="accepted", countable=countable, request_id=request_id, prior=prior,
             )
             # The read-back failed: unknown, not posted and not rejected. It is
             # not recorded as posted; the next run settles it.

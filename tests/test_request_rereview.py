@@ -1327,6 +1327,22 @@ def test_logged_requests_the_timeline_lags_on_still_count(monkeypatch, tmp_path)
     ) == 2
 
 
+def test_settling_ignores_activity_that_predates_the_reservation():
+    """Skew tolerance reaches two minutes back, where an earlier, already
+    answered request can sit. Activity saved with the reservation as
+    already present is never proof the new request landed (PR #116 review)."""
+    runner = _state_runner(
+        _gql_pr("d7efa49000"),
+        reviews=[(COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:19:40Z", "c0ffee0000")],
+        events=[("agent", "2026-10-07T16:19:00Z")],
+    )
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z", runner=runner,
+        prior={"events": ["2026-10-07T16:19:00Z"], "reviews": ["2026-10-07T16:19:40Z"]},
+    ) is False
+
+
 class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 
@@ -1510,7 +1526,7 @@ class TestReviewRequestMain:
         assert payload["status"] == "review_request_uncertain"
         assert payload["posted"] is None
         assert payload["withdrew_stale_request"] is True
-        assert {k: v for k, v in self._marker().items() if k != "id"} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_5xx_the_timeline_shows_landed_counts_as_posted(self, monkeypatch, capsys, tmp_path):
@@ -1676,7 +1692,7 @@ class TestReviewRequestMain:
         assert payload["reason"] == "registration_pending"
         assert payload["http_status"] == 201
         assert payload["posted"] is None
-        assert {k: v for k, v in self._marker().items() if k != "id"} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_settling_request_blocks_a_new_post(self, monkeypatch, capsys, tmp_path):
@@ -1882,6 +1898,30 @@ class TestReviewRequestMain:
 
         assert json.loads(capsys.readouterr().out)["posted"] is True
         assert self._marker() is not None
+
+    def test_the_reservation_saves_the_activity_already_on_the_pr(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: {"state": "ABSENT", "head": "abc1234def", "pending_since": None,
+                             "first_completed_review_at": T_FIRST_REVIEW,
+                             "vendor_event_times": ["2026-10-07T16:19:00Z"],
+                             "vendor_review_times": ["2026-10-07T16:19:40Z"]},
+        )
+        seen = {}
+        ok = self._fake_request({})
+
+        def post(repo, pr, login, **kw):
+            seen["marker"] = self._marker()
+            return ok(repo, pr, login, **kw)
+
+        monkeypatch.setattr(request_rereview, "request_review", post)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert seen["marker"]["prior"] == {"events": ["2026-10-07T16:19:00Z"], "reviews": ["2026-10-07T16:19:40Z"]}
 
     def test_a_definite_refusal_releases_the_reservation(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
