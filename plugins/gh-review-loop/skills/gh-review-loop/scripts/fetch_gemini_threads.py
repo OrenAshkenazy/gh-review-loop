@@ -998,7 +998,6 @@ def pagination_warnings(
     """
     warnings: list[str] = []
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
     if not review_request_count_complete(
         pull_request, review_request_vendor=review_request_vendor
