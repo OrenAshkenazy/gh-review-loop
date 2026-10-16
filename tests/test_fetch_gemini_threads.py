@@ -4730,6 +4730,21 @@ class TestFetchProvenanceUnknown:
             pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
         ) is True
 
+    def test_explicitly_incomplete_history_makes_a_zero_count_incomplete(self, monkeypatch, tmp_path):
+        """No local history and an explicitly incomplete one both read as
+        None; only the latter must make even a zero event count a lower
+        bound (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(pr, loop_request_times=None, counted_requests=0) is True
+        assert loop_state.mark_provenance_incomplete("acme/widget", 159) is True
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=None, counted_requests=0,
+            provenance_incomplete=loop_state.provenance_incomplete("acme/widget", 159),
+        ) is False
+
     def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
         """A crash mid-append can tear the last record. Skipping it would make
         the rest look complete and undercount the cap (PR #116 review)."""

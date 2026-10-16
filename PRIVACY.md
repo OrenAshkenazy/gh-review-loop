@@ -94,6 +94,7 @@ Known files:
 ~/.config/gh-review-loop/state.json
 ~/.config/gh-review-loop/runs.jsonl
 ~/.config/gh-review-loop/provenance/<owner>_<repo>_<pr>.jsonl
+~/.config/gh-review-loop/provenance/<owner>_<repo>_<pr>.incomplete
 ~/.config/gh-review-loop/locks/<owner>_<repo>_<pr>.lock
 ~/.config/gh-review-loop/locks/<owner>_<repo>_<pr>.unconfirmed.json
 ```
@@ -104,7 +105,7 @@ Known files:
 
 `runs.jsonl` stores one append-only record per completed loop run: workflow counts (findings fetched, fixed, needs-human, addressed-by-reply, cycles used, verification result, outcome, duration), the repository name, and the pull request number. It contains no identity — no git author, GitHub login, or email — and is never transmitted. It exists solely to power the local run summary and the `--stats` command.
 
-`provenance/*.jsonl` stores one append-only line per review request the loop posted for a review-request reviewer (GitHub Copilot): the reviewer bot's login, the request timestamp, and whether it counted toward the re-review cap. It lets the cap tell the loop's own requests from ones you click in GitHub. Deleting it makes the cap fall back to counting every request made under your login.
+`provenance/*.jsonl` stores one append-only line per review request the loop posted for a review-request reviewer (GitHub Copilot): the reviewer bot's login, the request timestamp, and whether it counted toward the re-review cap. It lets the cap tell the loop's own requests from ones you click in GitHub. Deleting it makes the cap fall back to counting every request made under your login. The empty `.incomplete` file beside it appears only if a request could not be written to that log, and has the same effect.
 
 `locks/` holds an empty per-PR lock file that keeps two loop runs from requesting a review at the same time, and, briefly, a record of a request whose outcome GitHub had not confirmed yet (reviewer login, timestamp, and the kind of uncertainty). That record is deleted once the request is confirmed or ruled out.
 

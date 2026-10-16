@@ -1942,14 +1942,7 @@ class TestReviewRequestMain:
         self._stub_reads(monkeypatch)
         monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
         monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
-        real_write = request_rereview.Path.write_text
-
-        def no_state(self, *args, **kwargs):
-            if self.name == "state.json":
-                raise OSError("read-only file system")
-            return real_write(self, *args, **kwargs)
-
-        monkeypatch.setattr(request_rereview.Path, "write_text", no_state)
+        monkeypatch.setattr(request_rereview.loop_state, "mark_provenance_incomplete", lambda *a, **k: False)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -2669,6 +2662,31 @@ class TestProvenanceFailsClosed:
         assert request_rereview.loop_request_times(
             "acme/widget", 159, review_vendors.COPILOT
         ) == []
+
+    def test_a_failed_log_append_leaves_a_durable_incomplete_marker(self, monkeypatch, tmp_path):
+        """The incomplete flag used to live in state.json, which unlocked
+        writers rewrite whole; a concurrent fetch could erase it. It now sits
+        beside the provenance log, where nothing rewrites it (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
+        stale = request_rereview.load_state()
+
+        assert request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        ) is True
+        request_rereview.loop_state.save_sticky_state(stale)  # a concurrent writer lands last
+
+        assert request_rereview.loop_state.provenance_incomplete("acme/widget", 159) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+    def test_nothing_durable_means_not_recorded(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview.loop_state, "mark_provenance_incomplete", lambda *a, **k: False)
+
+        assert request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        ) is False
 
     def test_a_failed_log_append_marks_the_history_unusable(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))

@@ -412,6 +412,7 @@ def record_rereview_posted(
     already posted. The ordinal simply holds instead of drifting.
     """
     logged = True
+    marked = False
     if reviewer:
         # The cap's provenance goes to the PR's append-only log, which no
         # state.json writer can overwrite. Outside entry["run"] as well,
@@ -427,7 +428,11 @@ def record_rereview_posted(
             **({"request_id": request_id} if request_id else {}),
         })
         if not logged:
+            # The request was posted but is unrecorded, so the local history
+            # is no longer complete. Say so durably, beside the log, so the
+            # cap falls back to counting by actor; nothing rewrites that file.
             print("warning: could not record the review request for the cap", file=sys.stderr)
+            marked = loop_state.mark_provenance_incomplete(repo, pr)
     path = state_path()
     state = load_state()
     key = state_key_for(state, repo, pr)
@@ -440,21 +445,14 @@ def record_rereview_posted(
     if count_cycle:
         run["rereviews_posted"] = posted + 1
         entry["run"] = run
-    if not logged:
-        # The request was posted but is unrecorded, so the local history is no
-        # longer a complete account of what the loop did. Mark it unusable so
-        # the cap falls back to counting by actor instead of under-counting.
-        entry["review_requests_incomplete"] = True
     state[key] = entry
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
-        # Durable only if the log took the record; the incomplete flag that
-        # would have covered a failed append did not land either.
-        return logged
-    return True
+    # Durable once the log took the record, or the incomplete marker did.
+    return logged or marked
 
 
 # How long an unconfirmed review request may take to show up on the PR before
@@ -946,13 +944,8 @@ def _timeline_events(repo: str, pr: int, runner: Any) -> list[Any] | None:
 
 
 def provenance_incomplete(repo: str, pr: int) -> bool:
-    """Was a posted request explicitly left unrecorded (failed append, torn log)?"""
-    state = load_state()
-    entry = state.get(state_key_for(state, repo, pr))
-    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
-        return True
-    logged = loop_state.read_request_log(repo, pr) or []
-    return any(isinstance(item, dict) and item.get("incomplete") for item in logged)
+    """Was a posted request explicitly left unrecorded? See loop_state."""
+    return loop_state.provenance_incomplete(repo, pr)
 
 
 def count_agent_review_requests(

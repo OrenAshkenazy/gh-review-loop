@@ -1237,6 +1237,7 @@ def review_request_count_complete(
     review_request_vendor: bool = True,
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
+    provenance_incomplete: bool = False,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1257,6 +1258,10 @@ def review_request_count_complete(
     # candidate requests at all, zero is exact. Callers that pass neither get
     # the page-limit answer alone (back-compat).
     if loop_request_times is None and counted_requests:
+        return False
+    # A posted request that could not be logged: its event may not have
+    # reached the timeline yet, so even zero matched events is a bound.
+    if provenance_incomplete:
         return False
     # A request the loop durably recorded but whose event the timeline does
     # not show yet still consumed the cap: fewer matched events than records
@@ -4857,6 +4862,9 @@ def main() -> int:
                             review_request_vendor=review_request_vendor,
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
+                            provenance_incomplete=loop_state.provenance_incomplete(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
                         ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),

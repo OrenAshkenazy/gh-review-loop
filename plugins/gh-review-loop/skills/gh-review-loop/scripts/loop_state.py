@@ -180,6 +180,42 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
 INCOMPLETE_LOG_RECORD: dict[str, Any] = {"incomplete": True}
 
 
+def incomplete_marker_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".incomplete")
+
+
+def mark_provenance_incomplete(repo: str, pr: int) -> bool:
+    """Durably note that a posted request could not be logged; True once on disk.
+
+    Lives beside the provenance log, not in state.json: that file is
+    rewritten whole by unlocked writers, and a fetch holding an older
+    snapshot would erase a flag written there. Nothing rewrites this file.
+    """
+    path = incomplete_marker_path(repo, pr)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text("", encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def provenance_incomplete(repo: str, pr: int) -> bool:
+    """Was a posted request explicitly left unrecorded (failed append, torn log,
+    or the legacy state.json flag)?"""
+    if incomplete_marker_path(repo, pr).exists():
+        return True
+    logged = read_request_log(repo, pr) or []
+    if any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return True
+    state = load_sticky_state()
+    target = f"{repo}#{pr}".casefold()
+    for key, entry in state.items():
+        if isinstance(key, str) and key.casefold() == target:
+            return bool(isinstance(entry, dict) and entry.get("review_requests_incomplete"))
+    return False
+
+
 def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
     """The PR's appended request records; None when there is no log yet.
 
@@ -187,6 +223,8 @@ def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
     append), yields ``[INCOMPLETE_LOG_RECORD]``: dropping a torn record would
     make the rest look complete and undercount the cap.
     """
+    if incomplete_marker_path(repo, pr).exists():
+        return [dict(INCOMPLETE_LOG_RECORD)]
     try:
         text = request_log_path(repo, pr).read_text(encoding="utf-8")
     except FileNotFoundError:
