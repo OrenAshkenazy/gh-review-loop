@@ -1780,6 +1780,28 @@ class TestReviewRequestMain:
         assert self._marker() is None
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [CREATED_AT]
 
+    def test_the_reservation_stays_when_nothing_durable_was_recorded(self, monkeypatch, capsys, tmp_path):
+        """GitHub accepted the request but neither the log append nor the
+        incomplete flag could be saved. The reservation is then the only
+        record left, so it must stay for the next run to settle (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
+        real_write = request_rereview.Path.write_text
+
+        def no_state(self, *args, **kwargs):
+            if self.name == "state.json":
+                raise OSError("read-only file system")
+            return real_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(request_rereview.Path, "write_text", no_state)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert self._marker() is not None
+
     def test_a_definite_refusal_releases_the_reservation(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._stub_reads(monkeypatch)

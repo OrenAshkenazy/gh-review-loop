@@ -406,3 +406,20 @@ def test_finding_titles_may_contain_brackets():
         {"severity": "high", "discussion_id": "111", "title": "Guard arr[i] access"},
         {"severity": "low", "discussion_id": "222", "title": "Add [Authorize] to route"},
     ]
+
+
+def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head():
+    """Copilot reviewed the head clean, then was asked again without a push.
+    The old overview must not clear the gate while the new review is
+    pending (PR #116 review)."""
+    pr = _pr(_review(CLEAN_OVERVIEW, "2026-10-07T16:00:00Z"))
+    pr["timelineItems"] = {"nodes": [{
+        "__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:30:00Z",
+        "actor": {"login": "agent"},
+        "requestedReviewer": {"__typename": "Bot", "login": COPILOT},
+    }]}
+
+    overview = latest_reviewer_overview(pr, COPILOT)
+
+    assert overview["covers_head"] is False
+    assert clean_blocked_by([], overview, review_request_vendor=True) == "no_review_for_head"

@@ -4342,6 +4342,21 @@ class TestHeadAnchoredWait:
         return {"__typename": "ReviewRequestedEvent", "createdAt": at, "actor": {"login": actor},
                 "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
 
+    def test_the_rendered_count_keeps_the_actor_filter(self):
+        """Without provenance, the Markdown count must filter by the agent's
+        login like the enforced count, or a teammate's manual requests show
+        as loop usage (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        pr.update(number=5, url="u")
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:20:00Z", actor="agent"),
+            self._request_event("2026-10-07T16:25:00Z", actor="a-human"),
+        ]
+
+        out = _fgt.render_markdown(pr, [], self.COPILOT, agent_login="agent")
+
+        assert "Re-review requests: 1" in out
+
     def test_a_re_request_on_the_same_head_waits_for_the_newer_review(self):
         """Copilot reviewed the head, then was asked again on the unchanged
         head. The old review must not end the wait or stand in for the new

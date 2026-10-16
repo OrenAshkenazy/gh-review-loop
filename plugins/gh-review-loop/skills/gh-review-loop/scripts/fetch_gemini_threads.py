@@ -1392,14 +1392,25 @@ def latest_reviewer_overview(
     readable overview is reported with ``covers_head: false``.
     """
     head = pull_request.get("headRefOid") or ""
+    newest_request = newest_request_at(pull_request, author)
     newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
+
+    def current(review: dict[str, Any]) -> bool:
+        # Of the head, and not superseded by a later request on that head.
+        return bool(head) and (review.get("commit") or {}).get("oid") == head and (
+            (review.get("submittedAt") or "") >= newest_request
+        )
+
     for review in newest_first:
-        if head and (review.get("commit") or {}).get("oid") == head:
+        if current(review):
             return _overview_record(review, parse_copilot_overview(review.get("body")), head)
     for review in newest_first:
         parsed = parse_copilot_overview(review.get("body"))
         if parsed is not None:
-            return _overview_record(review, parsed, head)
+            record = _overview_record(review, parsed, head)
+            if record["covers_head"] and not current(review):
+                record["covers_head"] = False
+            return record
     return None
 
 
@@ -3036,6 +3047,23 @@ def review_activity_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def newest_request_at(pull_request: dict[str, Any], author: str) -> str:
+    """GitHub's time of the newest review request for ``author``'s vendor, or "".
+
+    Only review-request vendors have one. A head review submitted before it
+    is history: a re-request on an unchanged head asked for a new review.
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return ""
+    newest = ""
+    for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
+        event = reviewer_resolver.normalize_request_event(node)
+        if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
+            newest = max(newest, event["created_at"])
+    return newest
+
+
 def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
     """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
 
@@ -3047,13 +3075,7 @@ def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | N
     head = pull_request.get("headRefOid") or ""
     if not head:
         return None
-    newest_request = ""
-    vendor = review_vendors.vendor_for(author)
-    if vendor is not None and vendor.trigger_kind == "review_request":
-        for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
-            event = reviewer_resolver.normalize_request_event(node)
-            if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
-                newest_request = max(newest_request, event["created_at"])
+    newest_request = newest_request_at(pull_request, author)
     for review in filter_reviews(pull_request, author):
         if review.get("state") == "PENDING":
             continue
@@ -3393,12 +3415,15 @@ def render_markdown(
     baseline: dict[str, str] | None = None,
     full: bool = False,
     loop_requests: list[str] | None = None,
+    agent_login: str | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
     # `loop_requests` is the local provenance record, supplied by the caller
-    # that knows which PR this is; without it the count keeps the actor filter.
+    # that knows which PR this is; without it the count keeps the actor
+    # filter, so it needs the same agent login the enforced count uses.
     rereviews = rereview_requests(
         pr,
+        agent_login,
         review_trigger_mention=review_trigger_mention,
         reviewer_login=author,
         loop_request_times=loop_requests,
@@ -4806,6 +4831,7 @@ def main() -> int:
                 baseline=render_baseline,
                 full=args.full,
                 loop_requests=loop_request_times(pr, args.author),
+                agent_login=agent_login,
             ),
             end="",
         )

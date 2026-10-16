@@ -391,7 +391,7 @@ def record_rereview_posted(
     requested_at: str | None = None,
     count_cycle: bool = True,
     countable: bool = True,
-) -> None:
+) -> bool:
     """Stamp the cycle transition this re-review request completes.
 
     ``count_cycle=False`` records only the request's provenance: used when an
@@ -446,6 +446,10 @@ def record_rereview_posted(
         path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
+        # Durable only if the log took the record; the incomplete flag that
+        # would have covered a failed append did not land either.
+        return logged
+    return True
 
 
 # How long an unconfirmed review request may take to show up on the PR before
@@ -1733,12 +1737,13 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
     if payload.get("dry_run"):
         payload["would_post"] = True
-    else:
-        record_rereview_posted(
+    elif record_rereview_posted(
             args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
             count_cycle=countable, countable=countable,
-        )
-        clear_unconfirmed_request(args.repo, args.pr)
+        ):
+            # The record (or the incomplete flag) is durable; the reservation
+            # has done its job. Otherwise it stays as the only record.
+            clear_unconfirmed_request(args.repo, args.pr)
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     elif payload.get("dry_run"):
