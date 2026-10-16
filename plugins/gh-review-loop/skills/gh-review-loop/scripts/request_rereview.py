@@ -379,7 +379,7 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
     """
     state = load_state()
     return reviewer_resolver.loop_request_times_from_entry(
-        state.get(state_key_for(state, repo, pr)), vendor
+        state.get(state_key_for(state, repo, pr)), vendor, loop_state.read_request_log(repo, pr)
     )
 
 
@@ -409,6 +409,20 @@ def record_rereview_posted(
     Fails open: a state write failure must never block the re-review that was
     already posted. The ordinal simply holds instead of drifting.
     """
+    logged = True
+    if reviewer:
+        # The cap's provenance goes to the PR's append-only log, which no
+        # state.json writer can overwrite. Outside entry["run"] as well,
+        # which run tracking clears: it must outlive a single loop run.
+        logged = loop_state.append_request_log(repo, pr, {
+            "reviewer": reviewer,
+            "at": requested_at or utc_now_iso(),
+            # A re-review (cap-countable) or the free first request: known
+            # now, so never re-derived later from clock comparisons.
+            "countable": countable,
+        })
+        if not logged:
+            print("warning: could not record the review request for the cap", file=sys.stderr)
     path = state_path()
     state = load_state()
     key = state_key_for(state, repo, pr)
@@ -421,41 +435,17 @@ def record_rereview_posted(
     if count_cycle:
         run["rereviews_posted"] = posted + 1
         entry["run"] = run
-    if reviewer:
-        # Outside entry["run"], which run tracking clears: provenance for the
-        # cap must outlive a single loop run on the PR.
-        requests = entry.get("review_requests")
-        requests = list(requests) if isinstance(requests, list) else []
-        requests.append({
-            "reviewer": reviewer,
-            "at": requested_at or utc_now_iso(),
-            # A re-review (cap-countable) or the free first request: known
-            # now, so never re-derived later from clock comparisons.
-            "countable": countable,
-        })
-        entry["review_requests"] = requests
+    if not logged:
+        # The request was posted but is unrecorded, so the local history is no
+        # longer a complete account of what the loop did. Mark it unusable so
+        # the cap falls back to counting by actor instead of under-counting.
+        entry["review_requests_incomplete"] = True
     state[key] = entry
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
-        # The request was posted but is now unrecorded, so the local history is
-        # no longer a complete account of what the loop did. Mark it unusable so
-        # the cap falls back to counting by actor instead of under-counting.
-        # Best effort: if this write fails too, the stale history stays, which
-        # is why the next read also treats a missing entry as unknown.
-        if reviewer:
-            try:
-                marked = load_state()
-                key_now = state_key_for(marked, repo, pr)
-                existing = marked.get(key_now)
-                existing = dict(existing) if isinstance(existing, dict) else {}
-                existing["review_requests_incomplete"] = True
-                marked[key_now] = existing
-                path.write_text(json.dumps(marked, indent=2, sort_keys=True), encoding="utf-8")
-            except OSError:
-                pass
 
 
 # How long an unconfirmed review request may take to show up on the PR before
@@ -981,6 +971,10 @@ def request_landed_since(
     ``since``, or a submitted ``vendor`` review at or after it on any commit
     (the head may have moved on since).
     """
+    if not agent_login:
+        # Without the actor, a teammate's manual request is indistinguishable
+        # from the loop's; attributing it would charge a free request to the cap.
+        return None
     if runner is None:
         runner = subprocess.run
     events = _timeline_events(repo, pr, runner)
@@ -990,7 +984,7 @@ def request_landed_since(
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None or review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
-        if (not agent_login or event["actor_login"] == agent_login) and event["created_at"] >= since:
+        if event["actor_login"] == agent_login and event["created_at"] >= since:
             return True
     reviews = _all_reviews(repo, pr, runner)
     if reviews is None:
@@ -1340,8 +1334,7 @@ def lock_path(repo: str, pr: int) -> Path:
     """One lock file per PR. GitHub owner and repo names are case-insensitive,
     so `Acme/Widget` and `acme/widget` must map to the same file even on a
     case-sensitive filesystem."""
-    safe = re.sub(r"[^a-z0-9._-]", "_", f"{repo}#{pr}".casefold())
-    return loop_state.state_dir() / "locks" / f"{safe}.lock"
+    return loop_state.pr_scoped_path(repo, pr, "locks", ".lock")
 
 
 def _try_lock(handle: Any) -> bool:

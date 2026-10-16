@@ -1166,6 +1166,17 @@ class TestReviewRequestHelpers:
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) is None
 
 
+def test_landed_check_is_unknown_without_the_agent_login():
+    """Without the login, a teammate's manual request cannot be told from the
+    loop's, so the answer is unknown, never "landed" (PR #116 review)."""
+    def runner(*a, **k):
+        pytest.fail("no read is useful without the actor to match")
+
+    assert request_rereview.request_landed_since(
+        "acme/widget", 159, review_vendors.COPILOT, None, "2026-10-07T16:00:00Z", runner=runner
+    ) is None
+
+
 class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 
@@ -2276,7 +2287,7 @@ class TestProvenanceFailsClosed:
             "acme/widget", 159, review_vendors.COPILOT
         ) == []
 
-    def test_a_failed_state_write_marks_the_history_unusable(self, monkeypatch, tmp_path):
+    def test_a_failed_log_append_marks_the_history_unusable(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         request_rereview.record_rereview_posted(
             "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
@@ -2285,29 +2296,36 @@ class TestProvenanceFailsClosed:
             "acme/widget", 159, review_vendors.COPILOT
         ) == [T_REQUEST]
 
-        # The next POST lands, but the write that would record it fails. The
-        # follow-up marker write succeeds, which is the realistic transient
-        # case (a full disk clearing, a lock released).
-        real_write = request_rereview.Path.write_text
-        calls = {"n": 0}
-
-        def flaky_write(self, *args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise OSError("read-only file system")
-            return real_write(self, *args, **kwargs)
-
-        monkeypatch.setattr(request_rereview.Path, "write_text", flaky_write)
+        # The next POST lands, but appending its record fails.
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
         request_rereview.record_rereview_posted(
             "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T17:00:00Z"
         )
-        monkeypatch.setattr(request_rereview.Path, "write_text", real_write)
 
         # One request is now unrecorded, so the history can no longer be
         # trusted as complete: unknown, not "one request".
         assert request_rereview.loop_request_times(
             "acme/widget", 159, review_vendors.COPILOT
         ) is None
+
+    def test_a_failed_state_write_does_not_lose_provenance(self, monkeypatch, tmp_path):
+        """The cap's records live in the append-only log, so a failed
+        state.json write (the cycle ordinal) leaves the history complete."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        def fail(self, *args, **kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(request_rereview.Path, "write_text", fail)
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        )
+        monkeypatch.undo()
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        assert request_rereview.loop_request_times(
+            "acme/widget", 159, review_vendors.COPILOT
+        ) == [T_REQUEST]
 
     def test_unknown_provenance_with_candidate_events_refuses_to_count(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))

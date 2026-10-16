@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -142,6 +143,56 @@ def save_sticky_state(state: dict[str, Any]) -> None:
     path = sticky_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+
+def pr_scoped_path(repo: str, pr: int, subdir: str, suffix: str) -> Path:
+    """A per-PR file under the state dir. Owner and repo names are
+    case-insensitive on GitHub, so the name is case-folded."""
+    safe = re.sub(r"[^a-z0-9._-]", "_", f"{repo}#{pr}".casefold())
+    return state_dir() / subdir / f"{safe}{suffix}"
+
+
+def request_log_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".jsonl")
+
+
+def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
+    """Append one review-request record; True once it is on disk.
+
+    The cap's provenance lives here, not in state.json: state.json is
+    rewritten whole by many writers that do not lock each other, and a writer
+    holding an older snapshot would erase a record appended meanwhile. An
+    appended line is never rewritten by anyone.
+    """
+    path = request_log_path(repo, pr)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
+    """The PR's appended request records; None when there is no log yet."""
+    try:
+        text = request_log_path(repo, pr).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    records = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue  # a torn last line from a crash mid-append
+        if isinstance(item, dict):
+            records.append(item)
+    return records
 
 
 def safe_int(value: Any) -> int:

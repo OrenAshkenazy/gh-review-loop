@@ -4617,6 +4617,23 @@ class TestFetchProvenanceUnknown:
 
         assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
 
+    def test_a_stale_state_writer_cannot_erase_recorded_requests(self, monkeypatch, tmp_path):
+        """state.json is rewritten whole by many writers that do not lock each
+        other. A writer holding a snapshot from before a request was recorded
+        must not erase it, or the cap undercounts (PR #116 review)."""
+        import request_rereview
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {"run": {}}})
+        stale = _fgt.load_sticky_state()
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer="copilot-pull-request-reviewer[bot]",
+            requested_at="2026-10-07T16:20:05Z",
+        )
+        _fgt.save_sticky_state(stale)  # the concurrent writer lands last
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
+
     def test_unknown_provenance_marks_the_count_incomplete(self):
         pr = self._pr_with_requests()
 

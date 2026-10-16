@@ -42,6 +42,7 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     touch_sentinel,
 )
 from loop_state import safe_int as _safe_int  # noqa: E402
+import loop_state  # noqa: E402
 
 
 # There is no default reviewer. An unconfigured PR resolves to "none configured"
@@ -1669,7 +1670,9 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
     return reviewer_resolver.loop_request_times_from_entry(
-        load_sticky_state().get(_state_key(pr), {}), vendor
+        load_sticky_state().get(_state_key(pr), {}),
+        vendor,
+        loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number),
     )
 
 

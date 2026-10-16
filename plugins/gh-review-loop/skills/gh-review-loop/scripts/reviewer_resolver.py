@@ -177,7 +177,11 @@ def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     return -PROVENANCE_SKEW_SECONDS <= delta <= window_seconds
 
 
-def loop_request_times_from_entry(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
+def loop_request_times_from_entry(
+    entry: Any,
+    vendor: review_vendors.ReviewVendor,
+    logged: list[dict[str, Any]] | None = None,
+) -> list[str] | None:
     """The countable request times this loop recorded for ``vendor``, sorted.
 
     None means unknown, not empty: no record for the PR, or a POST whose
@@ -185,13 +189,16 @@ def loop_request_times_from_entry(entry: Any, vendor: review_vendors.ReviewVendo
     list is authoritative to the counter. Records stored with
     ``countable: False`` are the free first request; whether a request is a
     re-review is known when it is posted, so it is never re-derived by
-    comparing the local clock with GitHub's.
+    comparing the local clock with GitHub's. ``logged`` is the PR's
+    append-only request log (``loop_state.read_request_log``); records in
+    ``entry`` are the older state.json form, still honored.
     """
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
         return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
+    stored = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(stored, list) and logged is None:
         return None
+    requests = (stored if isinstance(stored, list) else []) + (logged or [])
     out = []
     for item in requests:
         if not isinstance(item, dict) or item.get("countable") is False:
