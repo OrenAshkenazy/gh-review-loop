@@ -985,6 +985,23 @@ class TestRequestState:
         assert state["pending_since"] is None
         assert state["state"] == "PENDING"
 
+    def test_a_same_second_listed_request_after_a_head_review_is_pending(self):
+        """GitHub times are second-precision. A listed, unpaired request in the
+        same second as the head review is still a newer cycle (PR #116 review)."""
+        same = "2026-10-07T16:21:40Z"
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000", pending=[COPILOT_LOGIN]),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", same, "d7efa49000")],
+                events=[("agent", T_REQUEST), ("agent", same)],
+            ),
+            now=_at("2026-10-07T16:22:00Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] == same
+
     def test_request_state_pending_fresh(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,

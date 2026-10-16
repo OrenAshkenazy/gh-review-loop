@@ -871,7 +871,9 @@ def request_state(
     )
     # A listed request newer than the head's review is a later cycle on the
     # same head: wait for it rather than report the old review as current.
-    newer_request = listed and pending_since is not None and pending_since > head_reviewed_at
+    # ``>=``: GitHub stamps to the second, and pairing already gave the head
+    # review its own request, so an unpaired one in the same second is newer.
+    newer_request = listed and pending_since is not None and pending_since >= head_reviewed_at
 
     if completed_head and not newer_request:
         state = "COMPLETED_HEAD"

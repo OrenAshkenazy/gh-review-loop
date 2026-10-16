@@ -1250,6 +1250,15 @@ def review_request_count_complete(
     # the page-limit answer alone (back-compat).
     if loop_request_times is None and counted_requests:
         return False
+    # A request the loop durably recorded but whose event the timeline does
+    # not show yet still consumed the cap: fewer matched events than records
+    # makes the count a lower bound, not an exact number.
+    if (
+        isinstance(loop_request_times, list)
+        and counted_requests is not None
+        and counted_requests < len(loop_request_times)
+    ):
+        return False
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
     return len(nodes) < PAGE_LIMIT_TIMELINE and not reviews_page_truncated(pull_request)
 

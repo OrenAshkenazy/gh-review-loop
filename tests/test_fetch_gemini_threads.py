@@ -4670,6 +4670,19 @@ class TestFetchProvenanceUnknown:
 
         assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
 
+    def test_recorded_requests_the_timeline_does_not_show_yet_make_the_count_incomplete(self):
+        """A durably recorded request whose event GraphQL has not exposed yet
+        is still a consumed request: zero matched events is a lower bound,
+        not an exact zero (PR #116 review)."""
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=0
+        ) is False
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
+        ) is True
+
     def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
         """A crash mid-append can tear the last record. Skipping it would make
         the rest look complete and undercount the cap (PR #116 review)."""
