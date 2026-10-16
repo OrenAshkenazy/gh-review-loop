@@ -1389,6 +1389,17 @@ def test_explicitly_incomplete_history_is_unknown_even_with_no_events(monkeypatc
     ) is None
 
 
+def test_confirming_a_5xx_ignores_an_event_already_on_the_pr():
+    """An agent request event in the same second as the failed POST that
+    was already there before it is not proof the POST landed (PR #116 review)."""
+    runner = _state_runner(_gql_pr("d7efa49000"), events=[("agent", "2026-10-07T16:20:00Z")])
+
+    assert request_rereview.confirm_posted_after_uncertain(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:20:00Z",
+        runner=runner, prior={"events": ["2026-10-07T16:20:00Z"], "reviews": []},
+    ) is False
+
+
 class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 

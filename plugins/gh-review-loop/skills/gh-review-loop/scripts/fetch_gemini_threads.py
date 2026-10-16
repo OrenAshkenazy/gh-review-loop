@@ -1498,6 +1498,25 @@ def clean_blocked_by(
     return None
 
 
+def rereview_limit_reached(
+    pull_request: dict[str, Any], author: str | None, used: int, limit: int
+) -> bool:
+    """Has the loop used its re-review cap?
+
+    For a review-request vendor (Copilot) with no completed review yet, the
+    next request is the free cycle 0, which request_rereview.py allows even
+    at a cap of 0, so the limit cannot be reached before that first review.
+    """
+    vendor = review_vendors.vendor_for(author) if author else None
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        first = reviewer_resolver.first_completed_review_at(
+            (pull_request.get("reviews") or {}).get("nodes") or [], vendor
+        )
+        if not first:
+            return False
+    return used >= limit
+
+
 def rereview_requests(
     pull_request: dict[str, Any],
     agent_login: str | None = None,
@@ -4471,7 +4490,9 @@ def main() -> int:
                 accumulated_results = {}
             merged_judge_results = merge_judge_results(accumulated_results, judge_results)
             judge_ran = bool(run.get("judge_ran")) or bool(judge_status.get("ran"))
-            cap_reached = len(rereviews) >= args.max_rereview_requests
+            cap_reached = rereview_limit_reached(
+                pull_request, args.author, len(rereviews), args.max_rereview_requests
+            )
             fixed_markers = read_fixed_markers(pr)
             changed_paths = changed_files_in_range(args.changed_base, args.changed_head)
             remaining_states = classify_remaining_finding_states(
@@ -4824,7 +4845,9 @@ def main() -> int:
                         ) or None,
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
-                        "limitReached": len(rereviews) >= args.max_rereview_requests,
+                        "limitReached": rereview_limit_reached(
+                            pull_request, args.author, len(rereviews), args.max_rereview_requests
+                        ),
                         # False when a page the count rests on was full, or
                         # when the loop has no local record of its own
                         # requests: the count above is then a bound, not a

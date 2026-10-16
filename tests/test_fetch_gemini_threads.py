@@ -4404,6 +4404,16 @@ class TestHeadAnchoredWait:
             self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT
         ) is not None
 
+    def test_the_free_first_request_never_makes_the_limit_reached(self):
+        """With no completed Copilot review the next request is the free
+        cycle 0, which the request side allows even at a cap of 0 (PR #116 review)."""
+        pr = self._pr("d7efa49")
+
+        assert _fgt.rereview_limit_reached(pr, self.COPILOT, 0, 0) is False
+        reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 0, 0) is True
+        assert _fgt.rereview_limit_reached(pr, "chatgpt-codex-connector", 0, 0) is True
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]

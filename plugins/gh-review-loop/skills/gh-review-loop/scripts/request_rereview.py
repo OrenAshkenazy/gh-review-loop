@@ -1014,8 +1014,12 @@ def confirm_posted_after_uncertain(
     agent_login: str | None,
     requested_at: str | None,
     runner: Any = None,
+    prior: dict[str, Any] | None = None,
 ) -> bool:
     """After an uncertain POST, did the agent's request land on the timeline?
+
+    ``prior`` is the activity snapshot saved with the reservation: an event
+    already on the PR before the POST, even in the same second, is not it.
 
     ``>=`` on the timestamp: GitHub stamps to the second, so a request that
     landed within the same second as the local pre-POST time still counts.
@@ -1027,11 +1031,14 @@ def confirm_posted_after_uncertain(
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return False
+    old_events = set((prior or {}).get("events") or [])
     for raw in events:
         event = reviewer_resolver.normalize_request_event(raw)
         if event is None:
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
+            continue
+        if event["created_at"] in old_events:
             continue
         if reviewer_resolver.same_login(event["actor_login"], agent_login) and event["created_at"] >= requested_at:
             return True
@@ -1771,7 +1778,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # reconcile it like a missing status (PR #116 review).
         maybe_landed = exc.reason in ("uncertain", "transient")
         if maybe_landed and confirm_posted_after_uncertain(
-            args.repo, args.pr, vendor, gh_login(), exc.requested_at
+            args.repo, args.pr, vendor, gh_login(), exc.requested_at, prior=prior
         ):
             payload = {
                 "created_at": exc.requested_at,
