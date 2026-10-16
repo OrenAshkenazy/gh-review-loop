@@ -11,6 +11,7 @@ STALE_PENDING (see docs/superpowers/specs/2026-10-07-copilot-reviewer-design.md 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import json
 import re
@@ -18,7 +19,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
 
 import judge
 import review_vendors
@@ -1193,6 +1199,81 @@ def stale_not_replaced_payload(repo: str, pr: int, reviewer: str, pending_since:
     }
 
 
+# How long a run waits for another run's state-check/POST on the same PR.
+LOCK_WAIT_SECONDS = 30
+
+
+@contextlib.contextmanager
+def pr_request_lock(repo: str, pr: int) -> Iterator[bool]:
+    """Serialize the state-check/count/POST sequence per PR on this machine.
+
+    GitHub does not dedupe review requests, so two loops that both read
+    ABSENT (or the same remaining cap) would both POST and get two reviews.
+    Yields True when the lock is held, False when another run kept it past
+    ``LOCK_WAIT_SECONDS``. Runs on other machines are not covered; the
+    pending-state dedupe is still the guard there. When no lock file can be
+    created (no flock, unwritable state dir) it yields True: the lock is a
+    guard against a race, and failing closed would block every request.
+    """
+    if fcntl is None:
+        yield True
+        return
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{repo}#{pr}")
+    try:
+        lock_dir = loop_state.state_dir() / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = open(lock_dir / f"{safe}.lock", "a+", encoding="utf-8")
+    except OSError:
+        yield True
+        return
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.5)
+            except OSError:
+                yield True
+                return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def request_in_progress_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    return {
+        "status": "request_in_progress",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"Another run is requesting a review from `{reviewer}` on {repo}#{pr} "
+            f"right now (lock held past {LOCK_WAIT_SECONDS}s). Nothing was posted. "
+            "Let that run finish, then check the PR before requesting again."
+        ),
+    }
+
+
+def _note_withdrawal(payload: dict[str, Any]) -> dict[str, Any]:
+    """Mark a refusal that followed a successful withdrawal of a stale request."""
+    payload["withdrew_stale_request"] = True
+    payload["message"] = (
+        f"{payload.get('message', '').rstrip()} The stale pending request was "
+        "withdrawn before this attempt, so nothing is pending now. Running this "
+        "again requests a fresh review."
+    ).strip()
+    return payload
+
+
 def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1201,7 +1282,19 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
 
 
 def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
-    """The review_request path (spec §3): resolve state, dedupe, cap, POST, stamp."""
+    """The review_request path (spec §3), serialized per PR (see ``pr_request_lock``)."""
+    with pr_request_lock(args.repo, args.pr) as held:
+        if not held:
+            _emit(
+                request_in_progress_payload(args.repo, args.pr, vendor.request_login),
+                json_output=args.json_output,
+            )
+            return 0
+        return _run_review_request_locked(args, vendor)
+
+
+def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
+    """Resolve state, dedupe, cap, POST, stamp — called with the PR lock held."""
     reviewer = vendor.request_login
     json_output = args.json_output
     if args.phrase is not None or args.reviewer_mention:
@@ -1238,8 +1331,12 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
         if used >= cap:
             _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
             return 0
-    # The open request is withdrawn only once the cap has cleared, so a refusal
-    # never leaves the PR with nothing pending. A dry run withdraws nothing.
+    # The open request is withdrawn only once the cap has cleared, so a cap
+    # refusal never leaves the PR with nothing pending. A dry run withdraws
+    # nothing. If the replacement POST then fails, a retryable failure gets
+    # one more POST (it re-creates the request); a definite failure is
+    # reported as a withdrawal, never as "the old request is still there".
+    withdrew = False
     if state["state"] == "STALE_PENDING" and not args.dry_run:
         if not cancel_review_request(args.repo, args.pr, reviewer):
             _emit(
@@ -1247,8 +1344,14 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
                 json_output=json_output,
             )
             return 0
+        withdrew = True
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+        try:
+            payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+        except ReviewRequestRejected as first:
+            if not (withdrew and first.retryable):
+                raise
+            payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
     except ReviewRequestRejected as exc:
         if exc.reason == "uncertain" and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at
@@ -1265,7 +1368,10 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
                 "registered": True,
             }
         else:
-            _emit(rejected_payload(args.repo, args.pr, reviewer, exc), json_output=json_output)
+            refused = rejected_payload(args.repo, args.pr, reviewer, exc)
+            if withdrew and exc.reason != "uncertain":
+                refused = _note_withdrawal(refused)
+            _emit(refused, json_output=json_output)
             return 0
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1276,17 +1382,15 @@ def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVe
         # dropped request neither consumes the cap nor starts a wait.
         registered = request_registered(args.repo, args.pr, vendor, payload.get("created_at"))
         if registered is False:
-            _emit(
-                rejected_payload(
-                    args.repo, args.pr, reviewer,
-                    ReviewRequestRejected(
-                        "GitHub returned 201 but the reviewer was not added",
-                        reason="not_enabled", http_status=201, retryable=False,
-                        requested_at=payload.get("created_at"),
-                    ),
+            dropped = rejected_payload(
+                args.repo, args.pr, reviewer,
+                ReviewRequestRejected(
+                    "GitHub returned 201 but the reviewer was not added",
+                    reason="not_enabled", http_status=201, retryable=False,
+                    requested_at=payload.get("created_at"),
                 ),
-                json_output=json_output,
             )
+            _emit(_note_withdrawal(dropped) if withdrew else dropped, json_output=json_output)
             return 0
         if registered is None:
             # The read-back failed: unknown, not posted and not rejected.

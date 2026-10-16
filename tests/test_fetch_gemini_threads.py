@@ -4624,3 +4624,81 @@ class TestFetchProvenanceUnknown:
         )
 
         assert len(counted) == 1
+
+
+class TestFullReviewHistory:
+    """A full `reviews(last:100)` page can hide the head review and the
+    free-cycle boundary. fetch_threads backfills the whole history so the
+    waiter, the clean gate and the cap all read complete data (PR #116 review)."""
+
+    PR = PullRequest(owner="o", repo="r", number=5)
+    HEAD = "head000"
+
+    def _review(self, i, author="someone", commit="old000"):
+        return {"id": f"R{i}", "author": {"login": author, "__typename": "User"},
+                "body": "", "state": "COMMENTED",
+                "submittedAt": f"2026-10-01T00:{i // 60:02d}:{i % 60:02d}Z",
+                "url": f"u{i}", "commit": {"oid": commit}}
+
+    def test_full_page_is_backfilled_with_every_review(self, monkeypatch):
+        bot = "copilot-pull-request-reviewer"
+        history = [self._review(0, bot, self.HEAD)] + [self._review(i) for i in range(1, 101)]
+        main_page = {"data": {"repository": {"pullRequest": {
+            "headRefOid": self.HEAD, "reviews": {"nodes": history[-100:]},
+            "timelineItems": {"nodes": []},
+        }}}}
+
+        def run_gh(args, cwd=None):
+            query = args[3]
+            if "reviewsAfter" in query:
+                after = next((a.split("=", 1)[1] for a in args if a.startswith("reviewsAfter=")), None)
+                start = 0 if after is None else int(after)
+                chunk = history[start:start + 100]
+                more = start + 100 < len(history)
+                return {"data": {"repository": {"pullRequest": {"reviews": {
+                    "pageInfo": {"hasNextPage": more, "endCursor": str(start + 100) if more else None},
+                    "nodes": chunk,
+                }}}}}
+            return main_page
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 101
+        assert fgt.head_review(pull_request, bot)["id"] == "R0"
+        assert not any("reviews hit page limit" in w for w in fgt.pagination_warnings(pull_request))
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_short_page_makes_no_extra_call(self, monkeypatch):
+        calls = []
+
+        def run_gh(args, cwd=None):
+            calls.append(args)
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": [self._review(1)]},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(calls) == 1
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_failed_backfill_keeps_the_page_and_stays_truncated(self, monkeypatch):
+        page = [self._review(i) for i in range(100)]
+
+        def run_gh(args, cwd=None):
+            if "reviewsAfter" in args[3]:
+                raise RuntimeError("gh exploded")
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": page},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 100
+        assert fgt.reviews_page_truncated(pull_request) is True

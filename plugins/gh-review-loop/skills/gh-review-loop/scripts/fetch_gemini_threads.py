@@ -97,7 +97,9 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
-    r"\[(?P<title>[^\]\n]*)\]\(#discussion_r(?P<id>\d+)\)",
+    # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
+    # is matched lazily up to the `](#discussion_r` that ends it.
+    r"\[(?P<title>[^\n]*?)\]\(#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(
@@ -422,9 +424,86 @@ def fetch_threads(pr: PullRequest) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected gh GraphQL response.")
     try:
-        return result["data"]["repository"]["pullRequest"]
+        pull_request = result["data"]["repository"]["pullRequest"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected gh GraphQL shape: missing {exc}") from exc
+    if isinstance(pull_request, dict):
+        backfill_reviews(pr, pull_request)
+    return pull_request
+
+
+FULL_REVIEWS_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $reviewsAfter:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviews(first:100, after:$reviewsAfter) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          body
+          state
+          submittedAt
+          url
+          commit { oid }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def reviews_page_truncated(pull_request: dict[str, Any]) -> bool:
+    """True when the reviews list may be missing older reviews.
+
+    The main query reads ``reviews(last:100)``. A full page can hide the head
+    review or the vendor's first completed review (the free-cycle boundary),
+    unless ``backfill_reviews`` replaced it with the complete history.
+    """
+    reviews = pull_request.get("reviews") or {}
+    if reviews.get("complete"):
+        return False
+    return len(reviews.get("nodes") or []) >= PAGE_LIMIT_REVIEWS
+
+
+def backfill_reviews(pr: PullRequest, pull_request: dict[str, Any], *, max_pages: int = 20) -> None:
+    """Replace a full reviews page with the PR's whole review history, in place.
+
+    The waiter, the clean gate and the cap all read ``reviews``; on a PR with
+    more than 100 reviews the single page hides exactly the reviews they
+    need. Any failure leaves the original page untouched, so
+    ``reviews_page_truncated`` keeps reporting it as a bound.
+    """
+    if not reviews_page_truncated(pull_request):
+        return
+    nodes: list[dict[str, Any]] = []
+    after: str | None = None
+    try:
+        for _ in range(max_pages):
+            gh_args = [
+                "api", "graphql",
+                "-f", f"query={FULL_REVIEWS_QUERY}",
+                "-F", f"owner={pr.owner}",
+                "-F", f"repo={pr.repo}",
+                "-F", f"number={pr.number}",
+            ]
+            if after:
+                gh_args.extend(["-F", f"reviewsAfter={after}"])
+            result = run_gh(gh_args)
+            reviews = result["data"]["repository"]["pullRequest"]["reviews"]
+            nodes.extend(node for node in (reviews.get("nodes") or []) if isinstance(node, dict))
+            page_info = reviews.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+            if not after:
+                return
+        else:
+            return
+    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        return
+    pull_request["reviews"] = {"nodes": nodes, "complete": True}
 
 
 def fetch_remaining_discovery_comments(
@@ -927,7 +1006,7 @@ def pagination_warnings(
         warnings.append(
             f"PR comments hit page limit ({PAGE_LIMIT_PR_COMMENTS}); older comments may be missing."
         )
-    if len(reviews) >= PAGE_LIMIT_REVIEWS:
+    if reviews_page_truncated(pull_request):
         warnings.append(
             f"PR reviews hit page limit ({PAGE_LIMIT_REVIEWS}); older reviews may be missing."
         )
@@ -1167,8 +1246,7 @@ def review_request_count_complete(
     if loop_request_times is None and counted_requests:
         return False
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
-    return len(nodes) < PAGE_LIMIT_TIMELINE and len(reviews) < PAGE_LIMIT_REVIEWS
+    return len(nodes) < PAGE_LIMIT_TIMELINE and not reviews_page_truncated(pull_request)
 
 
 def parse_copilot_overview(body: Any) -> dict[str, Any] | None:

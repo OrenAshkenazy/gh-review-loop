@@ -1311,6 +1311,83 @@ class TestReviewRequestMain:
         assert payload["posted"] is False
         assert self._stamped(tmp_path) == 0
 
+    def test_stale_pending_retries_once_when_the_replacement_fails_transiently(self, monkeypatch, capsys, tmp_path):
+        """Withdrawing the stale request and then failing the POST would leave
+        the PR with nothing pending. A retryable failure gets one more POST,
+        which re-creates the request (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        monkeypatch.setattr(request_rereview, "cancel_review_request", lambda *a, **k: True)
+        calls = {"n": 0}
+        ok = self._fake_request({})
+
+        def flaky(repo, pr, login, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise request_rereview.ReviewRequestRejected(
+                    "HTTP 502", reason="transient", http_status=502, retryable=True)
+            return ok(repo, pr, login, **kw)
+
+        monkeypatch.setattr(request_rereview, "request_review", flaky)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert calls["n"] == 2
+        assert payload["posted"] is True
+        assert payload["replaced_stale_request"] is True
+        assert self._stamped(tmp_path) == 1
+
+    def test_stale_pending_reports_the_withdrawal_when_the_replacement_fails(self, monkeypatch, capsys, tmp_path):
+        """A definite failure after the withdrawal must say nothing is pending
+        now, not claim the old request is still there (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")
+        monkeypatch.setattr(request_rereview, "cancel_review_request", lambda *a, **k: True)
+
+        def refuse(*a, **k):
+            raise request_rereview.ReviewRequestRejected(
+                "HTTP 422", reason="validation", http_status=422, retryable=False)
+
+        monkeypatch.setattr(request_rereview, "request_review", refuse)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["posted"] is False
+        assert payload["withdrew_stale_request"] is True
+        assert "nothing is pending" in payload["message"].lower()
+        assert self._stamped(tmp_path) == 0
+
+    def test_concurrent_run_holding_the_pr_lock_posts_nothing(self, monkeypatch, capsys, tmp_path):
+        """Two loops for one PR can both read ABSENT and both POST; GitHub does
+        not dedupe. The state-check/count/POST sequence runs under a per-PR
+        lock, and a run that cannot take it posts nothing (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(request_rereview, "LOCK_WAIT_SECONDS", 0)
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(
+            request_rereview, "request_review",
+            lambda *a, **k: pytest.fail("another run holds the lock: must not request"),
+        )
+        with request_rereview.pr_request_lock("acme/widget", 159) as held:
+            assert held is True
+            assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "request_in_progress"
+        assert payload["posted"] is False
+
+    def test_lock_is_released_after_a_run(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+        capsys.readouterr()
+        with request_rereview.pr_request_lock("acme/widget", 159) as held:
+            assert held is True
+
     def test_stale_pending_dry_run_cancels_nothing(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T15:50:00Z")

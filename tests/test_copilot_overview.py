@@ -387,3 +387,22 @@ def test_a_pending_review_never_covers_the_head_or_grades_a_finding():
 
     overview = fgt.latest_reviewer_overview(pr, "copilot-pull-request-reviewer")
     assert overview is None or overview.get("covers_head") is not True
+
+
+def test_finding_titles_may_contain_brackets():
+    """A title like `arr[i]` must not stop the discussion link from matching;
+    otherwise the finding counts as unlinked and the clean gate never clears
+    (PR #116 review)."""
+    body = (
+        "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\n"
+        "<summary><strong>2 open findings</strong></summary>\n\n"
+        '- <picture><img alt="High severity" width="62"></picture> [Guard arr[i] access](#discussion_r111) · New\n'
+        '- <picture><img alt="Low severity" width="62"></picture> [Add [Authorize] to route](#discussion_r222) · New\n'
+    )
+    parsed = parse_copilot_overview(body)
+
+    assert parsed["unlinked_findings"] == 0
+    assert parsed["findings"] == [
+        {"severity": "high", "discussion_id": "111", "title": "Guard arr[i] access"},
+        {"severity": "low", "discussion_id": "222", "title": "Add [Authorize] to route"},
+    ]
