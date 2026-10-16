@@ -1213,15 +1213,14 @@ class TestReviewRequestMain:
 
     @staticmethod
     def _marker():
-        state = request_rereview.load_state()
-        entry = state.get(request_rereview.state_key_for(state, "acme/widget", 159)) or {}
-        return entry.get("unconfirmed_request")
+        return request_rereview.read_unconfirmed_request("acme/widget", 159)
 
     @staticmethod
-    def _seed_marker(*, seconds_ago, kind):
+    def _seed_marker(*, seconds_ago, kind, countable=True):
         import datetime as dt
         at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        request_rereview.record_unconfirmed_request("acme/widget", 159, reviewer=COPILOT_REQUEST, at=at, kind=kind)
+        assert request_rereview.record_unconfirmed_request(
+            "acme/widget", 159, reviewer=COPILOT_REQUEST, at=at, kind=kind, countable=countable)
         return at
 
     def test_copilot_login_requests_a_review_instead_of_commenting(self, monkeypatch, capsys):
@@ -1350,7 +1349,7 @@ class TestReviewRequestMain:
         assert payload["status"] == "review_request_uncertain"
         assert payload["posted"] is None
         assert payload["withdrew_stale_request"] is True
-        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe"}
+        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_5xx_the_timeline_shows_landed_counts_as_posted(self, monkeypatch, capsys, tmp_path):
@@ -1516,7 +1515,7 @@ class TestReviewRequestMain:
         assert payload["reason"] == "registration_pending"
         assert payload["http_status"] == 201
         assert payload["posted"] is None
-        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted"}
+        assert self._marker() == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_settling_request_blocks_a_new_post(self, monkeypatch, capsys, tmp_path):
@@ -1608,6 +1607,58 @@ class TestReviewRequestMain:
 
         assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
         assert self._marker() is not None
+
+    @pytest.mark.parametrize("countable", [True, False])
+    def test_a_confirmed_late_request_advances_the_cycle_only_if_it_was_a_re_review(self, monkeypatch, capsys, tmp_path, countable):
+        """A re-review that is confirmed a run later is still the cycle
+        transition the fetch needs; the free first request is not, and never
+        joins the cap provenance (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=30, kind="maybe", countable=countable)
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert self._stamped(tmp_path) == (1 if countable else 0)
+        times = request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT)
+        assert len(times) == (1 if countable else 0)
+
+    def test_an_unsaved_marker_is_reported_not_claimed(self, monkeypatch, capsys, tmp_path):
+        """If the record of an unconfirmed request cannot be written, the next
+        run cannot settle it; the payload must say so instead of implying the
+        request was remembered (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "record_unconfirmed_request", lambda *a, **k: False)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["remembered"] is False
+        assert "check the PR" in payload["message"]
+
+    def test_the_first_request_is_recorded_as_not_countable(self, monkeypatch, capsys, tmp_path):
+        """Whether a request is a re-review is known when it is posted, so it
+        is stored with the record instead of re-derived later by comparing the
+        local clock with GitHub's (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(
+            request_rereview, "request_state",
+            lambda *a, **k: {"state": "ABSENT", "head": "abc1234def", "pending_since": None,
+                             "first_completed_review_at": None},
+        )
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == []
 
     def test_a_lagging_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
         """GraphQL can show the request pending before the REST timeline does.

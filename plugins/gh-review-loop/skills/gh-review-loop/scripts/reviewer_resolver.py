@@ -161,6 +161,12 @@ def first_completed_review_at(
     return earliest
 
 
+# ``posted_at`` is the local clock just before the POST; the event time is
+# GitHub's. A local clock running ahead would put every event "before" its
+# record, so matching tolerates that much skew in the other direction.
+PROVENANCE_SKEW_SECONDS = 120
+
+
 def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     """True when a timeline event is the request posted at ``posted_at``."""
     start = _parse_instant(posted_at)
@@ -168,7 +174,34 @@ def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     if start is None or seen is None:
         return False
     delta = (seen - start).total_seconds()
-    return -1 <= delta <= window_seconds
+    return -PROVENANCE_SKEW_SECONDS <= delta <= window_seconds
+
+
+def loop_request_times_from_entry(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
+    """The countable request times this loop recorded for ``vendor``, sorted.
+
+    None means unknown, not empty: no record for the PR, or a POST whose
+    record could not be written (``review_requests_incomplete``). An empty
+    list is authoritative to the counter. Records stored with
+    ``countable: False`` are the free first request; whether a request is a
+    re-review is known when it is posted, so it is never re-derived by
+    comparing the local clock with GitHub's.
+    """
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
+        return None
+    requests = entry.get("review_requests")
+    if not isinstance(requests, list):
+        return None
+    out = []
+    for item in requests:
+        if not isinstance(item, dict) or item.get("countable") is False:
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        at = item.get("at")
+        if isinstance(at, str) and at:
+            out.append(at)
+    return sorted(out)
 
 
 def _parse_instant(value: str) -> _dt.datetime | None:
@@ -223,13 +256,9 @@ def counted_review_requests(
             return candidates
         return [event for event in candidates if event["actor_login"] == agent_login]
 
-    # A record from before the first completed review is the free cycle-0
-    # request. Inside the match window it could otherwise claim a manual
-    # re-request made right after that review and charge it to the cap.
-    post_review_times = [t for t in loop_request_times if t >= first_completed_review_at]
     out: list[dict[str, Any]] = []
     unmatched = list(candidates)
-    for posted_at in sorted(post_review_times):
+    for posted_at in sorted(loop_request_times):
         for index, event in enumerate(unmatched):
             if _within(event["created_at"], posted_at, match_window_seconds):
                 out.append(unmatched.pop(index))

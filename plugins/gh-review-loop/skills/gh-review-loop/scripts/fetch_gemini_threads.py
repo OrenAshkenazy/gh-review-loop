@@ -1668,25 +1668,9 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
-    entry = load_sticky_state().get(_state_key(pr), {})
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
-        return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
-        # No record for this PR: unknown, not empty. An empty list is
-        # authoritative to the counter and would display zero cap usage, so the
-        # loop would run another fix/push cycle before the write refuses.
-        return None
-    out = []
-    for item in requests:
-        if not isinstance(item, dict):
-            continue
-        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
-            continue
-        at = item.get("at")
-        if isinstance(at, str) and at:
-            out.append(at)
-    return sorted(out)
+    return reviewer_resolver.loop_request_times_from_entry(
+        load_sticky_state().get(_state_key(pr), {}), vendor
+    )
 
 
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:

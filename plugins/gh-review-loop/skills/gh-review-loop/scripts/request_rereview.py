@@ -378,26 +378,9 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
     the loop's own provenance.
     """
     state = load_state()
-    entry = state.get(state_key_for(state, repo, pr))
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete"):
-        # No record for this PR, or a POST whose record could not be written:
-        # the history is unknown, not empty. An empty list would be taken as
-        # authoritative and report zero requests used, which would let every
-        # pushed head post another request past the hard cap.
-        return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
-        return None
-    out = []
-    for item in requests:
-        if not isinstance(item, dict):
-            continue
-        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
-            continue
-        at = item.get("at")
-        if isinstance(at, str) and at:
-            out.append(at)
-    return sorted(out)
+    return reviewer_resolver.loop_request_times_from_entry(
+        state.get(state_key_for(state, repo, pr)), vendor
+    )
 
 
 def record_rereview_posted(
@@ -407,6 +390,7 @@ def record_rereview_posted(
     reviewer: str | None = None,
     requested_at: str | None = None,
     count_cycle: bool = True,
+    countable: bool = True,
 ) -> None:
     """Stamp the cycle transition this re-review request completes.
 
@@ -442,7 +426,13 @@ def record_rereview_posted(
         # cap must outlive a single loop run on the PR.
         requests = entry.get("review_requests")
         requests = list(requests) if isinstance(requests, list) else []
-        requests.append({"reviewer": reviewer, "at": requested_at or utc_now_iso()})
+        requests.append({
+            "reviewer": reviewer,
+            "at": requested_at or utc_now_iso(),
+            # A re-review (cap-countable) or the free first request: known
+            # now, so never re-derived later from clock comparisons.
+            "countable": countable,
+        })
         entry["review_requests"] = requests
     state[key] = entry
     try:
@@ -474,51 +464,66 @@ def record_rereview_posted(
 REGISTRATION_SETTLE_SECONDS = 120
 
 
-def _write_entry_field(repo: str, pr: int, field: str, value: Any) -> None:
-    """Set (or, with None, remove) one field of this PR's state entry. Best effort."""
-    path = state_path()
-    state = load_state()
-    key = state_key_for(state, repo, pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    if value is None:
-        if field not in entry:
-            return
-        entry.pop(field)
-    else:
-        entry[field] = value
-    state[key] = entry
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except OSError as exc:
-        print(f"warning: could not update {field}: {exc}", file=sys.stderr)
+def unconfirmed_path(repo: str, pr: int) -> Path:
+    """The unconfirmed-request record sits next to the PR's lock file, apart
+    from state.json, so a state file that cannot be written does not take
+    this guard down with it."""
+    lock = lock_path(repo, pr)
+    return lock.with_name(lock.stem + ".unconfirmed.json")
 
 
-def record_unconfirmed_request(repo: str, pr: int, *, reviewer: str, at: str | None, kind: str) -> None:
-    """Remember a request whose outcome this run could not confirm.
+def record_unconfirmed_request(
+    repo: str, pr: int, *, reviewer: str, at: str | None, kind: str, countable: bool = True
+) -> bool:
+    """Remember a request whose outcome this run could not confirm; True if saved.
 
     ``kind`` is ``accepted`` (GitHub answered 201, the read-back did not see
     it yet) or ``maybe`` (5xx or no HTTP status: it may or may not have
-    landed). The next run settles it instead of posting a possible duplicate.
+    landed). ``countable`` says whether it was a re-review. The next run
+    settles it instead of posting a possible duplicate.
     """
-    _write_entry_field(
-        repo, pr, "unconfirmed_request",
-        {"reviewer": reviewer, "at": at or utc_now_iso(), "kind": kind},
-    )
+    path = unconfirmed_path(repo, pr)
+    record = {"reviewer": reviewer, "at": at or utc_now_iso(), "kind": kind, "countable": countable}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except (OSError, ValueError) as exc:
+        print(f"warning: could not record the unconfirmed request: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def read_unconfirmed_request(repo: str, pr: int) -> dict[str, Any] | None:
-    state = load_state()
-    entry = state.get(state_key_for(state, repo, pr))
-    marker = entry.get("unconfirmed_request") if isinstance(entry, dict) else None
+    try:
+        marker = json.loads(unconfirmed_path(repo, pr).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
     if not isinstance(marker, dict) or not isinstance(marker.get("at"), str):
         return None
     return marker
 
 
 def clear_unconfirmed_request(repo: str, pr: int) -> None:
-    _write_entry_field(repo, pr, "unconfirmed_request", None)
+    try:
+        unconfirmed_path(repo, pr).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"warning: could not clear the unconfirmed request: {exc}", file=sys.stderr)
+
+
+def _remembered(payload: dict[str, Any], saved: bool) -> dict[str, Any]:
+    """Say whether the unconfirmed request was saved for the next run to settle."""
+    payload["remembered"] = saved
+    if not saved:
+        payload["message"] = (
+            f"{payload.get('message', '').rstrip()} Saving a record of this request failed, "
+            "so the next run cannot settle it: check the PR for a pending review request "
+            "before running this again."
+        )
+    return payload
 
 
 def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
@@ -1485,9 +1490,10 @@ def _settle_unconfirmed_request(
         )
     clear_unconfirmed_request(args.repo, args.pr)
     if landed:
+        countable = marker.get("countable") is not False
         record_rereview_posted(
             args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
-            requested_at=at, count_cycle=False,
+            requested_at=at, count_cycle=countable, countable=countable,
         )
         return None
     if marker.get("kind") == "accepted":
@@ -1541,9 +1547,10 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # before the timeline shows it, and a not-yet-visible request is not
         # an absent one. Otherwise it waits for the settle logic.
         if request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"]):
+            countable = marker.get("countable") is not False
             record_rereview_posted(
                 args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
-                requested_at=marker["at"], count_cycle=False,
+                requested_at=marker["at"], count_cycle=countable, countable=countable,
             )
             clear_unconfirmed_request(args.repo, args.pr)
     elif marker is not None and not args.dry_run:
@@ -1586,6 +1593,9 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # nothing. If the replacement POST then fails, a retryable failure gets
     # one more POST (it re-creates the request); a definite failure is
     # reported as a withdrawal, never as "the old request is still there".
+    # A re-review once the vendor has completed a review; before that it is
+    # the free first request. Stored with every record of this request.
+    countable = bool(state["first_completed_review_at"])
     withdrew = False
     if state["state"] == "STALE_PENDING" and not args.dry_run:
         if not cancel_review_request(args.repo, args.pr, reviewer):
@@ -1618,10 +1628,11 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             }
         else:
             if maybe_landed:
-                record_unconfirmed_request(
-                    args.repo, args.pr, reviewer=reviewer, at=exc.requested_at, kind="maybe"
+                saved = record_unconfirmed_request(
+                    args.repo, args.pr, reviewer=reviewer, at=exc.requested_at,
+                    kind="maybe", countable=countable,
                 )
-                refused = uncertain_payload(args.repo, args.pr, reviewer, exc)
+                refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:
                 refused = rejected_payload(args.repo, args.pr, reviewer, exc)
             if withdrew:
@@ -1640,8 +1651,9 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             # Not seen within the read-back window is not proof it was dropped:
             # remember it and let the next run settle it (not_enabled only once
             # the settle time has passed with nothing on the PR).
-            record_unconfirmed_request(
-                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"), kind="accepted"
+            saved = record_unconfirmed_request(
+                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
+                kind="accepted", countable=countable,
             )
             unseen = uncertain_payload(
                 args.repo, args.pr, reviewer,
@@ -1651,23 +1663,24 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                     requested_at=payload.get("created_at"),
                 ),
             )
-            _emit(unseen, json_output=json_output)
+            _emit(_remembered(unseen, saved), json_output=json_output)
             return 0
         if registered is None:
-            record_unconfirmed_request(
-                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"), kind="accepted"
+            saved = record_unconfirmed_request(
+                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
+                kind="accepted", countable=countable,
             )
-            # The read-back failed: unknown, not posted and not rejected.
-            # Nothing is recorded; the next run's state read settles it.
+            # The read-back failed: unknown, not posted and not rejected. It is
+            # not recorded as posted; the next run settles it.
             _emit(
-                uncertain_payload(
+                _remembered(uncertain_payload(
                     args.repo, args.pr, reviewer,
                     ReviewRequestRejected(
                         "the requested-reviewers read-back failed",
                         reason="registration_unknown", http_status=201, retryable=False,
                         requested_at=payload.get("created_at"),
                     ),
-                ),
+                ), saved),
                 json_output=json_output,
             )
             return 0
@@ -1678,7 +1691,8 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         payload["would_post"] = True
     else:
         record_rereview_posted(
-            args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at")
+            args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
+            countable=countable,
         )
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))

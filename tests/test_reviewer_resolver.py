@@ -407,10 +407,13 @@ def test_an_unknown_reviewer_login_is_left_exactly_as_given():
 
 
 def test_a_cycle_zero_record_never_claims_a_later_manual_request():
-    """The initial loop request predates the first completed review, so it is
-    free. If the first review and a manual re-request both land inside the
-    match window, the initial request's local record must not claim the
-    manual event and charge it to the cap (PR #116 review)."""
+    """The initial loop request is free. Its record is stored as not
+    countable, so even inside the match window it cannot claim a manual
+    re-request made right after the first review (PR #116 review)."""
+    entry = {"review_requests": [
+        {"reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T15:42:26Z", "countable": False},
+    ]}
+    times = reviewer_resolver.loop_request_times_from_entry(entry, review_vendors.COPILOT)
     events = [
         _gql_event("agent", "2026-10-07T15:42:27Z"),  # initial loop request
         _gql_event("agent", "2026-10-07T15:44:00Z"),  # member clicks re-request in the UI
@@ -419,7 +422,29 @@ def test_a_cycle_zero_record_never_claims_a_later_manual_request():
     counted = reviewer_resolver.counted_review_requests(
         events, agent_login="agent", vendor=review_vendors.COPILOT,
         first_completed_review_at="2026-10-07T15:43:10Z",
-        loop_request_times=["2026-10-07T15:42:26Z"],
+        loop_request_times=times,
     )
 
+    assert times == []
     assert counted == []
+
+
+def test_entry_reader_treats_missing_or_incomplete_history_as_unknown():
+    assert reviewer_resolver.loop_request_times_from_entry(None, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry({}, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry(
+        {"review_requests": [], "review_requests_incomplete": True}, review_vendors.COPILOT) is None
+
+
+def test_a_fast_local_clock_still_matches_its_event():
+    """The record is the local pre-POST time; the event is GitHub's. A local
+    clock a few seconds ahead must not orphan every record (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T16:20:00Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T16:20:45Z"],
+    )
+
+    assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:00Z"]
