@@ -1312,6 +1312,21 @@ def test_settling_matches_the_login_case_insensitively():
     ) is True
 
 
+def test_logged_requests_the_timeline_lags_on_still_count(monkeypatch, tmp_path):
+    """A countable request durably logged but not yet on the REST timeline
+    still consumed the cap; the enforced count must not drop it (PR #116 review)."""
+    monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+    request_rereview.record_rereview_posted(
+        "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:20:05Z")
+    request_rereview.record_rereview_posted(
+        "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:50:05Z")
+    runner = _state_runner(_gql_pr("d7efa49000"), events=[("agent", "2026-10-07T16:20:06Z")])
+
+    assert request_rereview.count_agent_review_requests(
+        "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+    ) == 2
+
+
 class TestReviewRequestMain:
     """main() routes a review_request vendor away from the comment path."""
 

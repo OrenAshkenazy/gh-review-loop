@@ -965,6 +965,11 @@ def count_agent_review_requests(
         # another request past the cap. So the count is unknown and the caller
         # refuses to post — `--no-cap-check` is the deliberate override.
         return None
+    if recorded is not None and len(recorded) > len(counted):
+        # A countable request is durably logged but its event has not
+        # surfaced on the timeline yet. It still consumed the cap, so the
+        # record wins over the lagging timeline.
+        return len(recorded)
     return len(counted)
 
 
