@@ -1425,6 +1425,22 @@ def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
         handle.close()
 
 
+def state_unwritable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    return {
+        "status": "state_unwritable",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"Could not save a reservation for the review request on {repo}#{pr}, so "
+            "nothing was posted: a request that is not recorded first can push the "
+            "loop past its re-review cap. Fix the state directory (GGRL_STATE_DIR) "
+            "and run this again."
+        ),
+    }
+
+
 def lock_unavailable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
     return {
         "status": "lock_unavailable",
@@ -1611,9 +1627,19 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # A re-review once the vendor has completed a review; before that it is
     # the free first request. Stored with every record of this request.
     countable = bool(state["first_completed_review_at"])
+    # Write-ahead reservation: once GitHub accepts the POST the request
+    # exists, so its record must already be on disk. A crash before the log
+    # append leaves this reservation, and the next run settles it. Taken
+    # before any withdrawal, so a failed reservation leaves the PR untouched.
+    if not args.dry_run and not record_unconfirmed_request(
+        args.repo, args.pr, reviewer=reviewer, at=utc_now_iso(), kind="maybe", countable=countable
+    ):
+        _emit(state_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
+        return 0
     withdrew = False
     if state["state"] == "STALE_PENDING" and not args.dry_run:
         if not cancel_review_request(args.repo, args.pr, reviewer):
+            clear_unconfirmed_request(args.repo, args.pr)
             _emit(
                 stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"]),
                 json_output=json_output,
@@ -1649,12 +1675,15 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                 )
                 refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:
+                clear_unconfirmed_request(args.repo, args.pr)
                 refused = rejected_payload(args.repo, args.pr, reviewer, exc)
             if withdrew:
                 refused = _note_withdrawal(refused)
             _emit(refused, json_output=json_output)
             return 0
     except ValueError as exc:
+        if not args.dry_run:
+            clear_unconfirmed_request(args.repo, args.pr)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if not payload.get("dry_run") and "registered" not in payload:
@@ -1709,6 +1738,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
             count_cycle=countable, countable=countable,
         )
+        clear_unconfirmed_request(args.repo, args.pr)
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     elif payload.get("dry_run"):

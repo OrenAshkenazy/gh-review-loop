@@ -1730,7 +1730,8 @@ class TestReviewRequestMain:
         self._stub_reads(monkeypatch)
         monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
         monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: False)
-        monkeypatch.setattr(request_rereview, "record_unconfirmed_request", lambda *a, **k: False)
+        saves = iter([True, False])  # the pre-POST reservation lands; the follow-up save fails
+        monkeypatch.setattr(request_rereview, "record_unconfirmed_request", lambda *a, **k: next(saves))
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -1756,6 +1757,64 @@ class TestReviewRequestMain:
 
         capsys.readouterr()
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == []
+
+    def test_a_reservation_is_saved_before_the_post_and_settled_after(self, monkeypatch, capsys, tmp_path):
+        """A crash between GitHub accepting the request and the log append
+        would leave the cap undercounted. The request is reserved before the
+        POST, so a crash leaves a record the next run settles (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        seen = {}
+        ok = self._fake_request({})
+
+        def post(repo, pr, login, **kw):
+            seen["marker"] = self._marker()
+            return ok(repo, pr, login, **kw)
+
+        monkeypatch.setattr(request_rereview, "request_review", post)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert seen["marker"]["kind"] == "maybe" and seen["marker"]["countable"] is True
+        assert self._marker() is None
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [CREATED_AT]
+
+    def test_a_definite_refusal_releases_the_reservation(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+
+        def refuse(*a, **k):
+            raise request_rereview.ReviewRequestRejected(
+                "HTTP 422", reason="validation", http_status=422, retryable=False)
+
+        monkeypatch.setattr(request_rereview, "request_review", refuse)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["status"] == "review_request_rejected"
+        assert self._marker() is None
+
+    def test_no_reservation_means_no_post(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "record_unconfirmed_request", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("unreserved: must not post"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "state_unwritable"
+        assert payload["posted"] is False
+
+    def test_a_dry_run_reserves_nothing(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "record_unconfirmed_request", lambda *a, **k: pytest.fail("dry run"))
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["dry_run"] is True
 
     def test_the_free_first_request_does_not_advance_the_cycle(self, monkeypatch, capsys, tmp_path):
         """The first request is cycle 0. Stamping it as a cycle transition
