@@ -124,6 +124,31 @@ def test_cluster_label_drops_badge_markup():
     assert "split the change by search layer" in label
 
 
+@pytest.mark.parametrize("marker,expected", [
+    ("P0", "critical"), ("P1", "high"),
+    ("P2", "medium"), ("P3", "low"),
+])
+def test_cluster_recognizes_leading_plain_priority(marker, expected):
+    for body in (f"[{marker}] Fix runtime verification", f" \n[{marker.lower()}] Fix runtime verification"):
+        assert cluster([_thread(body)])[0].severity == expected
+
+
+def test_plain_priority_preserves_pattern_identity_across_severities():
+    p2 = _thread("[P2] Fix runtime verification")
+    p3 = _thread("[P3] Fix runtime verification")
+    assert pattern_signature(p2) == pattern_signature(p3)
+    assert cluster([p2])[0].label == cluster([p3])[0].label
+
+
+@pytest.mark.parametrize("body", [
+    "This prose mentions [P2] but does not set priority",
+    "```python\n[P2] do_not_treat_as_priority\n```",
+    "[P4] Invalid level", "[P2]Not separated",
+])
+def test_cluster_ignores_nonleading_or_invalid_plain_priority(body):
+    assert cluster_findings._severity(_thread(body)) == "unknown"
+
+
 def test_gemini_alt_text_still_wins_over_unknown():
     # Guard: the Codex path must not regress the existing Gemini parsing.
     assert cluster([_thread("![critical](x.svg) Broken auth check.")])[0].severity == "critical"

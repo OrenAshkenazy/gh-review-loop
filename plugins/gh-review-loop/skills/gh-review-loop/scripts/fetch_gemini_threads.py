@@ -81,6 +81,8 @@ SEVERITY_RE = re.compile(r"!\[(critical|high|medium|low)\]", re.IGNORECASE)
 # Codex marks findings with a shields.io priority badge whose alt text is the
 # priority. Example: ![P2 Badge](https://img.shields.io/badge/P2-yellow...)
 CODEX_PRIORITY_RE = re.compile(r"!\[(P[0-3])(?:\s+Badge)?\]", re.IGNORECASE)
+# Some reviewers prefix findings with a plain [P0]–[P3] text marker.
+PLAIN_PRIORITY_RE = re.compile(r"\A(?:[ \t]*\r?\n)* {0,3}\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
 CODEX_PRIORITY_TO_SEVERITY = {
     "p0": "critical",
     "p1": "high",
@@ -607,6 +609,9 @@ def thread_severity(thread: dict[str, Any]) -> str:
     """
     for comment in _iter_comments(thread):
         body = comment.get("body") or ""
+        plain_match = PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
         match = SEVERITY_RE.search(body)
         if match:
             return match.group(1).lower()
@@ -2444,6 +2449,7 @@ def finding_fingerprint(thread: dict[str, Any]) -> str:
     comments = _iter_comments(thread)
     first_comment = comments[0].get("body") if comments and isinstance(comments[0], dict) else None
     body = first_comment if isinstance(first_comment, str) else ""
+    body = PLAIN_PRIORITY_RE.sub("", body, count=1)  # drop leading text priority
     body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)  # drop severity image
     body = re.sub(r"\s+", " ", body).strip().lower()
     return hashlib.sha1(f"{path}\n{body[:1000]}".encode()).hexdigest()[:16]

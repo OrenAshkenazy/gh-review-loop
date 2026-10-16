@@ -46,7 +46,7 @@ Checkable claims, with the honest scope of each:
 | Pattern clustering + sibling sweep | Findings cluster by signature and by the shape of the code they anchor to, so one defect described two ways still counts as one pattern. Two-site token sweeps report lines matching the shared tokens; one-site ranged sweeps report duplicate blocks as `mirror` candidates — text-identical by default in every language, comment-insensitive only for Python via stdlib `tokenize`, never across language families. Refuses generic shapes and never reads outside the changed files | `cluster_findings.py`, `sweep_siblings.py` |
 | Verification gate | Auto-detects Python / Node / Rust / Go. Required-check failure flips the run to `verification: failed`. **`Skip` is an offered menu option** — pick it and there is no gate | `detect_profile.py`, `run_profile.py` |
 | Cycle cap | Hard count, agent-scoped: only the agent's own pings consume it. Enforced at the write — `request_rereview.py` counts prior pings and refuses past the cap, rather than trusting the agent to stop | `request_rereview.py` |
-| Severity ordering | Parsed for **Codex `![P0]`–`![P3]` badges and `![critical]`–`![low]` image alt text only.** A bot using neither convention yields `unknown`, which is kept by default | `thread_severity()` |
+| Severity ordering | Parses Codex `![P0]`–`![P3]` badges, `![critical]`–`![low]` image alt text, and reviewer-leading plain-text `[P0]`–`[P3]` prefixes. Unrecognized markers yield `unknown`, kept by default | `thread_severity()`, `cluster_findings._severity()` |
 | Optional judge | Second-model triage per finding (`false_positive`, `needs_human`, …). Off by default, needs an OpenAI key | `judge.py` |
 | Audit trail + local stats | One live-edited PR comment, per-run receipts, per-repo aggregates via `--stats`. Never transmitted | `metrics.py` |
 | Zero infrastructure | Stdlib Python + `gh` + `git`. No SDK, no server, no account | all scripts |
@@ -72,11 +72,11 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 |---|---|---|---|
 | Codex (`chatgpt-codex-connector`) | Built-in, full support. Offered first on an unconfigured PR because it reviews on request, so accepting starts a cycle immediately | `@codex review` | `P0`–`P3`, normalized |
 | Gemini Code Assist | Built-in, full support. Needs the **enterprise** GitHub app ([consumer app shut down](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review)) | `@gemini-code-assist please review…` | `critical` / `high` / `medium` / `low` |
-| CodeRabbit, Copilot, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | **Not parsed** — findings carry `unknown` severity |
+| CodeRabbit, Copilot, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
 
 `--list-reviewers` discovers which bots have commented on your PR; `--reviewer` persists your choice per PR.
 
-**Severity caveat, stated plainly:** only two marker conventions are parsed today — Codex's `![P0]`–`![P3]` and the `![critical]`–`![low]` alt-text form Gemini uses. For any other bot every finding is `unknown`, so `--min-severity high` keeps everything and `--drop-unknown-severity` drops everything. Use severity filtering only with a bot whose format is parsed.
+**Severity caveat, stated plainly:** three marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, and reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers). Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
 
 ## Why this exists
 
