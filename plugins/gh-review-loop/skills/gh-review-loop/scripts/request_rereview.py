@@ -207,7 +207,35 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
     gets created, so the honest answer is unknown plus a delayed state check.
     """
     detail = (exc.detail or "").strip() or "no detail from GitHub"
-    if exc.reason == "registration_unknown":
+    settle = f"{REGISTRATION_SETTLE_SECONDS // 60} minutes"
+    if exc.reason == "registration_pending":
+        message = (
+            f"GitHub accepted the review request for `{reviewer}` (HTTP 201), but it is "
+            "not on the PR yet. It may still appear, so nothing was recorded as posted. "
+            f"Do not request again now: re-run this script after {settle}. It reports "
+            "review_pending if the request landed, or not_enabled if it never appeared."
+        )
+    elif exc.reason == "settling":
+        message = (
+            f"An earlier review request for `{reviewer}` (at {exc.requested_at}) is not "
+            f"confirmed yet and is still inside its {settle} settle time. Nothing was "
+            "posted. Re-run this script after that; it settles the earlier request first."
+        )
+    elif exc.reason == "settle_unreadable":
+        message = (
+            f"An earlier review request for `{reviewer}` (at {exc.requested_at}) is not "
+            f"confirmed, and reading the PR to settle it failed ({detail}). Nothing was "
+            "posted. Re-run this script in a minute."
+        )
+    elif exc.reason == "transient":
+        message = (
+            f"GitHub answered HTTP {exc.http_status} to the review request for `{reviewer}` "
+            f"({detail}). A server error can follow a request GitHub did register, and no "
+            "matching request is visible on the timeline yet, so the outcome is unknown. "
+            f"It was not retried. Re-run this script after {settle}; it posts a fresh "
+            "request only if the earlier one never landed."
+        )
+    elif exc.reason == "registration_unknown":
         # GitHub answered 201, so the POST landed; what failed is reading back
         # whether the reviewer was added (spec §6.1). Recording it could stamp
         # a request that does not exist; denying it could invite a duplicate.
@@ -374,8 +402,13 @@ def record_rereview_posted(
     *,
     reviewer: str | None = None,
     requested_at: str | None = None,
+    count_cycle: bool = True,
 ) -> None:
     """Stamp the cycle transition this re-review request completes.
+
+    ``count_cycle=False`` records only the request's provenance: used when an
+    earlier run's unconfirmed request turns out to have landed, so the cap
+    counts it without advancing this run's cycle ordinal.
 
     The session-cycle ordinal (#104) needs to know that a cycle actually
     pushed and asked for a re-review. Deriving that from the PR's comments was
@@ -397,8 +430,9 @@ def record_rereview_posted(
     run = dict(run) if isinstance(run, dict) else {}
     posted = run.get("rereviews_posted")
     posted = posted if isinstance(posted, int) and not isinstance(posted, bool) else 0
-    run["rereviews_posted"] = posted + 1
-    entry["run"] = run
+    if count_cycle:
+        run["rereviews_posted"] = posted + 1
+        entry["run"] = run
     if reviewer:
         # Outside entry["run"], which run tracking clears: provenance for the
         # cap must outlive a single loop run on the PR.
@@ -428,6 +462,59 @@ def record_rereview_posted(
                 path.write_text(json.dumps(marked, indent=2, sort_keys=True), encoding="utf-8")
             except OSError:
                 pass
+
+
+# How long an unconfirmed review request may take to show up on the PR before
+# its absence counts as proof that it did not land. The read-back right after
+# a POST lasts seconds; GitHub's API lag is not bounded that tightly.
+REGISTRATION_SETTLE_SECONDS = 120
+
+
+def _write_entry_field(repo: str, pr: int, field: str, value: Any) -> None:
+    """Set (or, with None, remove) one field of this PR's state entry. Best effort."""
+    path = state_path()
+    state = load_state()
+    key = state_key_for(state, repo, pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    if value is None:
+        if field not in entry:
+            return
+        entry.pop(field)
+    else:
+        entry[field] = value
+    state[key] = entry
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: could not update {field}: {exc}", file=sys.stderr)
+
+
+def record_unconfirmed_request(repo: str, pr: int, *, reviewer: str, at: str | None, kind: str) -> None:
+    """Remember a request whose outcome this run could not confirm.
+
+    ``kind`` is ``accepted`` (GitHub answered 201, the read-back did not see
+    it yet) or ``maybe`` (5xx or no HTTP status: it may or may not have
+    landed). The next run settles it instead of posting a possible duplicate.
+    """
+    _write_entry_field(
+        repo, pr, "unconfirmed_request",
+        {"reviewer": reviewer, "at": at or utc_now_iso(), "kind": kind},
+    )
+
+
+def read_unconfirmed_request(repo: str, pr: int) -> dict[str, Any] | None:
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    marker = entry.get("unconfirmed_request") if isinstance(entry, dict) else None
+    if not isinstance(marker, dict) or not isinstance(marker.get("at"), str):
+        return None
+    return marker
+
+
+def clear_unconfirmed_request(repo: str, pr: int) -> None:
+    _write_entry_field(repo, pr, "unconfirmed_request", None)
 
 
 def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
@@ -871,6 +958,42 @@ def confirm_posted_after_uncertain(
     return False
 
 
+def request_landed_since(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    agent_login: str | None,
+    since: str,
+    runner: Any = None,
+) -> bool | None:
+    """Did a request posted at ``since`` ever land? None when the reads fail.
+
+    Evidence is a request event for ``vendor`` by this agent at or after
+    ``since``, or a submitted ``vendor`` review at or after it on any commit
+    (the head may have moved on since).
+    """
+    if runner is None:
+        runner = subprocess.run
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return None
+    for raw in events:
+        event = reviewer_resolver.normalize_request_event(raw)
+        if event is None or review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
+            continue
+        if (not agent_login or event["actor_login"] == agent_login) and event["created_at"] >= since:
+            return True
+    reviews = _all_reviews(repo, pr, runner)
+    if reviews is None:
+        return None
+    for review in reviews:
+        if review_vendors.vendor_for(_review_author(review)) is not vendor:
+            continue
+        if review.get("state") != "PENDING" and (_review_submitted_at(review) or "") >= since:
+            return True
+    return False
+
+
 def request_registered(
     repo: str,
     pr: int,
@@ -888,7 +1011,8 @@ def request_registered(
     only proof is GraphQL ``reviewRequests`` listing the vendor — or the
     review itself already sitting on the head, submitted at or after the
     request. Read back up to ``attempts`` times a second apart. None when the
-    reads fail (unknown), never a guess.
+    reads fail (unknown), never a guess. False means only "not seen within
+    this window"; the caller treats it as unconfirmed, not as dropped.
     """
     if runner is None:
         runner = subprocess.run
@@ -1203,6 +1327,14 @@ def stale_not_replaced_payload(repo: str, pr: int, reviewer: str, pending_since:
 LOCK_WAIT_SECONDS = 30
 
 
+def lock_path(repo: str, pr: int) -> Path:
+    """One lock file per PR. GitHub owner and repo names are case-insensitive,
+    so `Acme/Widget` and `acme/widget` must map to the same file even on a
+    case-sensitive filesystem."""
+    safe = re.sub(r"[^a-z0-9._-]", "_", f"{repo}#{pr}".casefold())
+    return loop_state.state_dir() / "locks" / f"{safe}.lock"
+
+
 @contextlib.contextmanager
 def pr_request_lock(repo: str, pr: int) -> Iterator[bool]:
     """Serialize the state-check/count/POST sequence per PR on this machine.
@@ -1218,11 +1350,10 @@ def pr_request_lock(repo: str, pr: int) -> Iterator[bool]:
     if fcntl is None:
         yield True
         return
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{repo}#{pr}")
     try:
-        lock_dir = loop_state.state_dir() / "locks"
-        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        handle = open(lock_dir / f"{safe}.lock", "a+", encoding="utf-8")
+        path = lock_path(repo, pr)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = open(path, "a+", encoding="utf-8")
     except OSError:
         yield True
         return
@@ -1281,6 +1412,53 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
         print(f"[loop] {payload['message']}")
 
 
+def _settle_unconfirmed_request(
+    args: argparse.Namespace, vendor: review_vendors.ReviewVendor, marker: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Settle an earlier unconfirmed request while the PR shows none pending.
+
+    Returns a payload to emit (and post nothing), or None to continue with a
+    normal request. Inside the settle time: refuse. Past it: if the request
+    landed, record its provenance and continue; if it never appeared, a 201
+    is the definite not_enabled signal, and a 5xx/no-status one simply did not
+    land, so a fresh request is safe.
+    """
+    reviewer = vendor.request_login
+    at = marker["at"]
+    sent = _parse_iso(at)
+    now = _parse_iso(utc_now_iso())
+    if sent is None or now is None or (now - sent).total_seconds() < REGISTRATION_SETTLE_SECONDS:
+        return uncertain_payload(
+            args.repo, args.pr, reviewer,
+            ReviewRequestRejected("earlier request not settled", reason="settling", requested_at=at),
+        )
+    landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), at)
+    if landed is None:
+        return uncertain_payload(
+            args.repo, args.pr, reviewer,
+            ReviewRequestRejected(
+                "could not read the PR to settle the earlier request",
+                reason="settle_unreadable", requested_at=at,
+            ),
+        )
+    clear_unconfirmed_request(args.repo, args.pr)
+    if landed:
+        record_rereview_posted(
+            args.repo, args.pr, reviewer=marker.get("reviewer") or reviewer,
+            requested_at=at, count_cycle=False,
+        )
+        return None
+    if marker.get("kind") == "accepted":
+        return rejected_payload(
+            args.repo, args.pr, reviewer,
+            ReviewRequestRejected(
+                "GitHub returned 201 but the reviewer was never added",
+                reason="not_enabled", http_status=201, retryable=False, requested_at=at,
+            ),
+        )
+    return None
+
+
 def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
     """The review_request path (spec §3), serialized per PR (see ``pr_request_lock``)."""
     with pr_request_lock(args.repo, args.pr) as held:
@@ -1310,6 +1488,16 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     if args.expect_head and args.expect_head != state["head"]:
         _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
         return 0
+    marker = read_unconfirmed_request(args.repo, args.pr)
+    if marker is not None and state["state"] != "ABSENT":
+        # A request is listed or the head is reviewed: whatever the earlier
+        # request did, the state machine below now sees it.
+        clear_unconfirmed_request(args.repo, args.pr)
+    elif marker is not None and not args.dry_run:
+        settled = _settle_unconfirmed_request(args, vendor, marker)
+        if settled is not None:
+            _emit(settled, json_output=json_output)
+            return 0
     if state["state"] == "COMPLETED_HEAD":
         _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
         return 0
@@ -1346,14 +1534,13 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             return 0
         withdrew = True
     try:
-        try:
-            payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
-        except ReviewRequestRejected as first:
-            if not (withdrew and first.retryable):
-                raise
-            payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
     except ReviewRequestRejected as exc:
-        if exc.reason == "uncertain" and confirm_posted_after_uncertain(
+        # A 5xx is not a clean refusal: GitHub can register the request and
+        # still fail the response, and it does not dedupe. Never replay it;
+        # reconcile it like a missing status (PR #116 review).
+        maybe_landed = exc.reason in ("uncertain", "transient")
+        if maybe_landed and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at
         ):
             payload = {
@@ -1368,8 +1555,14 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                 "registered": True,
             }
         else:
-            refused = rejected_payload(args.repo, args.pr, reviewer, exc)
-            if withdrew and exc.reason != "uncertain":
+            if maybe_landed:
+                record_unconfirmed_request(
+                    args.repo, args.pr, reviewer=reviewer, at=exc.requested_at, kind="maybe"
+                )
+                refused = uncertain_payload(args.repo, args.pr, reviewer, exc)
+            else:
+                refused = rejected_payload(args.repo, args.pr, reviewer, exc)
+            if withdrew:
                 refused = _note_withdrawal(refused)
             _emit(refused, json_output=json_output)
             return 0
@@ -1382,17 +1575,26 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # dropped request neither consumes the cap nor starts a wait.
         registered = request_registered(args.repo, args.pr, vendor, payload.get("created_at"))
         if registered is False:
-            dropped = rejected_payload(
+            # Not seen within the read-back window is not proof it was dropped:
+            # remember it and let the next run settle it (not_enabled only once
+            # the settle time has passed with nothing on the PR).
+            record_unconfirmed_request(
+                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"), kind="accepted"
+            )
+            unseen = uncertain_payload(
                 args.repo, args.pr, reviewer,
                 ReviewRequestRejected(
-                    "GitHub returned 201 but the reviewer was not added",
-                    reason="not_enabled", http_status=201, retryable=False,
+                    "GitHub returned 201 but the reviewer is not on the PR yet",
+                    reason="registration_pending", http_status=201, retryable=False,
                     requested_at=payload.get("created_at"),
                 ),
             )
-            _emit(_note_withdrawal(dropped) if withdrew else dropped, json_output=json_output)
+            _emit(unseen, json_output=json_output)
             return 0
         if registered is None:
+            record_unconfirmed_request(
+                args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"), kind="accepted"
+            )
             # The read-back failed: unknown, not posted and not rejected.
             # Nothing is recorded; the next run's state read settles it.
             _emit(
