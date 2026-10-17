@@ -180,6 +180,20 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
     return _append_jsonl(request_log_path(repo, pr), record)
 
 
+def baseline_adopted(repo: str, pr: int) -> bool:
+    """Does the PR's provenance log hold adopted history (``baseline`` lines)?
+
+    Those lines are every request found under the login on the timeline,
+    manual clicks included, so any count that rests on them is an upper
+    bound: the request side says so in ``capped`` and the fetch reports the
+    count as not complete (PR #120 review).
+    """
+    return any(
+        isinstance(item, dict) and item.get("baseline") is True
+        for item in read_request_log(repo, pr) or []
+    )
+
+
 def append_request_log_batch(repo: str, pr: int, records: list[dict[str, Any]]) -> bool:
     """Append several records in one write; True once they are on disk.
 

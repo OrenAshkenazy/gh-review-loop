@@ -2383,6 +2383,7 @@ class TestReviewRequestMain:
     def test_cap_applies_to_review_requests_too(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, used=3)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: [T_REQUEST] * 3)
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
@@ -2469,6 +2470,21 @@ class TestReviewRequestMain:
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
 
         assert json.loads(capsys.readouterr().out)["dry_run"] is True
+
+    def test_a_dry_run_cap_hit_without_a_record_still_says_upper_bound(self, monkeypatch, capsys, tmp_path):
+        """A dry run adopts nothing, so no baseline line exists to read the
+        flag from; the count still came straight from the timeline with no
+        record behind it (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: pytest.fail("dry run adopted"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "capped"
+        assert payload["count_is_upper_bound"] is True
 
     def test_a_posted_request_carries_a_status_like_every_other_result(self):
         """Every non-posting result has `status`; a posted one did not, so a

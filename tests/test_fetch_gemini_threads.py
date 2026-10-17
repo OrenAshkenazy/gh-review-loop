@@ -4461,6 +4461,32 @@ class TestHeadAnchoredWait:
         assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, attributable=False) is False
         assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, attributable=False) is True
 
+    def test_attribution_needs_a_record_a_login_or_the_explicit_all_actors_flag(self):
+        """An explicitly incomplete record wins over all of them: the request
+        side answers uncountable_count then, so a limitReached here would
+        send the member to raise a cap that cannot continue (PR #120 review)."""
+        assert _fgt.cap_count_attributable(["2026-10-07T16:00:00Z"], None) is True
+        assert _fgt.cap_count_attributable(None, "agent") is True
+        assert _fgt.cap_count_attributable(None, None) is False
+        assert _fgt.cap_count_attributable(None, None, no_agent_filter=True) is True
+        assert _fgt.cap_count_attributable(None, "agent", provenance_incomplete=True) is False
+        assert _fgt.cap_count_attributable(["x"], "agent", no_agent_filter=True, provenance_incomplete=True) is False
+
+    def test_adopted_history_keeps_the_count_marked_incomplete(self):
+        """Baseline lines are the login's timeline events, manual clicks
+        included, so a count that rests on any of them stays a bound even
+        when both pages are partial (PR #120 review)."""
+        partial = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}, "comments": {"nodes": []}}
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=["2026-10-07T16:00:00Z"], counted_requests=1, baseline_adopted=True
+        ) is False
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=[], counted_requests=0, baseline_adopted=True
+        ) is True
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=["2026-10-07T16:00:00Z"], counted_requests=1, baseline_adopted=False
+        ) is True
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
