@@ -1,25 +1,4 @@
-"""Slim loop-state helpers shared by the hook gates and the main script.
-
-The PreToolUse/Stop hooks must decide "is a review loop active?" on every
-matching tool call, so this module keeps that decision cheap: stdlib-only
-imports, no GraphQL machinery, no argparse tree. Importing it costs
-milliseconds where importing ``fetch_gemini_threads`` costs ~100ms.
-
-It also owns the loop-active *sentinel file*: an empty marker whose existence
-lets the hooks.json shell guard skip spawning Python entirely on the idle
-path. Lifecycle:
-
-- ``touch_sentinel()`` on every real fetch (loop start / each cycle). It
-  returns False when the marker could not be written — which disables the
-  gates for the run, so callers warn instead of ignoring it.
-- ``clear_sentinel()`` when the terminal ``--record-run`` leaves no active
-  run behind.
-- A sentinel older than ``SENTINEL_TTL_SECONDS`` (24h) is stale — a crashed
-  or abandoned loop must not keep the hooks live forever. The shell guard
-  only checks existence (`[ -f ]`, the cheapest possible test — #103); the
-  Python gates it spawns call ``reap_stale_sentinel()`` to delete a stale
-  marker and stand down, so staleness costs nothing on the idle path.
-"""
+"""Shared local state, transactions, and receipt-freshness helpers."""
 
 from __future__ import annotations
 
@@ -28,16 +7,11 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import loop_lock
-
-SENTINEL_TTL_SECONDS = 24 * 60 * 60
-
-SENTINEL_NAME = "loop-active"
 
 # The plugin was renamed gh-gemini-review-loop -> gh-review-loop. The state
 # dir follows the new name; the legacy dir keeps working two ways: unmigrated
@@ -189,8 +163,7 @@ def safe_int(value: Any) -> int:
 def any_active_run() -> bool:
     """True if any tracked PR (any repo) has an active loop run.
 
-    Repo-agnostic and network-free, so the Stop hook can skip git/repo
-    resolution entirely on the common case of no loop in flight.
+    Repo-agnostic and network-free; retained for state consumers.
     """
     state = load_sticky_state()
     if not isinstance(state, dict):
@@ -213,9 +186,9 @@ def find_active_run(repo_full: str) -> tuple[int, dict[str, Any]] | None:
 
     A loop is "active" once a cycle has accumulated into its ``run`` block
     (signalled by ``started_at``); ``--record-run`` clears that block, so a
-    recorded/never-started loop reads as inactive. This is the cheap,
-    network-free gate the loop hooks use to decide whether to spend a GitHub
-    fetch on a summary, so it only reads local state. If several PRs in the
+    recorded/never-started loop reads as inactive. This compatibility helper
+    only reads local state. Explicit lifecycle commands target an exact PR.
+    If several PRs in the
     repo look active, the most recently started one wins.
     """
     candidates: list[tuple[str, int, dict[str, Any]]] = []
@@ -275,107 +248,3 @@ def resolve_current_repo() -> str:
     if not isinstance(view, dict) or "nameWithOwner" not in view:
         raise RuntimeError("Could not resolve the current repo with gh repo view.")
     return view["nameWithOwner"]
-
-
-# ---------------------------------------------------------------------------
-# Loop-active sentinel
-# ---------------------------------------------------------------------------
-
-
-def sentinel_path() -> Path:
-    return state_dir() / SENTINEL_NAME
-
-
-def touch_sentinel() -> bool:
-    """Create or freshen the loop-active sentinel. True when the marker exists.
-
-    Refreshed on every real fetch so a long-running loop never crosses the
-    TTL mid-run.
-
-    Failure is fail-open *for the loop* but fail-**off** for the gates: the
-    hooks.json guard reads an absent sentinel as "no loop is running" and
-    exits 0 before spawning Python. So a sentinel that cannot be written
-    leaves the loop itself fully functional while silently disabling the
-    profile gate, the push gate, and the Stop-hook summary backstop for the
-    rest of the run — the state.json run block alone will not revive them.
-    That trade is deliberate (a marker we cannot write must never wedge the
-    loop), but it is not free, so this returns False instead of swallowing
-    the error: callers surface it rather than assume the gates are live.
-    """
-    try:
-        path = sentinel_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        os.utime(path, None)
-    except OSError:
-        return False
-    return True
-
-
-def clear_sentinel() -> None:
-    try:
-        sentinel_path().unlink()
-    except OSError:
-        pass
-
-
-def sentinel_is_stale(now: float | None = None) -> bool:
-    """True when the sentinel exists but is older than the 24h TTL.
-
-    A missing sentinel is not "stale" — it is simply absent.
-    """
-    try:
-        mtime = sentinel_path().stat().st_mtime
-    except OSError:
-        return False
-    reference = time.time() if now is None else now
-    return (reference - mtime) > SENTINEL_TTL_SECONDS
-
-
-def _reap_candidates() -> list[Path]:
-    """Sentinel paths the reap must inspect — the same set the shell guard can
-    arm from. With no ``GGRL_STATE_DIR`` the guard falls back from the new
-    config dir to the legacy one, so in a split-directory state (both dirs
-    exist, marker only under legacy) ``sentinel_path()`` alone would inspect
-    a different, absent file and the stale marker would survive forever
-    (PR #110 review)."""
-    if os.environ.get("GGRL_STATE_DIR"):
-        return [sentinel_path()]
-    return [
-        _config_root() / STATE_DIR_NAME / SENTINEL_NAME,
-        _config_root() / LEGACY_STATE_DIR_NAME / SENTINEL_NAME,
-    ]
-
-
-def reap_stale_sentinel(now: float | None = None) -> bool:
-    """Reap stale sentinel(s); True when the gate should stand down.
-
-    The hooks.json shell guard spawns a gate on bare existence; each gate
-    calls this first so a crashed or abandoned loop disarms itself on the
-    next hook fire instead of blocking edits/pushes for a dead run (#103).
-
-    Mirrors the guard's selection exactly (PR #110 review): the first
-    candidate that exists is the marker that armed this gate, and only its
-    staleness decides the verdict — a fresh sentinel in the *other* config
-    dir must not keep the gates armed for the guard-selected dead run, and
-    a stale twin being cleaned up must not disarm an active loop. A stale
-    selected sentinel stands the gate down even when deletion fails
-    (read-only state dir): fail open, like the shell guard's old ``rm -f``.
-    Every stale candidate is unlinked best-effort along the way.
-    """
-    reference = time.time() if now is None else now
-    selected_stale: bool | None = None
-    for path in _reap_candidates():
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
-        stale = (reference - mtime) > SENTINEL_TTL_SECONDS
-        if selected_stale is None:
-            selected_stale = stale
-        if stale:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-    return bool(selected_stale)

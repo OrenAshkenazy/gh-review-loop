@@ -1,13 +1,13 @@
 # Receipts, run metrics, and PR audit comments
 
-The per-cycle discipline (`--cycle-summary` every non-terminal cycle, one terminal `--record-run`, single-channel delivery to the sticky PR comment with a one-line chat pointer) is in SKILL.md. This file covers the terminal flag catalog, the PR-comment machinery, what metrics are stored, the semantic-risk note, and `--stats`.
+The per-cycle discipline (publisher-owned cycle receipt, one explicit `finish_loop.py`, single-channel delivery to the sticky PR comment with a one-line chat pointer) is in SKILL.md. This file covers the terminal flag catalog, the PR-comment machinery, what metrics are stored, the semantic-risk note, and `--stats`.
 
 ## `--record-run` flag catalog
 
-A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome, no markers) — always pass what the run actually did:
+`finish_loop.py` wraps `--record-run`; a bare terminal call defaults every field (`fixed_count` 0, no outcome, no markers) — always pass what the run actually did:
 
 - `--fixed-count <n>` — findings fixed across the run.
-- `--verification <passed|failed|skipped>` and `--verification-details '<json>'` — from `run_profile.py` output.
+- `--verification <passed|failed|skipped>` and `--verification-details '<json>'` — from the publisher's `verification` object; do not rerun the suite for reporting.
 - `--outcome <clean|capped|human|regression|no_progress|verification_failed|fixed_pending_confirmation>` plus `--outcome-reason '<text>'`.
 - `--gemini-confirmed` / `--gemini-unconfirmed` — reviewer re-review confirmation from the final wait result.
 - `--fixed-finding <fp>` (repeatable) — per-finding fingerprint markers.

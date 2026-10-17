@@ -326,9 +326,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Publication safeguards and platform support
 
-Use the installed skill's `publish_changes.py` for every fix cycle. It validates PR/checkout/remote identity, current summary, known cap, explicit changed paths, and a required verification profile before committing. It rejects edits made during verification and commit-hook changes, never forces a push, and preserves local commits after failures. Manual Git commands are outside this enforcement.
+Use the installed skill's explicit lifecycle: `start_loop.py` before fixes, `publish_changes.py` for each publication, and `finish_loop.py` at loop end. It validates PR/checkout/remote identity, a fetched run, known cap, explicit changed paths, and a required verification profile before committing. It runs the full verification profile once and emits the cycle receipt before publication; finish reuses those results without rerunning checks. It rejects edits made during verification and commit-hook changes, never forces a push, and preserves local commits after failures. Manual Git commands are outside this enforcement.
 
-Python argv arrays preserve Windows paths and quotes; string commands use host quoting. The test matrix covers Ubuntu and Windows on Python 3.10–3.13. POSIX-only Claude shell-hook tests and unavailable symlink capabilities are marked separately.
+Python argv arrays preserve Windows paths and quotes; string commands use host quoting. The test matrix covers Ubuntu and Windows on Python 3.10–3.13. No lifecycle hooks or POSIX shell guards are installed; unavailable symlink capabilities are marked separately.
 
 For Copilot, publication uses the native request counter, and guarded requests recheck the open PR's head immediately before each write.
 

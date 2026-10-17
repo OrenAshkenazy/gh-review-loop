@@ -12,9 +12,9 @@ Load this when deciding whether a push is safe or when the user requests thread 
 
 ## Verified publication on every runtime
 
-Use `publish_changes.py` instead of separate Git add/commit/push commands. It requires an open PR, the exact PR head branch and commit, a push remote matching the head repository, an emitted current-cycle summary, a confirmed reviewer, and a known cap count below the limit. Base/default branches are blocked.
+Use `publish_changes.py` instead of separate Git add/commit/push commands. It requires an open PR, the exact PR head branch and commit, a push remote matching the head repository, a fetched run, a confirmed reviewer, and a known cap count below the limit. Base/default branches are blocked.
 
-A confirmed/customized profile must contain at least one boolean `required: true` check. Empty, skipped, malformed, optional-only, or failed required checks block publication. The helper reruns checks and refuses if file contents, the profile, the PR head, or checkout identity changed. Use literal argv arrays for verification commands where possible.
+A confirmed/customized profile must contain at least one boolean `required: true` check. Empty, skipped, malformed, optional-only, or failed required checks block publication. The helper runs the profile once, emits the cycle receipt with those results, and refuses if file contents, the profile, the PR head, or checkout identity changed. Use literal argv arrays for verification commands where possible.
 
 Pass every changed file explicitly via `--paths`; the index must initially be empty, and unrelated tracked or untracked files block publication. No automatic stashing, cleanup, reset, force push, or retry. The helper stages only those paths, checks that commit hooks preserved the verified tree, pushes the PR branch normally, and confirms the remote SHA. On failure, inspect local state; an existing local commit is preserved. `--dry-run` runs the checks and validates publication without staging, committing, or pushing.
 
@@ -28,18 +28,8 @@ REST success for an initial Copilot request must register the selected reviewer,
 
 ID-based native reconciliation records proven requests at GitHub's timestamp after later head moves; legacy recovery retains head checks.
 
-## Bundled hooks
+## Explicit lifecycle commands
 
-Claude Code additionally runs three state-gated hooks, which fail open. Codex relies on the verified publish helper for the same publication gate. The re-review cap is independently enforced by `request_rereview.py`; unknown counts refuse to post.
-
-For Copilot, both publication and re-review count native requests matched to the loop's locally recorded timestamps. Manual reviewer requests do not consume the loop's cap. Clearing local state removes that provenance; ambiguous history blocks further publication. Comment vendors continue to count the agent's mention comments.
-
-Copilot re-requests use GraphQL `rerequestReviews` with PR and completed-review bot IDs; missing or ambiguous IDs block cancellation and POST, including after a stale-request refresh. Initial requests use REST. Permissions can differ: a PR author's re-request can succeed when REST or `requestReviewsByLogin` is denied. Uncertain mutations are reconciled against the timeline, never retried through another transport.
-
-| Event | Script | Guarantee |
-|---|---|---|
-| `PreToolUse` (`Bash`) | `loop_summary_gate.py` | Blocks Git push with a stale cycle summary. |
-| `PreToolUse` (`Edit`/`Write`/`MultiEdit`) | `loop_profile_gate.py` | Blocks edits without a saved profile decision; Skip clears this edit hook but cannot enable publication. |
-| `Stop` | `loop_summary_hook.py` | Emits the missing cycle summary. |
+No tool or Stop hooks are installed. Setup, receipt generation, and terminal recording use explicit start/publish/finish commands. See `references/lifecycle.md` for commands, metadata, dry-run behavior, and recovery.
 
 `--expect-head <sha>` is honored on both re-review paths: pass the full published SHA. Immediately before a guarded comment, native request, or stale-request cancellation, the script rechecks that the PR is open at that head. A mismatch or unreadable state blocks the write; relay the resulting status and do not retry blindly. A trigger that lands before GitHub sees the push buys a review of the previous commit.

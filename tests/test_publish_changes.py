@@ -44,8 +44,13 @@ def checkout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pc, "git", local_git)
     profile = {"source": "confirmed", "checks": [{"name": "tests", "required": True, "command": [sys.executable, "-c", "assert open('fix.txt').read() == 'after\\n'"]}]}
-    monkeypatch.setattr(pc.judge, "get_profile", lambda repo: profile)
-    monkeypatch.setattr(rr, "load_state", lambda: {"owner/repo#1": {"run": {"update_seq": 1, "last_summary_seq": 1}}})
+    monkeypatch.setattr(pc.judge, "get_profile", lambda repo: copy.deepcopy(profile))
+    state = {"owner/repo#1": {"run": {"update_seq": 1, "last_summary_seq": 0}}}
+    monkeypatch.setattr(rr, "load_state", lambda: state)
+    def emit_receipt(*args, **kwargs):
+        state["owner/repo#1"]["run"]["last_summary_seq"] = state["owner/repo#1"]["run"]["update_seq"]
+        return {"output": "[loop] receipt", "warnings": ""}
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", emit_receipt)
     monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": "coderabbitai", "review_trigger": "@coderabbitai"})
     monkeypatch.setattr(rr, "gh_login", lambda: "agent")
     monkeypatch.setattr(rr, "count_agent_pings", lambda *args: 0)
@@ -257,11 +262,65 @@ def test_pr_head_change_during_verification_blocks(checkout, monkeypatch):
     assert_not_pushed(checkout)
 
 
-@pytest.mark.parametrize("state", [{}, {"owner/repo#1": {"run": {"update_seq": 2, "last_summary_seq": 1}}}, {"owner/repo#2": {"run": {"update_seq": 1, "last_summary_seq": 1}}}])
-def test_missing_stale_or_other_pr_summary_blocks(checkout, monkeypatch, state):
+@pytest.mark.parametrize("state", [{}, {"owner/repo#2": {"run": {"update_seq": 1, "last_summary_seq": 1}}}])
+def test_missing_or_other_pr_run_blocks(checkout, monkeypatch, state):
     monkeypatch.setattr(rr, "load_state", lambda: state)
-    with pytest.raises(pc.PublishError, match="cycle-summary"):
+    with pytest.raises(pc.PublishError, match="fetch this PR"):
         publish(checkout)
+    assert_not_pushed(checkout)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_profile_runs_exactly_once_per_publication(checkout, tmp_path, dry_run):
+    counter = tmp_path / "verification-count"
+    checkout[4]["checks"][0]["command"] = [sys.executable, "-c", f"from pathlib import Path; p=Path({str(counter)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x')"]
+    result = publish(checkout, dry_run=dry_run)
+    assert counter.read_text() == "x"
+    assert result["verification"]["verification"] == "passed"
+
+
+def test_publisher_emits_verified_summary_and_forwards_metadata(checkout, monkeypatch):
+    original = pc.loop_lifecycle.emit_receipt
+    calls = []
+    def receipt(repo, pr, root, **kwargs):
+        assert pc.git(root, "rev-parse", "HEAD").strip() == checkout[2]
+        assert pc.git(root, "diff", "--cached", "--name-only") == ""
+        calls.append((repo, pr, kwargs))
+        return original(repo, pr, root, **kwargs)
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", receipt)
+    result = publish(checkout, max_rereview_requests=6, receipt_options=["--fixed-count", "2", "--semantic-risk", "changed return shape"])
+    assert len(calls) == 1
+    assert calls[0][:2] == ("owner/repo", 1)
+    assert calls[0][2]["verification"] == result["verification"]
+    assert calls[0][2]["options"] == ["--fixed-count", "2", "--semantic-risk", "changed return shape", "--max-rereview-requests", "6"]
+    assert result["cycle_summary"]["output"] == "[loop] receipt"
+
+
+def test_dry_run_does_not_emit_or_post_a_receipt(checkout, monkeypatch):
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **kw: pytest.fail("dry run cannot emit a receipt"))
+    assert "cycle_summary" not in publish(checkout, dry_run=True)
+
+
+@pytest.mark.parametrize("failure", ["error", "unstamped", "files", "profile", "head"])
+def test_summary_failure_or_changes_block_staging_and_push(checkout, monkeypatch, failure):
+    original = pc.loop_lifecycle.emit_receipt
+    def receipt(*args, **kwargs):
+        if failure == "error":
+            raise RuntimeError("receipt timed out")
+        if failure != "unstamped":
+            original(*args, **kwargs)
+        if failure == "files":
+            (checkout[0] / "fix.txt").write_text("changed after verification")
+        if failure == "profile":
+            checkout[4]["checks"][0]["command"] = ["different"]
+        if failure == "head":
+            checkout[3]["head"]["sha"] = "b" * 40
+        return {"output": "[loop] full fallback receipt", "warnings": ""}
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", receipt)
+    with pytest.raises((pc.PublishError, RuntimeError)):
+        publish(checkout)
+    assert pc.git(checkout[0], "rev-parse", "HEAD").strip() == checkout[2]
+    assert pc.git(checkout[0], "diff", "--cached", "--name-only") == ""
     assert_not_pushed(checkout)
 
 
@@ -294,7 +353,7 @@ def test_cli_cap_override_applies_to_every_publication_gate(checkout, monkeypatc
     else:
         assert status == 0
         assert result["published"] is True
-        assert seen_caps == [cap, cap, cap]
+        assert seen_caps == [cap, cap, cap, cap]
         assert pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() == result["head"]
 
 

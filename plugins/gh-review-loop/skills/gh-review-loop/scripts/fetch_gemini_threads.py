@@ -28,19 +28,16 @@ import reviewer_resolver  # noqa: E402 — sibling module, pure/stdlib-only
 import review_vendors  # noqa: E402 — sibling module, pure/stdlib-only
 from loop_color import color_loop, colors_enabled, configure_utf8_output  # noqa: E402 — sibling module
 from loop_state import (  # noqa: E402 — sibling module, stdlib-only
-    any_active_run,
-    clear_sentinel,
-    find_active_run,  # noqa: F401 — re-exported; hooks/tests import via this module
+    any_active_run,  # noqa: F401 — compatibility re-export for state consumers
+    find_active_run,  # noqa: F401 — re-exported; state consumers import via this module
     load_sticky_state,
     migrate_legacy_state_dir,
     resolve_current_repo,
     save_sticky_state,
-    sentinel_path,
     state_dir,
     state_transaction,
-    sticky_state_path,  # noqa: F401 — re-exported; hooks/tests import via this module
-    summary_is_stale,  # noqa: F401 — re-exported; hooks/tests import via this module
-    touch_sentinel,
+    sticky_state_path,  # noqa: F401 — re-exported; state consumers import via this module
+    summary_is_stale,  # noqa: F401 — re-exported; state consumers import via this module
 )
 from loop_state import safe_int as _safe_int  # noqa: E402
 
@@ -1640,9 +1637,8 @@ def post_pr_comment(pr: PullRequest, body: str, *, dry_run: bool = False) -> Non
 STICKY_RECEIPT_MARKER = "<!-- gh-review-loop:sticky-receipt -->"
 
 
-# State-file primitives (sticky_state_path/load/save, active-run queries,
-# the loop-active sentinel) live in loop_state so the hook gates can import
-# them without paying this module's full import cost. Re-exported above.
+# State-file primitives and active-run queries live in loop_state.
+# Compatibility re-exports above preserve existing state consumers.
 
 
 def _state_key(pr: PullRequest) -> str:
@@ -1884,9 +1880,8 @@ def update_run_tracking(
     run = entry.get("run", {})
     if "started_at" not in run:
         run["started_at"] = _now_iso()
-    # Monotonic counter bumped on every fetch. The loop's Stop-hook backstop
-    # compares it against last_summary_seq to tell whether the run advanced
-    # since the agent last emitted a summary (see summary_is_stale).
+    # Monotonic counter bumped on every fetch. The publisher compares it
+    # against last_summary_seq to require a current cycle receipt.
     prev_seq = _safe_int(run.get("update_seq", 0))
     run["update_seq"] = prev_seq + 1
     # Script-owned session-cycle ordinal (#104): 1 on the run's first fetch,
@@ -1941,17 +1936,6 @@ def update_run_tracking(
     entry["run"] = run
     state[key] = entry
     save_sticky_state(state)
-    # Freshen the loop-active sentinel so the hooks.json shell guard lets the
-    # gates run for the duration of this loop (and the 24h TTL restarts).
-    # Without the marker the guard exits before Python starts, so the gates are
-    # off even though this run is active — never let that happen silently.
-    if not touch_sentinel():
-        print(
-            f"warning: could not write the loop-active sentinel at {sentinel_path()}. "
-            "The loop continues, but its edit gate, push gate, and Stop-hook "
-            "summary backstop stay disabled until the sentinel can be created.",
-            file=sys.stderr,
-        )
 
 
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
@@ -1977,10 +1961,6 @@ def clear_run_tracking(pr: PullRequest) -> None:
             del entry[field]
         if stale:
             save_sticky_state(state)
-    # Drop the sentinel only when no loop remains anywhere — another repo's
-    # concurrent loop still needs the hooks live.
-    if not any_active_run():
-        clear_sentinel()
 
 
 @state_transaction
@@ -2676,8 +2656,8 @@ def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
 def stamp_summary_emitted(pr: PullRequest) -> None:
     """Record that a summary covering the current run state was just emitted.
 
-    Sets ``last_summary_seq`` to the current ``update_seq`` so the Stop-hook
-    backstop won't re-emit a summary the agent already showed. A no-op when no
+    Sets ``last_summary_seq`` to the current ``update_seq`` so the publisher
+    can check receipt freshness. A no-op when no
     run is being tracked, so it never resurrects a cleared/absent run block.
     """
     state = load_sticky_state()
@@ -3484,7 +3464,7 @@ def main() -> int:
     # Post-rename housekeeping: move ~/.config/gh-gemini-review-loop to
     # ~/.config/gh-review-loop once, leaving a compatibility symlink for
     # pre-rename plugin versions. No-op after the first run. Done here (the
-    # loop's single entry point) so the hook gates never pay for it.
+    # loop's fetch entry point).
     migrate_legacy_state_dir()
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -3766,9 +3746,9 @@ def main() -> int:
         action="store_true",
         help=(
             "Render the lean auto-snapshot receipt instead of the full one. For "
-            "the Stop-hook backstop: shows only GitHub-observable state (threads "
+            "a compact diagnostic: shows only GitHub-observable state (threads "
             "seen/resolved/open, cycles) and omits agent-only fields (fixed "
-            "count, verification, outcome) the hook cannot know."
+            "count, verification, outcome)."
         ),
     )
     parser.add_argument("--fixed-count", type=int, default=0, help="Agent-claimed fixes this run.")
@@ -4554,7 +4534,7 @@ def main() -> int:
             else:
                 # --cycle-summary leaves the accumulator intact but stamps that a
                 # summary covering the current run state was emitted, so the
-                # Stop-hook backstop won't duplicate it.
+                # publisher can check receipt freshness.
                 try:
                     stamp_summary_emitted(pr)
                 except OSError as exc:

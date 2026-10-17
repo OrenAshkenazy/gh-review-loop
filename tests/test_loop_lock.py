@@ -156,7 +156,7 @@ def test_atomic_replace_failure_preserves_original_and_cleans_temp(tmp_path, mon
     assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json", "state.json.lock"]
 
 
-def test_run_teardown_cannot_remove_another_runs_sentinel(tmp_path):
+def test_run_teardown_preserves_another_prs_active_run(tmp_path):
     import fetch_gemini_threads as fetch
 
     fetch.update_run_tracking(fetch.PullRequest("owner", "repo", 1), [])
@@ -164,13 +164,12 @@ def test_run_teardown_cannot_remove_another_runs_sentinel(tmp_path):
     clear = child(tmp_path, """
 import fetch_gemini_threads as f, time
 from pathlib import Path
-real_active = f.any_active_run
-def delayed_active():
-    active = real_active()
+real_save = f.save_sticky_state
+def delayed_save(state):
+    real_save(state)
     Path(sys.argv[1]).touch()
     time.sleep(.3)
-    return active
-f.any_active_run = delayed_active
+f.save_sticky_state = delayed_save
 f.clear_run_tracking(f.PullRequest('owner', 'repo', 1))
 """, ready)
     wait_file(ready)
@@ -180,8 +179,8 @@ f.update_run_tracking(f.PullRequest('owner', 'repo', 2), [])
 """)
     finish(clear)
     finish(create)
-    assert loop_state.any_active_run()
-    assert loop_state.sentinel_path().exists()
+    assert fetch.read_run_tracking(fetch.PullRequest("owner", "repo", 1)) == {}
+    assert fetch.read_run_tracking(fetch.PullRequest("owner", "repo", 2))["update_seq"] == 1
 
 
 @pytest.mark.parametrize("vendor", ["coderabbitai", "copilot-pull-request-reviewer"])

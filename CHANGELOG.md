@@ -20,6 +20,10 @@ All notable changes to this project will be documented in this file. The format 
   Stdlib only, nothing transmitted. Registered in both marketplace files; CI
   compiles its scripts and checks manifest drift.
 
+### Changed
+
+- **Explicit review-loop lifecycle replaces hooks.** Start checks the saved profile decision; publish verifies once and emits its cycle receipt before pushing; finish emits the terminal receipt and records the run without repeating checks. Removed POSIX hook commands that failed under Windows PowerShell and added per-tool startup overhead.
+
 ### Fixed
 
 - **Linked Copilot summary findings follow live thread state.** Existing inline threads are not duplicated or reopened by synthetic summary findings after resolution, outdated classification, or explicit deferral.

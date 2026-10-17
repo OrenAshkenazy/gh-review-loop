@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import judge
+import loop_lifecycle
 import loop_lock
 import loop_state
 import request_rereview as rr
@@ -145,7 +146,7 @@ def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozen
         raise PublishError("staged bytes differ from verified changes; staged changes preserved, no commit")
 
 
-def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None) -> None:
+def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, require_summary: bool = True) -> None:
     state = rr.load_state()
     entry = state.get(rr.state_key_for(state, repo, pr))
     if isinstance(entry, dict) and entry.get("review_request_in_flight"):
@@ -153,8 +154,10 @@ def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None) -> N
     if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
         raise PublishError("local re-review history is incomplete; publishing blocked")
     tracking = entry.get("run") if isinstance(entry, dict) else None
-    if not isinstance(tracking, dict) or loop_state.safe_int(tracking.get("update_seq")) <= 0 or loop_state.summary_is_stale(tracking):
-        raise PublishError("fetch this PR, then emit and relay --cycle-summary before publishing")
+    if not isinstance(tracking, dict) or loop_state.safe_int(tracking.get("update_seq")) <= 0:
+        raise PublishError("fetch this PR before publishing")
+    if require_summary and loop_state.summary_is_stale(tracking):
+        raise PublishError("cycle-summary was not recorded for the current run; no push")
     reviewer = rr.read_persisted_reviewer(repo, pr)
     if not reviewer:
         raise PublishError("confirm a reviewer for this PR before publishing")
@@ -195,19 +198,19 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
     return branch, sha
 
 
-def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None) -> dict:
+def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None) -> dict:
     with loop_lock.pr_lock(repo, pr):
-        return _publish(repo, pr, root, paths, message, remote, dry_run, max_rereview_requests)
+        return _publish(repo, pr, root, paths, message, remote, dry_run, max_rereview_requests, receipt_options)
 
 
-def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None) -> dict:
+def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None) -> dict:
     root = root.resolve()
     if not message.strip() or remote.startswith("-") or not remote:
         raise PublishError("provide a commit message and a named Git remote")
     if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
         raise PublishError("repo-root must be the checkout root")
     branch, head = checkout_gate(root, repo, pr, remote)
-    loop_gate(repo, pr, max_rereview_requests)
+    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
     before = snapshot(root, paths)
     blobs = verified_blobs(root, paths)
     if snapshot(root, paths) != before:
@@ -219,12 +222,20 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during verification; verify again")
     checkout_gate(root, repo, pr, remote, expected_head=head)
-    loop_gate(repo, pr, max_rereview_requests)
+    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
     if snapshot(root, paths) != before:
         raise PublishError("files changed before staging; verify again")
     payload = {"status": "verified", "published": False, "dry_run": dry_run, "head": head, "verification": result.to_details()}
     if dry_run:
         return payload
+    options = list(receipt_options or [])
+    if max_rereview_requests is not None:
+        options.extend(["--max-rereview-requests", str(max_rereview_requests)])
+    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options)
+    checkout_gate(root, repo, pr, remote, expected_head=head)
+    loop_gate(repo, pr, max_rereview_requests)
+    if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
+        raise PublishError("files or verification profile changed during summary delivery; verify again")
     git(root, "--literal-pathspecs", "add", "--", *paths)
     staged_gate(root, paths, blobs)
     tree = git(root, "write-tree").strip()
@@ -266,10 +277,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-rereview-requests", type=int, default=None)
+    loop_lifecycle.add_receipt_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run, args.max_rereview_requests)
-    except (PublishError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run, args.max_rereview_requests, loop_lifecycle.receipt_arguments(args))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"status": "blocked", "published": False, "error": str(exc)}))
         return 1
     print(json.dumps(payload, indent=2))

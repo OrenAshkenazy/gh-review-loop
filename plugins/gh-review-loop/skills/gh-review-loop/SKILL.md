@@ -21,9 +21,10 @@ This file holds the every-cycle happy path. Read the referenced file **at the po
 |---|---|
 | `references/reviewer-selection.md` | No persisted reviewer; discovery returns `none_configured`/`partial`/`confirmation_required`; reviewer switch/reset |
 | `references/user-decisions.md` | User choice or human judgment needed |
-| `references/verification-profile.md` | First run for a repo (edit gate blocks until a profile decision); customize/un-skip/re-detect |
+| `references/verification-profile.md` | First run for a repo (start requires a profile decision); customize/un-skip/re-detect |
 | `references/sweep-internals.md` | Receipt shows a multi-site pattern (`count >= 2`), a multi-line ranged finding, or a `Clustering:` advisory |
-| `references/write-safety.md` | Resolving beyond the auto-resolve set; write constraints; is a push safe; what the bundled hooks enforce |
+| `references/write-safety.md` | Resolving beyond the auto-resolve set; write constraints; is a push safe; lifecycle command safety |
+| `references/lifecycle.md` | Start, publish, or finish command arguments; terminal-record recovery |
 | `references/judge-eval.md` | `judge_mode` ≠ `off`, the user mentions judge/eval, or the one-time tip is due |
 | `references/receipts-and-metrics.md` | `--post-receipt`/`--sticky-receipt`, `--semantic-risk`, `--stats`, the `--record-run` flag catalog |
 | `references/terminal-report.md` | Terminal `[loop] Summary` has `remaining_actionable > 0` |
@@ -51,23 +52,23 @@ Bot reviewers are LLMs: fixing only the flagged sites of a pattern teaches the b
 
 ## Verification Profile
 
-Each repo can have a code-derived verification profile — the checks the verify step runs. **First run for a repo** (a `PreToolUse` hook blocks edits until a profile decision is saved): load `references/verification-profile.md` and run its detect → menu → save flow before any edit. **Subsequent runs**: no prompt — the fetch output ends with the profile intro and planned-verification blocks; relay the intro from there, then for `confirmed`/`customized` run `run_profile.py <owner/repo> <repo_root>` — never call the test runner directly — feeding its `verification` field into `--verification` and its JSON into `--verification-details`. Verify fails iff any `required` check fails or times out. On `skipped`/unknown, relay the fallback intro; save a customized profile with at least one required meaningful check before publishing.
+Each repo can have a saved verification profile. On the first run, load `references/verification-profile.md` and complete detect → menu → save. After fetching and before editing, run `start_loop.py` (`references/script-usage.md`): it requires the exact PR's tracked run, selected reviewer, and saved profile decision. Explicit Skip permits diagnosis and editing; publication still needs a confirmed/customized profile with at least one required meaningful check. Relay the fetch's profile intro and planned-verification blocks. **For a publishing cycle, `publish_changes.py` runs the full profile exactly once on the files it commits. Do not run `run_profile.py` separately before publishing.** Focused checks during development remain optional; use the standalone runner when diagnosing a cycle that will not publish.
 
 ## Receipts: per-cycle and terminal
 
-- **`--cycle-summary`** — read-only mid-loop receipt from accumulated run state. Safe every cycle.
-- **`--record-run`** — terminal: appends one record to local `runs.jsonl` and clears the run accumulator. Call exactly once, at loop end (flag catalog: `references/receipts-and-metrics.md`).
+- **Publish:** `publish_changes.py` verifies once, emits the current cycle receipt, then commits, pushes, and requests review. Relay `cycle_summary.output` from its JSON, including a full fallback receipt.
+- **Finish:** `finish_loop.py` emits the terminal receipt and records the run exactly once. Pass the publisher's `verification` object as `--verification-details`; no checks are rerun. Call it on every terminal path, including no publication.
 
-**Emit a receipt at the end of every cycle.** Non-terminal → `--cycle-summary` right after verify, REQUIRED even when fixes were small. Terminal → `--record-run` only (never both on one cycle; never twice).
+The low-level `--cycle-summary` and `--record-run` options remain available for diagnostics; do not invoke them as extra steps in the normal lifecycle.
 
-**Single-channel delivery.** Both deliver the FULL receipt to the sticky PR comment (one per PR, edited in place) and print a one-line `[loop]` pointer to stdout. Relay the pointer verbatim; do NOT reprint the full receipt in chat. On comment-write failure (or `--dry-run`) the script prints the full receipt to stdout — relay that fallback verbatim instead.
+**Single-channel delivery.** Lifecycle receipts deliver the FULL receipt to the sticky PR comment (one per PR, edited in place) and print a one-line `[loop]` pointer to stdout. Relay the pointer verbatim; do NOT reprint the full receipt in chat. On comment-write failure (or `--dry-run`) the script prints the full receipt to stdout — relay that fallback verbatim instead.
 
 **Script-owned human blocks** — relay verbatim, never paraphrase unless the script fails: profile intro, planned verification, judge table/skip line, receipt pointer (or fallback receipt), semantic-risk note, `Next options:`, wait heartbeat. Before the reviewer confirms a re-review use the script's fixed-pending wording, never `Remaining valid actionable`. `--json`/`--format json` stdout is machine JSON — parse, don't relay.
 
 ## Progress Narration
 
 <HARD-GATE>
-Before `git push` on a non-terminal cycle: run `--cycle-summary` and relay its printed `[loop]` pointer line. For a terminal cycle **that follows a final push**: request re-review, capture `REREVIEW_AT`, wait with `--wait --after "$REREVIEW_AT"`, and set the terminal reviewer-confirmation flag from that wait result before `--record-run`. Terminal paths that publish nothing (already clean, cap reached, human decision, regression, no progress) record directly — no push, re-review, or wait. `publish_changes.py` enforces this on every runtime (manual Git is outside its scope). On hook runtimes: `loop_summary_gate.py` blocks `git push` while the summary is stale (exit 2 names the exact fix); `--record-run` is exempt. Violating the letter violates the spirit.
+Use the publisher for every fix publication; it generates the cycle receipt after verification and checks freshness before staging and pushing. Manual Git is outside this enforcement. After a final push, wait for re-review and pass the confirmation result to `finish_loop.py`. Terminal paths with no publication finish directly. No tool or Stop hooks are installed: start/publish/finish must be called explicitly.
 </HARD-GATE>
 
 Emit one-line status updates at each phase transition. **N** = session cycle: copy it from the script (`[loop] session cycle N`, `loopStatus.sessionCycle`, or the receipt header) — never count it yourself. It exists only after a fetch, so the pre-fetch line omits it. **M/K** = cap consumed.
@@ -76,13 +77,13 @@ Emit one-line status updates at each phase transition. **N** = session cycle: co
 |---|---|
 | Before fetch | `[loop] fetching threads from PR #<num>...` (no ordinal yet — the fetch is what reports it) |
 | After fetch | `[loop] session cycle N — re-review cap: M/K consumed. <J> actionable thread(s) (severity: <breakdown>). Fixing.` + judge tip/block if due |
-| After fixes | `[loop] session cycle N — fixes applied. Verifying via profile runner.` |
+| After fixes | `[loop] session cycle N — fixes applied. Publishing with verification.` |
 | After verify | `[loop] session cycle N — verified (<test summary>).` |
-| Before push | `--cycle-summary` + relay pointer; `[loop] session cycle N — verifying and publishing fixes...` |
+| Before push | `[loop] session cycle N — verifying and publishing fixes...` |
 | After push | `[loop] session cycle N — pushed. Requesting reviewer re-review. Cap now M/K.` |
 | Reviewer wait | Background task (primary) or chunked heartbeats (fallback) — Workflow step 8 |
 | Stop | `[loop] STOP — <stop-condition>: <one-line explanation>.` |
-| Done | `[loop] DONE — 0 actionable threads remaining. Re-review requests used: M/K.` (cap consumption, not N — a clean PR ends at `0/K`) + relay the `--record-run` pointer; `remaining_actionable > 0` → `references/terminal-report.md` |
+| Done | `[loop] DONE — 0 actionable threads remaining. Re-review requests used: M/K.` (cap consumption, not N — a clean PR ends at `0/K`) + relay `finish_loop.py`'s receipt output; `remaining_actionable > 0` → `references/terminal-report.md` |
 
 Skip narration only in pure non-interactive batch mode. User stepping away → pair with `--sticky-receipt`.
 
@@ -92,7 +93,7 @@ An opt-in, read-only OpenAI judge can classify findings. **Off by default; nothi
 
 ## Stopping Conditions
 
-Stop or pause instead of pushing or re-asking when any is true: **1. Cap reached.** **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — ask; pause publication until answered. **4. Test regression** — failure not clearly caused by the finding-addressing change. **5. No progress** — the script prints `[loop] no_progress: …` (unchanged actionable fingerprint): stop immediately with `--record-run --outcome no_progress`; do not push or re-request.
+Stop or pause instead of pushing or re-asking when any is true: **1. Cap reached.** **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — ask; pause publication until answered. **4. Test regression** — failure not clearly caused by the finding-addressing change. **5. No progress** — the script prints `[loop] no_progress: …` (unchanged actionable fingerprint): stop immediately with `finish_loop.py --outcome no_progress`; do not push or re-request.
 
 At the cap still run cleanup, terminal classification, metrics recording, and the final summary. Re-invocation at the cap is usually a resume signal — load `references/resume-and-recovery.md` before declaring a hard stop.
 
@@ -103,14 +104,14 @@ At the cap still run cleanup, terminal classification, metrics recording, and th
 3. **Select the reviewer** (persisted → continue silently; else see Reviewer Selection).
 4. **Wait for the first review.** `reviewerSelection.auto_reviews: false` (Codex, Copilot) and no review activity → post the trigger via `request_rereview.py` first, then wait with `--after`; waiting without pinging burns the whole timeout. Activity already present → skip the wait and fetch. Timeout → say so; never invent feedback.
 5. **Check loop status** — count prior agent re-review requests; at or above the cap → Stopping Conditions.
-6. **Fetch, acknowledge, classify.** Default fetch (below). Summarize actionable findings grouped by file/behavior; none and `loopStatus.cleanBlockedBy` null → report clean and stop (set → not clean, see `references/reviewer-selection.md`). First run for the repo → profile decision NOW, before any edit (see Verification Profile), then relay the profile intro. Explanation requests get a reply draft, not a forced edit; conflicts or regression risk → stop and surface the tradeoff.
-7. **Fix + verify.** Scoped to feedback; read before editing; each change traceable to a feedback cluster; sweep per Pattern → Sweep → Converge. Verify via the profile runner; checks can't run → report why.
-8. **Commit, push, re-review, wait, record.** `--cycle-summary` + relay pointer; use `publish_changes.py` (`references/script-usage.md`) to verify, commit, push explicit paths, and request review under one PR lock. Read `head` and `review_request`; no manual Git fallback or duplicate request. Standalone `request_rereview.py --expect-head <sha> --json` recovers a missing request (handle `status`: `busy` → retry after its owner finishes; `review_pending` → wait; `already_reviewed_head` → fetch; `head_mismatch` → confirm the push, retry once; `capped`, `no_safe_trigger`, `uncountable_*`, `stale_request_not_replaced`, `review_request_rejected` → stop and relay exactly; `review_request_uncertain` or `request_failed` → reconcile; `state_record_failed`, `request_in_flight` → stop and reconcile; `published: true` still means the push succeeded), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
+6. **Fetch, acknowledge, classify.** Default fetch (below). Summarize actionable findings grouped by file/behavior; none and `loopStatus.cleanBlockedBy` null → report clean and stop (set → not clean, see `references/reviewer-selection.md`). First run for the repo → profile decision NOW, before any edit (see Verification Profile), then run `start_loop.py` and relay the profile intro. Explanation requests get a reply draft, not a forced edit; conflicts or regression risk → stop and surface the tradeoff.
+7. **Fix.** Scoped to feedback; read before editing; each change traceable to a feedback cluster; sweep per Pattern → Sweep → Converge. The next step owns full verification; checks can't run → report why and finish without publication.
+8. **Commit, push, re-review, wait, record.** Use `publish_changes.py` (`references/script-usage.md`) to verify, commit, push explicit paths, and request review under one PR lock. Relay `cycle_summary.output`; read `head`, `verification`, and `review_request`; no manual Git fallback or duplicate request. Standalone `request_rereview.py --expect-head <sha> --json` recovers a missing request (handle `status`: `busy` → retry after its owner finishes; `review_pending` → wait; `already_reviewed_head` → fetch; `head_mismatch` → confirm the push, retry once; `capped`, `no_safe_trigger`, `uncountable_*`, `stale_request_not_replaced`, `review_request_rejected` → stop and relay exactly; `review_request_uncertain` or `request_failed` → reconcile; `state_record_failed`, `request_in_flight` → stop and reconcile; `published: true` still means the push succeeded), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
    ```bash
    python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
      --wait --after "$REREVIEW_AT" --timeout 1800
    ```
-   Do not poll it; never invent its result; relay its final output once. Fallback (no completion notifications, e.g. Codex): chunked waits — commands, statuses, refused/timed-out handling in `references/script-usage.md`. After the final wait, `--record-run` exactly once and relay its `[loop] Summary` pointer line.
+   Do not poll it; never invent its result; relay its final output once. Fallback (no completion notifications, e.g. Codex): chunked waits — commands, statuses, refused/timed-out handling in `references/script-usage.md`. After the final wait, run `finish_loop.py` and relay `receipt.output` from its JSON.
 
 ## Script Usage
 
@@ -126,4 +127,4 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 
 ## GitHub Write Safety
 
-Invariants: **never resolve an `UNRESOLVED` thread without an explicit user request; never submit approve/request-changes reviews unless explicitly asked.** Thread resolution is off by default; explicit opt-in uses `--resolve-outdated` / `--resolve-addressed-by-reply`; uncertain run → `--dry-run` first. Full policy, publish-stop conditions, and the bundled-hooks table: `references/write-safety.md`.
+Invariants: **never resolve an `UNRESOLVED` thread without an explicit user request; never submit approve/request-changes reviews unless explicitly asked.** Thread resolution is off by default; explicit opt-in uses `--resolve-outdated` / `--resolve-addressed-by-reply`; uncertain run → `--dry-run` first. Full policy, publish-stop conditions, and lifecycle command behavior: `references/write-safety.md`.

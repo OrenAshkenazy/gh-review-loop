@@ -247,17 +247,15 @@ def _duration_seconds(started_at: str, ts: str) -> int:
 
 
 def format_auto_snapshot(record: dict[str, Any]) -> str:
-    """Lean receipt for the Stop-hook backstop (agent didn't post a summary).
+    """Lean diagnostic receipt without agent-supplied verification claims.
 
-    The hook can't know agent-only facts — fixed count, verification result,
+    A diagnostic can't know agent-only facts — fixed count, verification result,
     terminal outcome — so this shows ONLY GitHub-observable state and is
     explicitly labelled automatic. It never prints a guessed Fixed/
     Verification/Outcome, which is what made the full receipt misleading when
     fired without agent inputs.
     """
-    # One line on purpose: Claude Code collapses multi-line hook output behind
-    # "ctrl+o to expand", so a multi-line backstop summary wouldn't actually be
-    # visible to someone watching the chat.
+    # Keep the diagnostic compact when only GitHub-observable counts are needed.
     snapshot = (
         "[loop] Summary (auto, agent didn't post one): "
         f"{record['findings_fetched']} seen, "

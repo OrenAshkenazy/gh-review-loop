@@ -62,7 +62,8 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
     --planned-verification --repo OWNER/REPO
 
-# Run the verification profile (feed its JSON into --verification-details).
+# Standalone diagnosis only; publish_changes.py already runs this once.
+# Do not run the full profile separately before publishing.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/run_profile.py" owner/repo /path/to/repo
 
 # Read-only fetch (no GraphQL mutations)
@@ -105,12 +106,8 @@ The script emits `warning: ... hit page limit ...` to stderr if any GraphQL page
 # - timed_out -> record --gemini-unconfirmed; do not guess clean. Say the wait
 #   timed out — never invent feedback.
 
-## Verified publish (all runtimes)
+## Explicit lifecycle (all runtimes)
 
-After fixes and `--cycle-summary`, invoke the script using its installed absolute path:
+Use installed absolute paths for `start_loop.py`, `publish_changes.py`, and `finish_loop.py`; each accepts `--repo OWNER/REPO --pr N --repo-root ROOT`. Start before editing, publish each fix cycle, and finish after the final reviewer wait or a terminal path with no publication. Full arguments, report metadata, and examples: `references/lifecycle.md`.
 
-```text
-python "<plugin-root>/skills/gh-review-loop/scripts/publish_changes.py" --repo owner/repo --pr 42 --repo-root "<checkout-root>" --paths src/fix.py tests/test_fix.py --message "Fix reviewer findings"
-```
-
-Use checkout-relative paths and an empty index. `--dry-run` verifies only. Pass cap overrides. Wait after `review_request.created_at` on success. Inspect `published` before retrying; `request_rereview.py --expect-head <sha>` recovers a missing request. For `publication_unconfirmed`, see `resume-and-recovery.md`.
+The publisher verifies once and generates the cycle receipt. Do not run a separate full profile or cycle summary first. Relay `cycle_summary.output`; pass its `verification` object to finish and relay `receipt.output`.
