@@ -173,7 +173,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
     def fake_request(repo, pr, request_login, **kwargs):
         requested["login"] = request_login
         return {"created_at": REREVIEW_AT, "repo": repo, "pr": pr,
-                "kind": "review_request", "reviewer": request_login, "posted": True}
+                "kind": "review_request", "reviewer": request_login, "posted": True, "status": "posted"}
 
     monkeypatch.setattr(request_rereview, "request_review", fake_request)
     monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
@@ -182,6 +182,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
 
     assert requested["login"] == COPILOT_REQUEST
     assert posted["kind"] == "review_request"
+    assert posted["status"] == "posted"
     assert posted["created_at"] == REREVIEW_AT
     assert posted["state"] == "ABSENT"
 

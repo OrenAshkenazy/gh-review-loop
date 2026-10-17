@@ -1559,16 +1559,19 @@ def rereview_limit_reached(
     at a cap of 0, so the limit cannot be reached before that first review.
     Without local provenance (``provenance_known=False``) ``used`` is the
     actor fallback: every request under the member's login, manual clicks
-    included, an upper bound that proves nothing; the request side reports
-    that count as unknown rather than capped, and so does this. A
+    included. That upper bound counts toward the cap, exactly as the
+    request side counts it (an early ``capped`` is answered by raising the
+    cap; refusing it as unknown stopped every first run on a second
+    machine). ``reReviewCountComplete`` still says it is a bound. A
     page-limited count is a lower bound and still proves the cap.
     """
+    del provenance_known  # kept for callers; the bound counts either way
     vendor = review_vendors.vendor_for(author) if author else None
     if vendor is not None and vendor.trigger_kind == "review_request":
         first = reviewer_resolver.first_completed_review_at(
             (pull_request.get("reviews") or {}).get("nodes") or [], vendor
         )
-        if not first or not provenance_known:
+        if not first:
             return False
     return used >= limit
 
@@ -4332,8 +4335,8 @@ def main() -> int:
             loop_request_times=recorded_request_times,
         )
         # One decision for the stderr warning, the JSON flag and the
-        # `capped` outcome: cycle 0 is free and an actor-fallback count is
-        # not proof (PR #116 review).
+        # `capped` outcome: cycle 0 is free; an actor-fallback count is an
+        # upper bound and counts (post-#116 live test).
         _limit_reached = rereview_limit_reached(
             pull_request, args.author, len(rereviews), args.max_rereview_requests,
             provenance_known=recorded_request_times is not None,

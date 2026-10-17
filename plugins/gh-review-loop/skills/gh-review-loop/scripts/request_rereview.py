@@ -986,7 +986,9 @@ def count_agent_review_requests(
     The REST timeline is the complete record of who clicked or called
     "request review" (paginated, unlike the fetch's GraphQL page). The rule
     itself lives in ``reviewer_resolver.counted_review_requests`` so the fetch
-    and this script can never disagree. None when it cannot be established.
+    and this script can never disagree. None when it cannot be established
+    (a failed read, no login and no record, or an unlogged post in flight).
+    Without a local record the count is an upper bound: see the comment below.
 
     The recorded provenance matches the loop's own timestamps and needs no
     login; only the actor fallback does. So an unresolvable ``gh api user``
@@ -1015,13 +1017,13 @@ def count_agent_review_requests(
         return None
     if recorded is None and counted:
         # No local record, yet requests under this login exist after the
-        # vendor's first review. They may be the loop's (a cleared state dir)
-        # or the member's own clicks, and the two findings this resolves pull
-        # opposite ways: charging the member's clicks to the loop stops a first
-        # run as capped, while assuming zero would let every pushed head post
-        # another request past the cap. So the count is unknown and the caller
-        # refuses to post — `--no-cap-check` is the deliberate override.
-        return None
+        # vendor's first review: the loop's own from another machine or a
+        # cleared state dir, or the member's clicks. Count them all. That is
+        # an upper bound, so the worst case is an early `capped` that the
+        # member answers by raising the cap; refusing as unknown (the earlier
+        # rule) stopped every first run on a second machine, which the live
+        # Copilot test hit, and the fetch already reports this same bound.
+        return len(counted)
     if recorded is not None and len(recorded) > len(counted):
         # A countable request is durably logged but its event has not
         # surfaced on the timeline yet. It still consumed the cap, so the
@@ -1207,7 +1209,19 @@ def request_registered(
     return False
 
 
-def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
+def capped_payload(
+    repo: str, pr: int, used: int, cap: int, *, upper_bound: bool = False
+) -> dict[str, Any]:
+    """``upper_bound``: the count rests on the timeline alone (no local
+    provenance), so it includes every request under this login, manual
+    clicks included. Said in the payload so the member knows raising the
+    cap is the honest answer, not a bypass."""
+    basis = (
+        " This count has no local record behind it and includes every request "
+        "made under this login, manual clicks included, so it may overstate "
+        "the loop's own use."
+        if upper_bound else ""
+    )
     return {
         "status": "capped",
         "posted": False,
@@ -1215,9 +1229,10 @@ def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
         "pr": pr,
         "rereviews_used": used,
         "rereview_limit": cap,
+        "count_is_upper_bound": upper_bound,
         "message": (
             f"Re-review cap reached: {used} of {cap} requests already posted by "
-            "this agent on this PR. Raise max_rereview_requests or pass "
+            f"this agent on this PR.{basis} Raise max_rereview_requests or pass "
             "--max-rereview-requests to continue."
         ),
     }
@@ -1306,6 +1321,7 @@ def post_rereview(
 
     if dry_run:
         return {
+            "status": "dry_run",
             "created_at": None,
             "repo": repo,
             "pr": pr,
@@ -1345,10 +1361,12 @@ def post_rereview(
         raise RuntimeError("gh api response missing created_at")
 
     return {
+        "status": "posted",
         "created_at": created_at,
         "repo": repo,
         "pr": pr,
         "phrase": phrase,
+        "posted": True,
     }
 
 
@@ -1377,6 +1395,7 @@ def request_review(
 
     if dry_run:
         return {
+            "status": "dry_run",
             "created_at": None,
             "repo": repo,
             "pr": pr,
@@ -1413,6 +1432,7 @@ def request_review(
             requested_at=requested_at,
         )
     return {
+        "status": "posted",
         "created_at": requested_at,
         "repo": repo,
         "pr": pr,
@@ -1801,7 +1821,13 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
             return 0
         if used >= cap:
-            _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
+            _emit(
+                capped_payload(
+                    args.repo, args.pr, used, cap,
+                    upper_bound=loop_request_times(args.repo, args.pr, vendor) is None,
+                ),
+                json_output=json_output,
+            )
             return 0
     # The open request is withdrawn only once the cap has cleared, so a cap
     # refusal never leaves the PR with nothing pending. A dry run withdraws
@@ -1850,6 +1876,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             args.repo, args.pr, vendor, posting_login, exc.requested_at, prior=prior
         ):
             payload = {
+                "status": "posted",
                 "created_at": exc.requested_at,
                 "repo": args.repo,
                 "pr": args.pr,
