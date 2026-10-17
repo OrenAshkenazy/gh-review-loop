@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -142,6 +143,166 @@ def save_sticky_state(state: dict[str, Any]) -> None:
     path = sticky_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+
+def pr_scoped_path(repo: str, pr: int, subdir: str, suffix: str) -> Path:
+    """A per-PR file under the state dir. Owner and repo names are
+    case-insensitive on GitHub, so the name is case-folded."""
+    safe = re.sub(r"[^a-z0-9._-]", "_", f"{repo}#{pr}".casefold())
+    return state_dir() / subdir / f"{safe}{suffix}"
+
+
+def request_log_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".jsonl")
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
+    """Append one record to an append-only log; True once it is on disk.
+
+    These logs live apart from state.json on purpose: state.json is rewritten
+    whole by many writers that do not lock each other, and a writer holding
+    an older snapshot erases whatever was written meanwhile. An appended line
+    is never rewritten by anyone.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
+    """Append one review-request record (the cap's provenance); True once on disk."""
+    return _append_jsonl(request_log_path(repo, pr), record)
+
+
+def cycle_stamp_log_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".stamps.jsonl")
+
+
+def append_cycle_stamp(repo: str, pr: int, record: dict[str, Any]) -> bool:
+    """Append one cycle-transition stamp (a posted re-review); True once on disk.
+
+    The stamp drives the session-cycle ordinal. It used to be a counter in
+    state.json, which a fetch or hook holding an older snapshot would erase
+    right after the request script wrote it, leaving the ordinal one behind
+    for the rest of the run (PR #116 review).
+    """
+    return _append_jsonl(cycle_stamp_log_path(repo, pr), record)
+
+
+def read_cycle_stamps(repo: str, pr: int) -> list[dict[str, Any]]:
+    """The PR's cycle stamps, oldest first; a torn line is skipped.
+
+    Only the narration ordinal depends on these, so a torn last line costs
+    at most one cycle label; it never touches the cap.
+    """
+    try:
+        text = cycle_stamp_log_path(repo, pr).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    stamps = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            stamps.append(item)
+    return stamps
+
+
+def count_cycle_stamps(repo: str, pr: int) -> int:
+    return len(read_cycle_stamps(repo, pr))
+
+
+# Returned inside the record list when the log cannot be trusted as complete.
+INCOMPLETE_LOG_RECORD: dict[str, Any] = {"incomplete": True}
+
+
+def incomplete_marker_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".incomplete")
+
+
+def mark_provenance_incomplete(repo: str, pr: int) -> bool:
+    """Durably note that a posted request could not be logged; True once on disk.
+
+    Lives beside the provenance log, not in state.json: that file is
+    rewritten whole by unlocked writers, and a fetch holding an older
+    snapshot would erase a flag written there. Nothing rewrites this file.
+    """
+    path = incomplete_marker_path(repo, pr)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text("", encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def unconfirmed_request_path(repo: str, pr: int) -> Path:
+    """The record of a request whose outcome is not confirmed yet (a
+    reservation). Beside the PR's lock file, apart from state.json."""
+    return pr_scoped_path(repo, pr, "locks", ".unconfirmed.json")
+
+
+def cap_count_uncertain(repo: str, pr: int) -> bool:
+    """Is the local request history not a complete count right now?
+
+    True for an explicitly incomplete history, and while a reservation is
+    open: that request may already be on GitHub but is not in the log until
+    it is settled.
+    """
+    return provenance_incomplete(repo, pr) or unconfirmed_request_path(repo, pr).exists()
+
+
+def provenance_incomplete(repo: str, pr: int) -> bool:
+    """Was a posted request explicitly left unrecorded (failed append, torn log,
+    or the legacy state.json flag)?"""
+    if incomplete_marker_path(repo, pr).exists():
+        return True
+    logged = read_request_log(repo, pr) or []
+    if any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return True
+    state = load_sticky_state()
+    target = f"{repo}#{pr}".casefold()
+    for key, entry in state.items():
+        if isinstance(key, str) and key.casefold() == target:
+            return bool(isinstance(entry, dict) and entry.get("review_requests_incomplete"))
+    return False
+
+
+def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
+    """The PR's appended request records; None when there is no log yet.
+
+    An unreadable log, or any malformed line (a crash can tear the last
+    append), yields ``[INCOMPLETE_LOG_RECORD]``: dropping a torn record would
+    make the rest look complete and undercount the cap.
+    """
+    if incomplete_marker_path(repo, pr).exists():
+        return [dict(INCOMPLETE_LOG_RECORD)]
+    try:
+        text = request_log_path(repo, pr).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return [dict(INCOMPLETE_LOG_RECORD)]
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return [dict(INCOMPLETE_LOG_RECORD)]
+        if not isinstance(item, dict):
+            return [dict(INCOMPLETE_LOG_RECORD)]
+        records.append(item)
+    return records
 
 
 def safe_int(value: Any) -> int:

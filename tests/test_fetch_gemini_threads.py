@@ -971,6 +971,24 @@ class TestReviewerSelectionCli:
         assert fgt.read_reviewer_selection(self.PR) is None
 
 
+def _with_reviews_page(responder, logins=()):
+    """Wrap a thread-query responder so the reviews query is answered too.
+
+    Reviewer discovery reads review authors from their own paginated query
+    (PR #116 review); these tests exercise thread pagination and only need
+    that query satisfied.
+    """
+    def run_gh(args, cwd=None):
+        query = args[3] if len(args) > 3 else ""
+        if "reviewsAfter" in query:
+            return {"data": {"repository": {"pullRequest": {"reviews": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"author": {"login": login, "__typename": "Bot"}} for login in logins],
+            }}}}}
+        return responder(args)
+    return run_gh
+
+
 class TestReviewerDiscoveryFetch:
     PR = PullRequest(owner="o", repo="r", number=5)
 
@@ -1029,7 +1047,7 @@ class TestReviewerDiscoveryFetch:
             calls.append(args)
             return next(responses)
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR)
 
@@ -1052,7 +1070,7 @@ class TestReviewerDiscoveryFetch:
         monkeypatch.setattr(
             fgt,
             "run_gh",
-            lambda args: {"data": {"repository": None}},
+            _with_reviews_page(lambda args: {"data": {"repository": None}}),
         )
 
         with pytest.raises(RuntimeError, match="missing or invalid data"):
@@ -1120,7 +1138,7 @@ class TestReviewerDiscoveryFetch:
                 }
             }
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR)
 
@@ -1180,7 +1198,7 @@ class TestReviewerDiscoveryFetch:
                 }
             }
 
-        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        monkeypatch.setattr(fgt, "run_gh", _with_reviews_page(fake_run_gh))
 
         result = fgt.fetch_reviewer_discovery(self.PR, max_pages=1)
 
@@ -1781,12 +1799,44 @@ class TestRunTracking:
         assert read_run_tracking(pr)["session_cycle"] == 1
 
     def _post_rereview(self, pr):
-        """Mimic request_rereview.py's local cycle-transition stamp."""
+        """request_rereview.py's cycle-transition stamp, as it really lands:
+        one stamp per posted request, each under its own request id."""
+        import request_rereview
+        import uuid
+        request_rereview.stamp_cycle(f"{pr.owner}/{pr.repo}", pr.number, uuid.uuid4().hex)
+
+    def test_a_stale_state_writer_cannot_erase_the_rereview_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """A fetch or hook that loaded state.json before the request was
+        posted and saved its snapshot afterwards used to wipe the stamp, so
+        the next cycle never advanced. The stamp now lives beside the
+        provenance log, where no state.json writer can reach it
+        (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        from fetch_gemini_threads import load_sticky_state, save_sticky_state
+        pr = self._pr()
+        update_run_tracking(pr, [("t1", "a.py")])
+        stamp_summary_emitted(pr)
+        stale = load_sticky_state()
+        self._post_rereview(pr)
+        save_sticky_state(stale)
+        update_run_tracking(pr, [("t2", "b.py")])
+        assert read_run_tracking(pr)["session_cycle"] == 2
+
+    def test_a_legacy_in_state_stamp_still_advances_the_cycle(self, tmp_path, monkeypatch):
+        """Runs that were mid-cycle on the previous release keep their count."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         from fetch_gemini_threads import load_sticky_state, save_sticky_state, _state_key
+        pr = self._pr()
+        update_run_tracking(pr, [("t1", "a.py")])
+        stamp_summary_emitted(pr)
         state = load_sticky_state()
-        run = state.setdefault(_state_key(pr), {}).setdefault("run", {})
+        run = state[_state_key(pr)]["run"]
         run["rereviews_posted"] = run.get("rereviews_posted", 0) + 1
         save_sticky_state(state)
+        update_run_tracking(pr, [("t2", "b.py")])
+        assert read_run_tracking(pr)["session_cycle"] == 2
 
     def test_fetch_after_summary_and_rereview_starts_next_cycle(
         self, tmp_path, monkeypatch
@@ -2750,6 +2800,9 @@ class TestDeriveOutcome:
 
     def test_clean_when_no_remaining_and_passed(self):
         assert _derive_outcome(0, "passed", cap_reached=False) == "clean"
+        # A Copilot clean gate that blocks (unparseable or stale overview)
+        # means zero threads is not clean, in the record too (PR #116 review).
+        assert _derive_outcome(0, "passed", cap_reached=False, clean_blocked="overview_unparseable") == "human"
 
     def test_human_fallback_when_remaining(self):
         assert _derive_outcome(2, "passed", cap_reached=False) == "human"
@@ -4146,3 +4199,787 @@ class TestConvergenceReceiptWiring:
             f"{owners['format_convergence_line']}; only build_convergence may "
             "render the convergence line"
         )
+
+
+from fetch_gemini_threads import reviewer_selection_state  # noqa: E402
+
+
+class TestReviewRequestSelectionState:
+    def test_copilot_selection_keeps_its_display_name_without_a_mention_trigger(self):
+        state = reviewer_selection_state(
+            {"login": "copilot-pull-request-reviewer", "display_name": "Copilot Pull Request Reviewer"},
+            source="persisted",
+        )
+
+        assert state["display_name"] == "Copilot"
+        assert state["review_trigger"] is None
+        assert state["trigger_kind"] == "review_request"
+        assert state["request_login"] == "copilot-pull-request-reviewer[bot]"
+        assert state["auto_reviews"] is False
+        assert state["configured"] is True
+
+    def test_a_stale_persisted_mention_for_copilot_is_dropped(self):
+        """Records saved by the old 'configurable' path carry review_trigger
+        '@copilot'. A comment never triggers Copilot, so the projection must
+        not advertise one."""
+        state = reviewer_selection_state(
+            {"login": "copilot-pull-request-reviewer", "review_trigger": "@copilot"},
+            source="persisted",
+        )
+
+        assert state["review_trigger"] is None
+        assert state["trigger_kind"] == "review_request"
+
+    def test_codex_selection_is_unchanged(self):
+        state = reviewer_selection_state({"login": "chatgpt-codex-connector"}, source="persisted")
+
+        assert state["review_trigger"] == "@codex"
+        assert state["trigger_kind"] == "comment"
+        assert state["request_login"] is None
+
+
+import fetch_gemini_threads as _fgt  # noqa: E402
+
+
+class TestReviewRequestCounting:
+    """For a review_request vendor the cap counts timeline events, not mentions,
+    and only those after the vendor's first completed review."""
+
+    COPILOT = "copilot-pull-request-reviewer"
+    FIRST_REVIEW = "2026-10-07T15:46:14Z"
+
+    def _pr(self, *events, reviews=None, timeline_size=None):
+        nodes = [
+            {
+                "__typename": "ReviewRequestedEvent",
+                "createdAt": created_at,
+                "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": login},
+            }
+            for actor, login, created_at in events
+        ]
+        if timeline_size is not None:
+            nodes = nodes + [
+                {
+                    "__typename": "ReviewRequestedEvent",
+                    "createdAt": f"2026-10-08T00:{i % 60:02d}:{i // 60:02d}Z",
+                    "actor": {"login": "agent"},
+                    "requestedReviewer": {"__typename": "Bot", "login": self.COPILOT},
+                }
+                for i in range(timeline_size - len(nodes))
+            ]
+        if reviews is None:
+            reviews = [{"author": {"login": self.COPILOT}, "state": "COMMENTED",
+                        "submittedAt": self.FIRST_REVIEW, "commit": {"oid": "f4a55e3"}}]
+        return {
+            "comments": {"nodes": []},
+            "reviews": {"nodes": reviews},
+            "timelineItems": {"nodes": nodes},
+        }
+
+    def test_copilot_requests_by_the_agent_after_the_first_review_count(self):
+        pr = self._pr(
+            ("agent", self.COPILOT, "2026-10-07T15:42:27Z"),   # initial: free
+            ("agent", self.COPILOT, "2026-10-07T16:20:05Z"),   # counts
+            ("human", self.COPILOT, "2026-10-07T16:30:00Z"),   # human: never
+            ("agent", "some-user", "2026-10-07T16:40:00Z"),    # other reviewer
+        )
+
+        requests = rereview_requests(pr, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT)
+
+        assert [r["created_at"] for r in requests] == ["2026-10-07T16:20:05Z"]
+
+    def test_without_an_agent_login_every_post_review_copilot_request_counts(self):
+        pr = self._pr(
+            ("agent", self.COPILOT, "2026-10-07T15:42:27Z"),
+            ("agent", self.COPILOT, "2026-10-07T16:20:05Z"),
+            ("human", self.COPILOT, "2026-10-07T16:30:00Z"),
+        )
+
+        assert len(rereview_requests(pr, None, review_trigger_mention=None, reviewer_login=self.COPILOT)) == 2
+
+    def test_nothing_counts_before_the_first_completed_review(self):
+        pr = self._pr(("agent", self.COPILOT, "2026-10-07T15:42:27Z"), reviews=[])
+
+        assert rereview_requests(pr, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT) == []
+
+    def test_comment_vendors_still_count_mentions_not_events(self):
+        pr = self._pr(("agent", self.COPILOT, "2026-10-07T16:20:05Z"))
+        pr["comments"]["nodes"] = [{"author": {"login": "agent"}, "body": "@codex review"}]
+
+        requests = rereview_requests(pr, "agent", review_trigger_mention="@codex", reviewer_login="chatgpt-codex-connector")
+
+        assert len(requests) == 1
+        assert requests[0]["body"] == "@codex review"
+
+    def test_missing_timeline_is_zero_not_an_error(self):
+        assert rereview_requests(
+            {"comments": {"nodes": []}}, "agent", review_trigger_mention=None, reviewer_login=self.COPILOT
+        ) == []
+
+    def test_full_timeline_page_marks_the_count_incomplete(self):
+        full = self._pr(timeline_size=_fgt.PAGE_LIMIT_TIMELINE)
+        partial = self._pr(("agent", self.COPILOT, "2026-10-07T16:20:05Z"))
+
+        assert _fgt.review_request_count_complete(full) is False
+        assert _fgt.review_request_count_complete(partial) is True
+        assert _fgt.review_request_count_complete({"comments": {"nodes": []}}) is True
+
+    def test_comment_vendors_always_have_a_complete_count(self):
+        # The timeline is only consulted for review-request vendors; a busy
+        # Gemini PR with a full event page must not be told its mention count
+        # is a lower bound.
+        full = self._pr(timeline_size=_fgt.PAGE_LIMIT_TIMELINE)
+
+        assert _fgt.review_request_count_complete(full, review_request_vendor=False) is True
+        assert _fgt.review_request_count_complete(full, review_request_vendor=True) is False
+        assert not any("review-request events" in w for w in _fgt.pagination_warnings(full))
+        assert not any("review-request events" in w for w in _fgt.pagination_warnings(full, review_request_vendor=False))
+        assert any("review-request events" in w for w in _fgt.pagination_warnings(full, review_request_vendor=True))
+
+    def test_the_fetch_query_asks_for_review_requested_events_and_review_commits(self):
+        assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT])" in _fgt.QUERY
+        assert "... on ReviewRequestedEvent" in _fgt.QUERY
+        assert "commit { oid }" in _fgt.QUERY
+
+
+class TestHeadAnchoredWait:
+    """A review_request vendor's wait keys on commit.oid == headRefOid, never on a timestamp."""
+
+    COPILOT = "copilot-pull-request-reviewer"
+    GEMINI = "gemini-code-assist"
+    AFTER = "2026-10-07T16:20:05Z"
+
+    def _pr(self, head, *reviews, author=None):
+        author = author or self.COPILOT
+        return {
+            "headRefOid": head,
+            "comments": {"nodes": []},
+            "reviews": {"nodes": [
+                {"id": f"R{i}", "author": {"login": author}, "state": state, "submittedAt": at,
+                 "commit": {"oid": commit}, "body": "", "url": f"u{i}"}
+                for i, (state, at, commit) in enumerate(reviews)
+            ]},
+            "reviewThreads": {"nodes": []},
+            "timelineItems": {"nodes": []},
+        }
+
+    def test_head_review_is_the_completed_review_on_the_head(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"),
+                      ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R1"
+        assert _fgt.head_review(self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3")), self.COPILOT) is None
+        assert _fgt.head_review(self._pr("d7efa49", ("PENDING", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT) is None
+
+    @staticmethod
+    def _request_event(at, actor="agent"):
+        return {"__typename": "ReviewRequestedEvent", "createdAt": at, "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+
+    def test_the_rendered_count_keeps_the_actor_filter(self):
+        """Without provenance, the Markdown count must filter by the agent's
+        login like the enforced count, or a teammate's manual requests show
+        as loop usage (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        pr.update(number=5, url="u")
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:20:00Z", actor="agent"),
+            self._request_event("2026-10-07T16:25:00Z", actor="a-human"),
+        ]
+
+        out = _fgt.render_markdown(pr, [], self.COPILOT, agent_login="agent")
+
+        assert "Re-review requests: 1" in out
+
+    def test_a_re_request_on_the_same_head_waits_for_the_newer_review(self):
+        """Copilot reviewed the head, then was asked again on the unchanged
+        head. The old review must not end the wait or stand in for the new
+        one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, "2026-10-07T16:30:00Z") is None
+
+    def test_a_dismissed_head_review_is_not_the_head_review(self):
+        pr = self._pr("d7efa49", ("DISMISSED", "2026-10-07T16:21:40Z", "d7efa49"))
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT) is None or \
+            _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is False
+
+    def test_a_listed_request_whose_event_lags_keeps_the_old_review_out(self):
+        """GraphQL lists the new same-head request before its timeline event
+        appears. GitHub drops a reviewer from the list once it submits, so the
+        old head review cannot answer it: wait, and do not call it clean
+        (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["reviewRequests"] = {"nodes": [{"requestedReviewer": {"__typename": "Bot", "login": self.COPILOT}}]}
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    def test_the_fetch_query_reads_listed_review_requests(self):
+        assert "reviewRequests(first:" in _fgt.QUERY
+
+    def test_comment_reviewers_get_no_copilot_overview(self):
+        """Only Copilot writes an overview. A Codex head review must not be
+        turned into a fabricated one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"),
+                      author="chatgpt-codex-connector")
+
+        assert _fgt.reviewer_overview_for(pr, "chatgpt-codex-connector") is None
+        assert _fgt.reviewer_overview_for(
+            self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT
+        ) is not None
+
+    def test_the_free_first_request_never_makes_the_limit_reached(self):
+        """With no completed Copilot review the next request is the free
+        cycle 0, which the request side allows even at a cap of 0 (PR #116 review)."""
+        pr = self._pr("d7efa49")
+
+        assert _fgt.rereview_limit_reached(pr, self.COPILOT, 0, 0) is False
+        reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 0, 0) is True
+        assert _fgt.rereview_limit_reached(pr, "chatgpt-codex-connector", 0, 0) is True
+
+    def test_an_actor_fallback_count_never_proves_the_cap_reached(self):
+        """Without local provenance the Copilot count is every request made
+        under the member's login after the first review: an upper bound that
+        includes manual clicks. It must not set limitReached or derive a
+        `capped` outcome; the request side reports that count as unknown
+        (PR #116 review). A page-limited count is a lower bound and still
+        proves the cap."""
+        reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=False) is False
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=True) is True
+        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, provenance_known=False) is True
+
+    def test_a_same_second_answer_to_the_newest_request_counts(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+
+    def test_a_same_second_re_request_is_not_answered_by_the_review_it_followed(self):
+        """A head review and a later re-request on the same head share one
+        GitHub second. Once that request is no longer listed (withdrawn, or
+        the list and the reviews disagree for a moment) a timestamp
+        comparison takes the old review for its answer. Pairing requests with
+        reviews, as the request side does, leaves one request unanswered, so
+        the waiter keeps waiting and the overview does not cover the head
+        (PR #116 review)."""
+        at = "2026-10-07T16:30:00Z"
+        pr = self._pr("d7efa49", ("COMMENTED", at, "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event(at), self._request_event(at)]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, at) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    @staticmethod
+    def _removed_event(at, actor="agent"):
+        return {"__typename": "ReviewRequestRemovedEvent", "createdAt": at, "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+
+    def test_a_withdrawn_request_does_not_claim_the_replacements_review(self):
+        """Stale request A withdrawn, replacement B posted, Copilot answered
+        B in B's second. Pairing without the removal gave the review to A and
+        kept the waiter waiting on a head it had (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:00:00Z"),
+            self._removed_event("2026-10-07T16:30:00Z"),
+            self._request_event("2026-10-07T16:30:00Z"),
+        ]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is True
+
+    def test_a_dismissed_review_does_not_answer_the_request_it_followed(self):
+        """Valid review R0 on the head, a re-request, then R1 on the same
+        head dismissed by a maintainer. R1 must not count as the answer, or
+        the older review (and its overview) stands in for the dismissed one
+        (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:00:00Z", "d7efa49"),
+                      ("DISMISSED", "2026-10-07T16:40:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    def test_the_fetch_query_reads_request_removals(self):
+        assert "REVIEW_REQUEST_REMOVED_EVENT" in _fgt.QUERY
+        assert "ReviewRequestRemovedEvent" in _fgt.QUERY
+
+    def test_an_older_withdrawn_request_does_not_unseat_a_later_head_review(self):
+        """Two request events before one review: the first was withdrawn and
+        the review answered the second. The leftover, older event is history
+        and the head review stands (mirrors request_state)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:00:00Z"),
+            self._request_event("2026-10-07T16:00:00Z"),
+        ]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is True
+
+    def test_copilot_wait_is_not_ready_for_a_review_of_the_previous_head(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+
+    def test_copilot_wait_is_ready_on_a_same_second_head_review(self):
+        pr = self._pr("d7efa49", ("COMMENTED", self.AFTER, "d7efa49"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is not None
+
+    def test_copilot_wait_ignores_a_pending_review_object(self):
+        pr = self._pr("d7efa49", ("PENDING", "2026-10-07T16:30:00Z", "d7efa49"))
+
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+
+    def test_gemini_wait_fingerprint_is_unchanged(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"), author=self.GEMINI)
+
+        assert _fgt.wait_activity_fingerprint(pr, self.GEMINI, self.AFTER) == _fgt.review_activity_fingerprint(pr, self.GEMINI, after_iso=self.AFTER)
+        assert _fgt.wait_activity_fingerprint(pr, self.GEMINI, self.AFTER) is not None
+
+    def test_copilot_blocking_wait_returns_only_once_the_head_is_reviewed(self, monkeypatch):
+        stale = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+        ready = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"),
+                         ("COMMENTED", "2026-10-07T16:31:00Z", "d7efa49"))
+        seen = {"n": 0}
+
+        def sequence(pr):
+            seen["n"] += 1
+            return stale if seen["n"] < 3 else ready
+
+        monkeypatch.setattr(_fgt, "fetch_threads", sequence)
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+
+        settled = _fgt.wait_for_stable_review(
+            PullRequest(owner="acme", repo="widget", number=159), author=self.COPILOT,
+            timeout_seconds=60, interval_seconds=1, quiet_seconds=0, after_iso=self.AFTER,
+        )
+
+        assert seen["n"] >= 3
+        assert settled["reviews"]["nodes"][-1]["commit"]["oid"] == "d7efa49"
+
+    def test_run_wait_chunk_copilot_waiting_then_ready(self, monkeypatch):
+        pr_ref = PullRequest(owner="acme", repo="widget", number=159)
+        stale = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
+        ready = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:31:00Z", "d7efa49"))
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        # The wait budget is measured from the request anchor, so anchor "now".
+        after = _fgt._dt.datetime.now(_fgt._dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        monkeypatch.setattr(_fgt, "fetch_threads", lambda pr: stale)
+        first = _fgt.run_wait_chunk(pr_ref, self.COPILOT, timeout_seconds=600, interval_seconds=1,
+                                    quiet_seconds=0, after_iso=after, chunk_seconds=0)
+        assert first["status"] == "waiting"
+
+        monkeypatch.setattr(_fgt, "fetch_threads", lambda pr: ready)
+        second = _fgt.run_wait_chunk(pr_ref, self.COPILOT, timeout_seconds=600, interval_seconds=1,
+                                     quiet_seconds=0, after_iso=after, chunk_seconds=0)
+        assert second["status"] == "ready"
+
+
+class TestReviewerDiscoverySources:
+    def test_single_page_discovery_keeps_reviews_and_pending_requests(self, monkeypatch):
+        payload = {"data": {"repository": {"pullRequest": {
+            "number": 1,
+            "url": "https://github.com/acme/widget/pull/1",
+            "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+            ]},
+            "reviewRequests": {"nodes": [
+                {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+            ]},
+        }}}}
+        captured = {}
+
+        def fake_run_gh(args, cwd=None):
+            query = args[3]
+            if "reviewsAfter" in query:
+                captured["reviews_query"] = query
+                return {"data": {"repository": {"pullRequest": {"reviews": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": payload["data"]["repository"]["pullRequest"]["reviews"]["nodes"],
+                }}}}}
+            captured["query"] = query
+            return payload
+
+        monkeypatch.setattr(_fgt, "run_gh", fake_run_gh)
+
+        discovery = _fgt.fetch_reviewer_discovery(PullRequest(owner="acme", repo="widget", number=1))
+
+        # Review authors come from their own paginated query now.
+        assert "reviews(first:100, after:$reviewsAfter)" in captured["reviews_query"]
+        assert "reviewRequests(first:50)" in captured["query"]
+        pr = discovery["pull_request"]
+        assert pr["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
+        assert pr["reviewRequests"]["nodes"][0]["requestedReviewer"]["login"] == "copilot-pull-request-reviewer"
+        assert discovery["partial"] is False
+
+    def test_page_capped_discovery_still_carries_the_first_pages_reviews(self, monkeypatch):
+        def page(cursor):
+            return {"data": {"repository": {"pullRequest": {
+                "number": 1, "url": "u",
+                "reviewThreads": {"pageInfo": {"hasNextPage": True, "endCursor": cursor}, "nodes": []},
+                "reviews": {"nodes": [{"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}}]},
+                "reviewRequests": {"nodes": []},
+            }}}}
+
+        monkeypatch.setattr(_fgt, "run_gh", lambda args, cwd=None: page("c1"))
+
+        discovery = _fgt.fetch_reviewer_discovery(
+            PullRequest(owner="acme", repo="widget", number=1), max_pages=2
+        )
+
+        assert discovery["partial"] is True
+        assert discovery["pull_request"]["reviews"]["nodes"][0]["author"]["login"] == "copilot-pull-request-reviewer"
+
+
+class TestSelectionCanonicalizesAliases:
+    """A selection projected from an alias must carry the GraphQL login."""
+
+    @pytest.mark.parametrize("alias", [
+        "copilot", "@copilot", "Copilot", "copilot-pull-request-reviewer[bot]",
+    ])
+    def test_copilot_aliases_project_to_the_graphql_login(self, alias):
+        state = reviewer_selection_state({"login": alias}, source="explicit")
+
+        assert state["login"] == "copilot-pull-request-reviewer"
+        assert state["display_name"] == "Copilot"
+        assert state["trigger_kind"] == "review_request"
+        assert state["request_login"] == "copilot-pull-request-reviewer[bot]"
+
+    def test_codex_alias_projects_to_the_connector_login(self):
+        state = reviewer_selection_state({"login": "@codex"}, source="persisted")
+
+        assert state["login"] == "chatgpt-codex-connector"
+        assert state["review_trigger"] == "@codex"
+
+    def test_an_unknown_login_is_preserved(self):
+        state = reviewer_selection_state({"login": "some-new-bot"}, source="persisted")
+
+        assert state["login"] == "some-new-bot"
+
+
+class TestFetchSideCapCompleteness:
+    """The fetch's cap count derives the free-cycle boundary from the reviews
+    page. A full page may hide the vendor's first completed review, which makes
+    later requests look free and lets the loop run another fix/push cycle
+    before the request script refuses the write (PR #116 review)."""
+
+    @staticmethod
+    def _pr(review_count):
+        return {
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer"}, "state": "COMMENTED",
+                 "submittedAt": f"2026-10-07T15:{index % 60:02d}:00Z", "commit": {"oid": "a"}}
+                for index in range(review_count)
+            ]},
+            "timelineItems": {"nodes": []},
+        }
+
+    def test_a_full_reviews_page_marks_the_count_incomplete(self):
+        assert _fgt.review_request_count_complete(self._pr(100)) is False
+
+    def test_a_partial_reviews_page_keeps_the_count_complete(self):
+        assert _fgt.review_request_count_complete(self._pr(3)) is True
+
+    def test_a_comment_vendor_is_unaffected(self):
+        assert _fgt.review_request_count_complete(
+            self._pr(100), review_request_vendor=False
+        ) is True
+
+
+import reviewer_resolver  # noqa: E402
+
+
+class TestDiscoveryPaginatesReviewAuthors:
+    """A clean Copilot pass leaves no thread, so its review is the only
+    evidence it reviewed. On a PR with more than 100 reviews that review can
+    fall outside one page, and discovery would then ask the user to pick a
+    reviewer again (PR #116 review)."""
+
+    PR = _fgt.PullRequest(owner="o", repo="r", number=5, url="https://github.com/o/r/pull/5")
+
+    @staticmethod
+    def _reviews_page(logins, *, has_next, end_cursor=None):
+        return {"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+            "nodes": [
+                {"author": {
+                    "login": login,
+                    "__typename": "Bot" if login.endswith("reviewer") else "User",
+                }}
+                for login in logins
+            ],
+        }}}}}
+
+    @staticmethod
+    def _threads_page():
+        return {"data": {"repository": {"pullRequest": {
+            "number": 5,
+            "url": "https://github.com/o/r/pull/5",
+            "reviewRequests": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        }}}}
+
+    def test_a_review_author_on_a_later_page_is_still_discovered(self, monkeypatch):
+        calls = []
+        responses = iter([
+            self._reviews_page(["a-human"], has_next=True, end_cursor="RCUR1"),
+            self._reviews_page(["copilot-pull-request-reviewer"], has_next=False),
+            self._threads_page(),
+        ])
+
+        def fake_run_gh(args):
+            calls.append(args)
+            return next(responses)
+
+        monkeypatch.setattr(_fgt, "run_gh", fake_run_gh)
+
+        result = _fgt.fetch_reviewer_discovery(self.PR)
+
+        authors = [
+            (node.get("author") or {}).get("login")
+            for node in result["pull_request"]["reviews"]["nodes"]
+        ]
+        assert "copilot-pull-request-reviewer" in authors
+        assert any("reviewsAfter=RCUR1" in arg for arg in calls[1])
+        assert result["partial"] is False
+
+        candidates = reviewer_resolver.discover_candidates(
+            result["pull_request"], self_login=None
+        )
+        assert [c.login for c in candidates] == ["copilot-pull-request-reviewer"]
+
+
+class TestFetchProvenanceUnknown:
+    """The fetch must carry the same uncertainty the request script does, or
+    the loop displays zero cap usage and runs another fix/push cycle before the
+    write refuses (PR #116 review)."""
+
+    PR = _fgt.PullRequest(owner="acme", repo="widget", number=159, url="u")
+
+    @staticmethod
+    def _pr_with_requests():
+        first_review = "2026-10-07T15:46:14Z"
+        return {
+            "reviews": {"nodes": [
+                {"author": {"login": "copilot-pull-request-reviewer"}, "state": "COMMENTED",
+                 "submittedAt": first_review, "commit": {"oid": "a"}},
+            ]},
+            "timelineItems": {"nodes": [
+                {"__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:20:05Z",
+                 "actor": {"login": "agent"},
+                 "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+            ]},
+        }
+
+    def test_no_state_entry_is_unknown_not_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
+    def test_an_incomplete_marker_is_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {
+            "review_requests": [{"reviewer": "copilot-pull-request-reviewer", "at": "2026-10-07T16:20:05Z"}],
+            "review_requests_incomplete": True,
+        }})
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
+    def test_a_recorded_history_is_used(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {
+            "review_requests": [{"reviewer": "copilot-pull-request-reviewer", "at": "2026-10-07T16:20:05Z"}],
+        }})
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
+
+    def test_a_stale_state_writer_cannot_erase_recorded_requests(self, monkeypatch, tmp_path):
+        """state.json is rewritten whole by many writers that do not lock each
+        other. A writer holding a snapshot from before a request was recorded
+        must not erase it, or the cap undercounts (PR #116 review)."""
+        import request_rereview
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {"run": {}}})
+        stale = _fgt.load_sticky_state()
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer="copilot-pull-request-reviewer[bot]",
+            requested_at="2026-10-07T16:20:05Z",
+        )
+        _fgt.save_sticky_state(stale)  # the concurrent writer lands last
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
+
+    def test_recorded_requests_the_timeline_does_not_show_yet_make_the_count_incomplete(self):
+        """A durably recorded request whose event GraphQL has not exposed yet
+        is still a consumed request: zero matched events is a lower bound,
+        not an exact zero (PR #116 review)."""
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=0
+        ) is False
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
+        ) is True
+
+    def test_explicitly_incomplete_history_makes_a_zero_count_incomplete(self, monkeypatch, tmp_path):
+        """No local history and an explicitly incomplete one both read as
+        None; only the latter must make even a zero event count a lower
+        bound (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(pr, loop_request_times=None, counted_requests=0) is True
+        assert loop_state.mark_provenance_incomplete("acme/widget", 159) is True
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=None, counted_requests=0,
+            provenance_incomplete=loop_state.provenance_incomplete("acme/widget", 159),
+        ) is False
+
+    def test_an_open_reservation_makes_the_count_incomplete(self, monkeypatch, tmp_path):
+        """A reserved request that has not been logged yet is neither a record
+        nor an incomplete marker, but it may already be on GitHub; the count
+        is a bound until it is settled (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is False
+        path = loop_state.unconfirmed_request_path("acme/widget", 159)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"at": "2026-10-07T16:20:05Z", "kind": "maybe", "countable": true}', encoding="utf-8")
+
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is True
+
+    def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
+        """A crash mid-append can tear the last record. Skipping it would make
+        the rest look complete and undercount the cap (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T16:20:05Z", "countable": True})
+        with open(loop_state.request_log_path("acme/widget", 159), "a", encoding="utf-8") as handle:
+            handle.write('{"reviewer": "copilot-pull-req')
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
+    def test_unknown_provenance_marks_the_count_incomplete(self):
+        pr = self._pr_with_requests()
+
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=None, counted_requests=1
+        ) is False
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
+        ) is True
+
+    def test_unknown_provenance_with_nothing_to_attribute_is_still_exact(self):
+        """Cycle 0 on a fresh PR: no record and no requests, so zero is not a
+        bound, it is the count."""
+        assert _fgt.review_request_count_complete(
+            self._pr_with_requests(), loop_request_times=None, counted_requests=0
+        ) is True
+
+    def test_unknown_provenance_still_counts_candidates_so_the_cap_is_not_understated(self):
+        pr = self._pr_with_requests()
+
+        counted = _fgt.rereview_requests(
+            pr, "agent", reviewer_login="copilot-pull-request-reviewer", loop_request_times=None
+        )
+
+        assert len(counted) == 1
+
+
+class TestFullReviewHistory:
+    """A full `reviews(last:100)` page can hide the head review and the
+    free-cycle boundary. fetch_threads backfills the whole history so the
+    waiter, the clean gate and the cap all read complete data (PR #116 review)."""
+
+    PR = PullRequest(owner="o", repo="r", number=5)
+    HEAD = "head000"
+
+    def _review(self, i, author="someone", commit="old000"):
+        return {"id": f"R{i}", "author": {"login": author, "__typename": "User"},
+                "body": "", "state": "COMMENTED",
+                "submittedAt": f"2026-10-01T00:{i // 60:02d}:{i % 60:02d}Z",
+                "url": f"u{i}", "commit": {"oid": commit}}
+
+    def test_full_page_is_backfilled_with_every_review(self, monkeypatch):
+        bot = "copilot-pull-request-reviewer"
+        history = [self._review(0, bot, self.HEAD)] + [self._review(i) for i in range(1, 101)]
+        main_page = {"data": {"repository": {"pullRequest": {
+            "headRefOid": self.HEAD, "reviews": {"nodes": history[-100:]},
+            "timelineItems": {"nodes": []},
+        }}}}
+
+        def run_gh(args, cwd=None):
+            query = args[3]
+            if "reviewsAfter" in query:
+                after = next((a.split("=", 1)[1] for a in args if a.startswith("reviewsAfter=")), None)
+                start = 0 if after is None else int(after)
+                chunk = history[start:start + 100]
+                more = start + 100 < len(history)
+                return {"data": {"repository": {"pullRequest": {"reviews": {
+                    "pageInfo": {"hasNextPage": more, "endCursor": str(start + 100) if more else None},
+                    "nodes": chunk,
+                }}}}}
+            return main_page
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 101
+        assert fgt.head_review(pull_request, bot)["id"] == "R0"
+        assert not any("reviews hit page limit" in w for w in fgt.pagination_warnings(pull_request))
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_short_page_makes_no_extra_call(self, monkeypatch):
+        calls = []
+
+        def run_gh(args, cwd=None):
+            calls.append(args)
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": [self._review(1)]},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(calls) == 1
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_failed_backfill_keeps_the_page_and_stays_truncated(self, monkeypatch):
+        page = [self._review(i) for i in range(100)]
+
+        def run_gh(args, cwd=None):
+            if "reviewsAfter" in args[3]:
+                raise RuntimeError("gh exploded")
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": page},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 100
+        assert fgt.reviews_page_truncated(pull_request) is True

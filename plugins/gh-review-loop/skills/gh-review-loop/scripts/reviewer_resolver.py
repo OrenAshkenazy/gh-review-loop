@@ -25,12 +25,19 @@ class Candidate:
     login: str
     display_name: str
     review_trigger: str | None
+    trigger_kind: str = "comment"
+    # Where discovery saw this reviewer: "thread" (inline review comment),
+    # "review" (a submitted review with no inline comments), or "requested"
+    # (a pending review request that has not produced a review yet).
+    source: str = "thread"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "login": self.login,
             "display_name": self.display_name,
             "review_trigger": self.review_trigger,
+            "trigger_kind": self.trigger_kind,
+            "source": self.source,
         }
 
 
@@ -49,8 +56,15 @@ def display_name_for(login: str) -> str:
 
 
 def trigger_for(login: str) -> str | None:
+    """The @mention that re-reviews this vendor, or None when there is none.
+
+    A review_request vendor has a handle (``@copilot``) but no comment the loop
+    could post to trigger it, so it has no trigger here.
+    """
     vendor = review_vendors.vendor_for(login)
-    return vendor.mention if vendor else None
+    if vendor is None or vendor.trigger_kind != "comment":
+        return None
+    return vendor.mention
 
 
 def phrase_for(login: str) -> str | None:
@@ -58,10 +72,27 @@ def phrase_for(login: str) -> str | None:
 
     Vendors differ: Gemini reads any sentence that mentions it, Codex matches
     ``@codex review`` exactly. Unknown reviewers have no phrase, so callers
-    fall back to the generic mention-plus-sentence form.
+    fall back to the generic mention-plus-sentence form. Review-request
+    vendors have no phrase at all.
     """
     vendor = review_vendors.vendor_for(login)
-    return vendor.rereview_phrase if vendor else None
+    if vendor is None or vendor.trigger_kind != "comment":
+        return None
+    return vendor.rereview_phrase
+
+
+def trigger_kind_for(login: str) -> str:
+    """"comment" (post an @mention) or "review_request" (requested-reviewers API)."""
+    vendor = review_vendors.vendor_for(login)
+    return vendor.trigger_kind if vendor else "comment"
+
+
+def request_login_for(login: str) -> str | None:
+    """The login to pass to the requested-reviewers API, for review_request vendors."""
+    vendor = review_vendors.vendor_for(login)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return None
+    return vendor.request_login
 
 
 def auto_reviews(login: str) -> bool:
@@ -74,6 +105,274 @@ def auto_reviews(login: str) -> bool:
     return vendor.auto_reviews if vendor else True
 
 
+def normalize_request_event(event: Any) -> dict[str, Any] | None:
+    """One shape for a review-request event from either GitHub API.
+
+    Accepts a GraphQL ``ReviewRequestedEvent`` node (``createdAt``,
+    ``actor.login``, ``requestedReviewer.login``) or a REST timeline event
+    (``event == "review_requested"``, ``created_at``, ``actor.login``,
+    ``requested_reviewer.login``). Team requests, other event types, and
+    non-dicts normalize to None.
+    """
+    if not isinstance(event, dict):
+        return None
+    if "event" in event or "requested_reviewer" in event or "requested_team" in event:
+        if event.get("event") != "review_requested":
+            return None
+        requested = event.get("requested_reviewer")
+        if not isinstance(requested, dict):
+            return None
+        return {
+            "created_at": event.get("created_at") or "",
+            "actor_login": (event.get("actor") or {}).get("login") or "",
+            "reviewer_login": requested.get("login") or "",
+        }
+    if event.get("__typename") not in (None, "ReviewRequestedEvent"):
+        return None
+    requested = event.get("requestedReviewer")
+    if not isinstance(requested, dict):
+        return None
+    return {
+        "created_at": event.get("createdAt") or "",
+        "actor_login": (event.get("actor") or {}).get("login") or "",
+        "reviewer_login": requested.get("login") or "",
+    }
+
+
+def normalize_request_removed_event(event: Any) -> dict[str, Any] | None:
+    """One shape for a review-request *removal* from either GitHub API.
+
+    Accepts a GraphQL ``ReviewRequestRemovedEvent`` node or a REST timeline
+    event with ``event == "review_request_removed"``. Everything else,
+    including a plain request event, normalizes to None.
+    """
+    if not isinstance(event, dict):
+        return None
+    if "event" in event or "requested_reviewer" in event or "requested_team" in event:
+        if event.get("event") != "review_request_removed":
+            return None
+        requested = event.get("requested_reviewer")
+        if not isinstance(requested, dict):
+            return None
+        return {
+            "created_at": event.get("created_at") or "",
+            "actor_login": (event.get("actor") or {}).get("login") or "",
+            "reviewer_login": requested.get("login") or "",
+        }
+    if event.get("__typename") != "ReviewRequestRemovedEvent":
+        return None
+    requested = event.get("requestedReviewer")
+    if not isinstance(requested, dict):
+        return None
+    return {
+        "created_at": event.get("createdAt") or "",
+        "actor_login": (event.get("actor") or {}).get("login") or "",
+        "reviewer_login": requested.get("login") or "",
+    }
+
+
+def first_completed_review_at(
+    reviews: Any, vendor: review_vendors.ReviewVendor
+) -> str | None:
+    """Earliest submitted, non-PENDING review by ``vendor``; None when there is none.
+
+    Accepts GraphQL review nodes (``author.login``, ``submittedAt``) or REST
+    reviews (``user.login``, ``submitted_at``). This is the cycle-0 boundary:
+    a review request made before it is the initial request and is free.
+    """
+    earliest: str | None = None
+    for review in reviews or []:
+        if not isinstance(review, dict) or review.get("state") == "PENDING":
+            continue
+        author = review.get("author") or review.get("user") or {}
+        if review_vendors.vendor_for(author.get("login")) is not vendor:
+            continue
+        submitted = review.get("submittedAt") or review.get("submitted_at") or ""
+        if submitted and (earliest is None or submitted < earliest):
+            earliest = submitted
+    return earliest
+
+
+def unanswered_request_times(
+    request_times: list[str],
+    review_times: list[str],
+    removed_times: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Review-request times no submitted review has answered, oldest first.
+
+    A removal cancels the latest request made strictly before it: the stale
+    path withdraws request A and posts B in the same second, and the review
+    that answers B must not be paired with A, or B reads as unanswered for
+    twenty minutes and then invites a third request (PR #116 review). Each
+    submitted review then answers the earliest remaining request made at or
+    before it; GitHub stamps both to the second, so a same-second answer
+    counts. What is left is still waiting. Comparing only the newest request
+    time with the newest review time cannot tell two requests in one second
+    from one. Both the request-side state machine and the fetch-side head
+    check pair this way so they never disagree about which review is current.
+    """
+    unanswered = sorted(time for time in request_times if time)
+    for removed in sorted(time for time in removed_times if time):
+        for index in range(len(unanswered) - 1, -1, -1):
+            if unanswered[index] < removed:
+                unanswered.pop(index)
+                break
+    for submitted in sorted(time for time in review_times if time):
+        for index, requested in enumerate(unanswered):
+            if requested <= submitted:
+                unanswered.pop(index)
+                break
+    return unanswered
+
+
+# ``posted_at`` is the local clock just before the POST; the event time is
+# GitHub's. A local clock running ahead would put every event "before" its
+# record, so matching tolerates that much skew in the other direction.
+PROVENANCE_SKEW_SECONDS = 120
+
+
+def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
+    """True when a timeline event is the request posted at ``posted_at``."""
+    start = _parse_instant(posted_at)
+    seen = _parse_instant(event_at)
+    if start is None or seen is None:
+        return False
+    delta = (seen - start).total_seconds()
+    return -PROVENANCE_SKEW_SECONDS <= delta <= window_seconds
+
+
+def same_login(a: str | None, b: str | None) -> bool:
+    """GitHub logins are case-insensitive."""
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+def shift_iso(value: str, seconds: int) -> str:
+    """``value`` moved by ``seconds``, in GitHub's second-precision format."""
+    instant = _parse_instant(value)
+    if instant is None:
+        return value
+    return (instant + _dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def loop_request_times_from_entry(
+    entry: Any,
+    vendor: review_vendors.ReviewVendor,
+    logged: list[dict[str, Any]] | None = None,
+) -> list[str] | None:
+    """The countable request times this loop recorded for ``vendor``, sorted.
+
+    None means unknown, not empty: no record for the PR, or a POST whose
+    record could not be written (``review_requests_incomplete``). An empty
+    list is authoritative to the counter. Records stored with
+    ``countable: False`` are the free first request; whether a request is a
+    re-review is known when it is posted, so it is never re-derived by
+    comparing the local clock with GitHub's. ``logged`` is the PR's
+    append-only request log (``loop_state.read_request_log``); records in
+    ``entry`` are the older state.json form, still honored.
+    """
+    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
+        return None
+    if logged and any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return None
+    stored = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(stored, list) and logged is None:
+        return None
+    requests = (stored if isinstance(stored, list) else []) + (logged or [])
+    out = []
+    for item in requests:
+        if not isinstance(item, dict) or item.get("countable") is False:
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        at = item.get("at")
+        if isinstance(at, str) and at:
+            out.append(at)
+    return sorted(out)
+
+
+def _parse_instant(value: str) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def counted_review_requests(
+    events: Any,
+    *,
+    agent_login: str | None,
+    vendor: review_vendors.ReviewVendor,
+    first_completed_review_at: str | None,
+    loop_request_times: list[str] | None = None,
+    match_window_seconds: int = 180,
+) -> list[dict[str, Any]]:
+    """The review requests that consume the loop cap, in timeline order.
+
+    An event counts when it asks ``vendor`` and came after the vendor's first
+    completed review, so the initial request, a failed POST (no event) and a
+    deduplicated request (no POST) all cost nothing.
+
+    Provenance comes from ``loop_request_times`` — the timestamps the loop
+    recorded locally as it posted. The actor cannot supply it: the loop uses
+    the member's own `gh` credentials, so a request the member clicked in the
+    GitHub UI carries the same ``actor_login``, and counting those would let a
+    few manual clicks stop a first loop run as capped. Each recorded time
+    claims at most one event. ``loop_request_times=None`` means "no local
+    record available" and falls back to the actor filter, which bounds the
+    loop from above rather than exactly.
+    """
+    if not first_completed_review_at:
+        return []
+    candidates: list[dict[str, Any]] = []
+    for raw in events or []:
+        event = normalize_request_event(raw)
+        if event is None:
+            continue
+        if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
+            continue
+        # The actor fallback cannot tell the free first request from a
+        # re-review in the first review's second, so it excludes that second.
+        # Recorded times already exclude the free request (``countable``), so
+        # with them only events strictly before the first review are cycle 0.
+        if loop_request_times is None:
+            if event["created_at"] <= first_completed_review_at:
+                continue
+        elif event["created_at"] < first_completed_review_at:
+            continue
+        candidates.append(event)
+    candidates.sort(key=lambda event: event["created_at"])
+
+    if loop_request_times is None:
+        if agent_login is None:
+            return candidates
+        return [event for event in candidates if same_login(event["actor_login"], agent_login)]
+
+    out: list[dict[str, Any]] = []
+    unmatched = list(candidates)
+    for posted_at in sorted(loop_request_times):
+        for index, event in enumerate(unmatched):
+            if _within(event["created_at"], posted_at, match_window_seconds):
+                out.append(unmatched.pop(index))
+                break
+    out.sort(key=lambda event: event["created_at"])
+    return out
+
+
+def canonical_login(login: str) -> str:
+    """The login GraphQL reports for this reviewer, for a known vendor's alias.
+
+    Callers select a reviewer by whatever spelling they have — ``copilot``,
+    ``@copilot``, ``Copilot``, ``copilot-pull-request-reviewer[bot]`` — while
+    review and thread filters compare authors exactly against the stored
+    login. Storing an alias would request the right reviewer and then never
+    match its review. Unknown logins pass through untouched.
+    """
+    vendor = review_vendors.vendor_for(login)
+    return vendor.login if vendor else login
+
+
 def make_reviewer_record(
     login: str,
     *,
@@ -82,10 +381,13 @@ def make_reviewer_record(
     source: str,
     selected_at: str | None = None,
 ) -> dict[str, Any]:
+    login = canonical_login(login)
     return {
         "login": login,
         "display_name": display_name or display_name_for(login),
         "review_trigger": review_trigger if review_trigger is not None else trigger_for(login),
+        "trigger_kind": trigger_kind_for(login),
+        "request_login": request_login_for(login),
         "auto_reviews": auto_reviews(login),
         "source": source,
         "selected_at": selected_at or now_iso(),
@@ -113,35 +415,60 @@ def _is_bot_author(author: dict[str, Any]) -> bool:
     return False
 
 
+_SOURCE_RANK = {"thread": 0, "review": 1, "requested": 2}
+
+
 def discover_candidates(
     pull_request: dict[str, Any],
     *,
     self_login: str | None,
 ) -> list[Candidate]:
-    first_seen: dict[str, int] = {}
+    """Bot reviewers visible on the PR: threads first, then reviews, then pending requests.
+
+    Thread comment authors are the strongest signal (they left findings). A
+    review with no inline comments (a clean Copilot pass) only shows up as a
+    review author. A reviewer that was requested but has not answered yet only
+    shows up as a pending request. Within a source, first-seen order; a login
+    seen in an earlier source keeps that source.
+    """
+    seen: dict[str, tuple[int, int, str]] = {}
+
+    def consider(author: Any, index: int, source: str) -> None:
+        if not isinstance(author, dict):
+            return
+        login = author.get("login")
+        if not isinstance(login, str) or not login:
+            return
+        if self_login and login == self_login:
+            return
+        if login in seen or not _is_bot_author(author):
+            return
+        seen[login] = (_SOURCE_RANK[source], index, source)
+
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
     for thread_index, thread in enumerate(threads):
         if not isinstance(thread, dict):
             continue
         for comment in _iter_comments(thread):
-            author = comment.get("author")
-            if not isinstance(author, dict):
-                continue
-            login = author.get("login")
-            if not isinstance(login, str) or not login:
-                continue
-            if self_login and login == self_login:
-                continue
-            if login in first_seen or not _is_bot_author(author):
-                continue
-            first_seen[login] = thread_index
+            consider(comment.get("author"), thread_index, "thread")
+    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
+    for review_index, review in enumerate(reviews):
+        if isinstance(review, dict):
+            consider(review.get("author"), review_index, "review")
+    requests = (pull_request.get("reviewRequests") or {}).get("nodes") or []
+    for request_index, request in enumerate(requests):
+        if isinstance(request, dict):
+            consider(request.get("requestedReviewer"), request_index, "requested")
+
     return [
         Candidate(
             login=login,
             display_name=display_name_for(login),
             review_trigger=trigger_for(login),
+            trigger_kind=trigger_kind_for(login),
+            source=source,
         )
-        for login, _thread_index in sorted(
-            first_seen.items(), key=lambda item: (item[1], item[0])
+        for login, (_rank, _index, source) in sorted(
+            seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
         )
     ]

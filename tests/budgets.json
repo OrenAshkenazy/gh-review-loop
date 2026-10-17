@@ -1,7 +1,7 @@
 {
-  "_comment": "Doc size ratchet (#109). Raising any budget requires editing this file in the same PR \u2014 a visible, reviewable line instead of silent drift. Ratchet DOWN when a trim lands; never raise without saying why in the PR body. 2026-09-17: skill_md raised 14000\u219215000 bytes, 140\u2192150 lines, description 35\u219250 words for the OpenAI plugin-directory instruction-following requirements (explicit user-instruction precedence, preconditions with a clean stop, and a description that states inputs and stop conditions).",
+  "_comment": "Doc size ratchet (#109). Raising any budget requires editing this file in the same PR \u2014 a visible, reviewable line instead of silent drift. Ratchet DOWN when a trim lands; never raise without saying why in the PR body. 2026-09-17: skill_md raised 14000\u219215000 bytes, 140\u2192150 lines, description 35\u219250 words for the OpenAI plugin-directory instruction-following requirements (explicit user-instruction precedence, preconditions with a clean stop, and a description that states inputs and stop conditions). 2026-10-10: skill_md raised 15000\u219215300 bytes for the Copilot review-request statuses (PR #116 Codex review): workflow step 8 said every status means nothing was posted, which contradicts review_request_uncertain (posted: null \u2014 the POST may have landed) and would have an agent either build a broken wait from a missing created_at or re-request a review GitHub already accepted. stale_request_not_replaced is listed with it. Line budget unchanged.",
   "skill_md": {
-    "max_bytes": 15000,
+    "max_bytes": 15300,
     "max_lines": 150,
     "description_max_words": 50
   },

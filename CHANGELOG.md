@@ -6,6 +6,135 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **A review request GitHub accepts but does not register is refused, not
+  stamped.** The first live run (an account without Copilot code review) showed
+  the requested-reviewers POST returning 201 with no reviewer added, no pending
+  request and no timeline event — and the script reported `posted: true`,
+  consumed a cap slot and sent the loop into a wait nothing would end. REST
+  cannot tell that apart from a real Copilot request, so after a 201 the
+  script reads GraphQL `reviewRequests` (and the head's reviews) back, up to
+  three times a second apart, and reports `review_request_rejected` with
+  `reason: not_enabled` when the reviewer never appears. A read-back that fails
+  is `review_request_uncertain` / `registration_unknown` with nothing recorded.
+
+- **The fetch propagates unknown request provenance.** The write side already
+  refused to guess; the fetch still treated a missing or incomplete local
+  record as an authoritative empty list, so the loop could display zero cap
+  usage and run another fix/push cycle before the write refused. Unknown
+  provenance now falls back to the actor filter and sets
+  `reReviewCountComplete: false` — unless there is nothing to attribute, where
+  zero is exact.
+
+- **Reviewer discovery paginates review authors.** A clean Copilot pass leaves
+  no thread, so its review is the only evidence it reviewed; on a PR with more
+  than 100 reviews that review fell outside the unpaginated page and discovery
+  reported no Copilot candidate. Review authors now come from their own
+  paginated query.
+
+- **Missing request provenance fails closed.** An empty local record was
+  indistinguishable from a lost or unwritable one, and the counter treats any
+  list as authoritative — zero used, so every pushed head could post another
+  request past the cap. Unavailable history is now `None`: with no record and
+  no candidate requests the count is a verified zero, but with candidate
+  requests under the same login it is unknown and nothing is posted
+  (`--no-cap-check` is the deliberate override). A state write that fails after
+  a successful POST marks the history unusable rather than silently short.
+
+- **The fetch-side cap count admits when it is a lower bound.**
+  `review_request_count_complete()` checked only the timeline page, while the
+  free-cycle boundary comes from the reviews page: a full page can hide the
+  vendor's first completed review, making later requests look free and letting
+  the loop run another fix/push cycle before the request script refuses the
+  write. Both pages are now checked.
+
+- **`--expect-head` is honored on the comment path, and documented in the
+  canonical command.** It guarded only the review-request path, so a Codex ping
+  could land before GitHub saw the push and buy a review of the previous
+  commit, which the loop would read as this cycle's verdict. The comment path
+  now reads the head and posts nothing on a mismatch (`head_mismatch`) or an
+  unreadable head (`uncountable_state`), and workflow step 8 passes
+  `$(git rev-parse HEAD)`.
+
+- **The free initial Copilot request is not gated on the cap.** With
+  `max_rereview_requests: 0`, or with `gh api user` unresolvable, a PR Copilot
+  had never reviewed could not get its first request: the count was correct
+  (zero) but `used >= cap` still reported `capped`, and the cap's reads ran for
+  a request that needs no accounting. The branch is skipped while the vendor has
+  no completed review.
+
+- **A pending review never covers the head.** `_reviews_oldest_first()` fed
+  `PENDING` reviews into the overview and severity helpers, which
+  `head_review()` already excluded: a draft reported as covering the head sent
+  the loop to `overview_unparseable` instead of waiting, and a zero-finding
+  draft could clear the clean gate before submission.
+
+- **The cap counts the loop's own requests, not yours.** Loop and member act
+  under the same `gh` login, so the timeline's actor could not tell a
+  loop-issued Copilot request from one clicked in the GitHub UI — three manual
+  requests could stop a first run as `capped`. Requests are now recorded
+  locally as they are posted (outside the per-run block, so they outlive run
+  tracking) and the cap counts those, with the fetch reading the same record so
+  the displayed and enforced counts agree.
+
+- **An unreadable PR state is no longer reported as a counting failure.** It
+  emitted `uncountable_count`, whose message suggested retrying with
+  `--no-cap-check` — a flag consulted after that branch, so the retry took the
+  same path and still posted nothing. It is now `uncountable_state`, with no
+  bypass advice.
+
+- **A still-pending Copilot request is never doubled.** `STALE_PENDING` fell
+  through to a second POST while GraphQL still listed the first request as
+  pending, and the design evidence records that producing two reviews. Age
+  alone cannot prove abandonment, so the open request is now explicitly
+  withdrawn (`cancel_review_request()`) after the cap clears and before the
+  repost; a withdrawal that fails posts nothing and reports
+  `stale_request_not_replaced`. A dry run withdraws nothing.
+
+- **The loop's workflow routes `review_request_uncertain`.** Step 8 said every
+  status means nothing was posted and then captured `created_at`, which the
+  uncertain payload deliberately lacks — an agent following it would build a
+  broken wait or re-request a review GitHub may have accepted. The uncertain
+  status now routes to the delayed state re-read, and `created_at` is captured
+  only from a posted result.
+
+- **The clean gate blocks when the overview count exceeds the parsed links.**
+  `open_findings` is authoritative and `finding_ids` is only what the parser
+  recognized; two reported findings with one parsed link read as clean once
+  that link was known. Fewer links than findings now keeps
+  `overview_reports_open_findings`.
+
+- **Copilot aliases canonicalize before any filtering.** `--reviewer copilot`,
+  `@copilot`, `Copilot` or `copilot-pull-request-reviewer[bot]` kept that
+  spelling in the persisted record and in the loop's selection state, while
+  GraphQL reports `copilot-pull-request-reviewer`. The loop requested the right
+  reviewer and then matched none of its reviews or threads, timing out or
+  reporting no feedback. `reviewer_resolver.canonical_login()` now resolves a
+  known vendor's alias to its GraphQL login on both the persist and the project
+  path; unknown logins pass through untouched.
+
+- **The re-review cap and head dedupe no longer depend on one GraphQL page.**
+  `request_state()` read `reviews(last:100)`, which on a PR with more than 100
+  reviews can omit the vendor's first completed review (moving the cycle-0
+  boundary forward, so capped requests look free) and its review of the current
+  head (allowing a redundant request). Reviews and review-request events now
+  come from the paginated REST APIs, and an unreadable read refuses instead of
+  reporting `ABSENT`.
+
+- **An explicit mention outranks the persisted reviewer.**
+  `resolve_reviewer_login()` preferred persisted state, so persisted Copilot
+  plus `--review-trigger-mention @codex` sent a Copilot review request, and
+  persisted Codex plus `@copilot` posted a comment Copilot never reads. The
+  precedence is now explicit login, explicit mention, then persisted state —
+  matching `resolve_review_trigger()`.
+
+- **An uncertain review request is reported as unknown, not as unposted.** When
+  `gh` loses its connection after GitHub accepts the POST, and the timeline
+  reconciliation runs before the event is visible, the result ended in "Nothing
+  was posted" and told the caller to re-run — creating the duplicate review the
+  state machine exists to prevent. That case is now
+  `review_request_uncertain` (`posted: null`, `outcome: "unknown"`) and advises
+  a delayed state check.
+
 - **State directory renamed to `~/.config/gh-review-loop`, with automatic
   migration.** `~/.config/gh-gemini-review-loop` was the last remnant of the old
   plugin name, hardcoded independently in six modules and the three hooks.json

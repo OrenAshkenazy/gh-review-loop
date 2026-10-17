@@ -122,6 +122,8 @@ def test_make_reviewer_record_fills_known_defaults_and_timestamp():
         "login": "gemini-code-assist",
         "display_name": "Gemini Code Assist",
         "review_trigger": "@gemini-code-assist",
+        "trigger_kind": "comment",
+        "request_login": None,
         "auto_reviews": True,
         "source": "confirmed",
         "selected_at": "2026-06-28T12:00:00Z",
@@ -173,3 +175,356 @@ def test_unknown_reviewers_are_assumed_to_review_on_their_own():
     )
 
     assert record["auto_reviews"] is True
+
+
+COPILOT = "copilot-pull-request-reviewer"
+
+
+def test_copilot_has_no_mention_trigger_but_a_request_login():
+    assert reviewer_resolver.trigger_for(COPILOT) is None
+    assert reviewer_resolver.phrase_for(COPILOT) is None
+    assert reviewer_resolver.trigger_kind_for(COPILOT) == "review_request"
+    assert reviewer_resolver.request_login_for(COPILOT) == "copilot-pull-request-reviewer[bot]"
+
+
+def test_unknown_and_comment_vendors_keep_the_comment_kind():
+    assert reviewer_resolver.trigger_kind_for("coderabbitai") == "comment"
+    assert reviewer_resolver.request_login_for("coderabbitai") is None
+    assert reviewer_resolver.trigger_kind_for("chatgpt-codex-connector") == "comment"
+    assert reviewer_resolver.trigger_for("chatgpt-codex-connector") == "@codex"
+
+
+def test_copilot_record_carries_kind_and_request_login():
+    record = reviewer_resolver.make_reviewer_record(COPILOT, source="confirmed")
+
+    assert record["display_name"] == "Copilot"
+    assert record["review_trigger"] is None
+    assert record["trigger_kind"] == "review_request"
+    assert record["request_login"] == "copilot-pull-request-reviewer[bot]"
+    assert record["auto_reviews"] is False
+
+
+def test_codex_record_still_carries_its_mention_and_the_comment_kind():
+    record = reviewer_resolver.make_reviewer_record("chatgpt-codex-connector", source="confirmed")
+
+    assert record["review_trigger"] == "@codex"
+    assert record["trigger_kind"] == "comment"
+    assert record["request_login"] is None
+
+
+def test_candidate_dict_carries_kind_and_source():
+    candidate = reviewer_resolver.Candidate(
+        login=COPILOT,
+        display_name="Copilot",
+        review_trigger=None,
+        trigger_kind="review_request",
+        source="requested",
+    )
+
+    assert candidate.to_dict() == {
+        "login": COPILOT,
+        "display_name": "Copilot",
+        "review_trigger": None,
+        "trigger_kind": "review_request",
+        "source": "requested",
+    }
+
+
+import review_vendors  # noqa: E402
+
+
+def _gql_event(actor, created_at, reviewer=COPILOT):
+    return {
+        "__typename": "ReviewRequestedEvent",
+        "createdAt": created_at,
+        "actor": {"login": actor},
+        "requestedReviewer": {"__typename": "Bot", "login": reviewer},
+    }
+
+
+def _rest_event(actor, created_at, reviewer="Copilot"):
+    return {
+        "event": "review_requested",
+        "created_at": created_at,
+        "actor": {"login": actor},
+        "requested_reviewer": {"login": reviewer, "type": "Bot"},
+    }
+
+
+def test_normalize_request_event_accepts_graphql_and_rest_shapes():
+    assert reviewer_resolver.normalize_request_event(_gql_event("agent", "2026-10-07T16:20:05Z")) == {
+        "created_at": "2026-10-07T16:20:05Z", "actor_login": "agent", "reviewer_login": COPILOT,
+    }
+    assert reviewer_resolver.normalize_request_event(_rest_event("agent", "2026-10-07T16:20:05Z")) == {
+        "created_at": "2026-10-07T16:20:05Z", "actor_login": "agent", "reviewer_login": "Copilot",
+    }
+
+
+def test_normalize_request_event_rejects_team_requests_and_other_events():
+    assert reviewer_resolver.normalize_request_event(
+        {"event": "review_requested", "actor": {"login": "a"}, "requested_team": {"slug": "core"},
+         "created_at": "2026-10-07T16:20:05Z"}
+    ) is None
+    assert reviewer_resolver.normalize_request_event({"event": "commented", "actor": {"login": "a"}}) is None
+    assert reviewer_resolver.normalize_request_event({"__typename": "IssueComment"}) is None
+    assert reviewer_resolver.normalize_request_event("nope") is None
+    assert reviewer_resolver.normalize_request_event(None) is None
+
+
+def test_first_completed_review_at_ignores_pending_and_other_authors():
+    reviews = [
+        {"author": {"login": "alice"}, "state": "APPROVED", "submittedAt": "2026-10-07T15:00:00Z"},
+        {"author": {"login": COPILOT}, "state": "PENDING", "submittedAt": "2026-10-07T15:10:00Z"},
+        {"author": {"login": COPILOT}, "state": "COMMENTED", "submittedAt": "2026-10-07T15:46:14Z"},
+        {"user": {"login": "copilot-pull-request-reviewer[bot]"}, "state": "COMMENTED",
+         "submitted_at": "2026-10-07T15:30:00Z"},
+    ]
+
+    assert reviewer_resolver.first_completed_review_at(reviews, review_vendors.COPILOT) == "2026-10-07T15:30:00Z"
+    assert reviewer_resolver.first_completed_review_at(reviews[:2], review_vendors.COPILOT) is None
+    assert reviewer_resolver.first_completed_review_at([], review_vendors.COPILOT) is None
+
+
+def test_counted_requests_exclude_initial_human_and_other_vendor():
+    events = [
+        _gql_event("agent", "2026-10-07T15:42:27Z"),          # initial request: before the first review
+        _rest_event("agent", "2026-10-07T16:20:05Z"),         # re-request: counts (REST spelling)
+        _gql_event("a-human", "2026-10-07T16:30:00Z"),        # human: never counts
+        _gql_event("agent", "2026-10-07T16:40:00Z", reviewer="gemini-code-assist"),  # other vendor
+        _gql_event("agent", "2026-10-07T17:00:00Z"),          # counts
+    ]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+    )
+
+    assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:05Z", "2026-10-07T17:00:00Z"]
+    everyone = reviewer_resolver.counted_review_requests(
+        events, agent_login=None, vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+    )
+    assert len(everyone) == 3
+
+
+def test_counted_requests_is_empty_before_any_completed_review():
+    events = [_gql_event("agent", "2026-10-07T15:42:27Z"), _gql_event("agent", "2026-10-07T15:50:00Z")]
+
+    assert reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT, first_completed_review_at=None,
+    ) == []
+
+
+def test_review_authors_and_pending_requests_are_candidates_too():
+    """A Copilot review with zero findings has no thread comments, and a
+    just-requested Copilot has nothing at all yet; both must be discoverable."""
+    pull_request = _pr(_thread(_comment("coderabbitai")))
+    pull_request["reviews"] = {"nodes": [
+        {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+        {"author": {"login": "alice", "__typename": "User"}},
+    ]}
+    pull_request["reviewRequests"] = {"nodes": [
+        {"requestedReviewer": {"__typename": "Bot", "login": "sourcery-ai"}},
+        {"requestedReviewer": {"__typename": "User", "login": "bob"}},
+        {"requestedReviewer": None},
+    ]}
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login="codex-agent")
+
+    assert [(c.login, c.source) for c in candidates] == [
+        ("coderabbitai", "thread"),
+        ("copilot-pull-request-reviewer", "review"),
+        ("sourcery-ai", "requested"),
+    ]
+    assert candidates[1].display_name == "Copilot"
+    assert candidates[1].trigger_kind == "review_request"
+    assert candidates[1].review_trigger is None
+
+
+def test_a_login_seen_in_a_thread_is_not_duplicated_from_reviews_or_requests():
+    pull_request = _pr(_thread(_comment("copilot-pull-request-reviewer")))
+    pull_request["reviews"] = {"nodes": [
+        {"author": {"login": "copilot-pull-request-reviewer", "__typename": "Bot"}},
+    ]}
+    pull_request["reviewRequests"] = {"nodes": [
+        {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+    ]}
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login=None)
+
+    assert [(c.login, c.source) for c in candidates] == [("copilot-pull-request-reviewer", "thread")]
+
+
+def test_discovery_without_reviews_or_requests_keys_still_works():
+    pull_request = _pr(_thread(_comment("gemini-code-assist")))
+
+    candidates = reviewer_resolver.discover_candidates(pull_request, self_login=None)
+
+    assert [c.login for c in candidates] == ["gemini-code-assist"]
+    assert candidates[0].source == "thread"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("alias", [
+    "copilot",
+    "@copilot",
+    "Copilot",
+    "copilot-pull-request-reviewer[bot]",
+    "copilot-pull-request-reviewer",
+])
+def test_a_reviewer_record_persists_the_canonical_vendor_login(alias):
+    """Downstream review and thread filters compare authors exactly against
+    this login, and GraphQL returns `copilot-pull-request-reviewer`. A record
+    that keeps an alias asks Copilot successfully and then never matches its
+    review (PR #116 review)."""
+    record = reviewer_resolver.make_reviewer_record(alias, source="explicit")
+
+    assert record["login"] == "copilot-pull-request-reviewer"
+    assert record["display_name"] == "Copilot"
+    assert record["trigger_kind"] == "review_request"
+    assert record["request_login"] == "copilot-pull-request-reviewer[bot]"
+
+
+@pytest.mark.parametrize("alias, login", [
+    ("@codex", "chatgpt-codex-connector"),
+    ("codex", "chatgpt-codex-connector"),
+    ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector"),
+    ("@gemini-code-assist", "gemini-code-assist"),
+])
+def test_comment_vendor_aliases_canonicalize_too(alias, login):
+    record = reviewer_resolver.make_reviewer_record(alias, source="explicit")
+
+    assert record["login"] == login
+    assert record["review_trigger"] == reviewer_resolver.trigger_for(login)
+
+
+def test_an_unknown_reviewer_login_is_left_exactly_as_given():
+    record = reviewer_resolver.make_reviewer_record("some-new-bot[bot]", source="explicit")
+
+    assert record["login"] == "some-new-bot[bot]"
+
+
+def test_a_cycle_zero_record_never_claims_a_later_manual_request():
+    """The initial loop request is free. Its record is stored as not
+    countable, so even inside the match window it cannot claim a manual
+    re-request made right after the first review (PR #116 review)."""
+    entry = {"review_requests": [
+        {"reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T15:42:26Z", "countable": False},
+    ]}
+    times = reviewer_resolver.loop_request_times_from_entry(entry, review_vendors.COPILOT)
+    events = [
+        _gql_event("agent", "2026-10-07T15:42:27Z"),  # initial loop request
+        _gql_event("agent", "2026-10-07T15:44:00Z"),  # member clicks re-request in the UI
+    ]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:43:10Z",
+        loop_request_times=times,
+    )
+
+    assert times == []
+    assert counted == []
+
+
+def test_entry_reader_treats_missing_or_incomplete_history_as_unknown():
+    assert reviewer_resolver.loop_request_times_from_entry(None, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry({}, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry(
+        {"review_requests": [], "review_requests_incomplete": True}, review_vendors.COPILOT) is None
+
+
+def test_a_fast_local_clock_still_matches_its_event():
+    """The record is the local pre-POST time; the event is GitHub's. A local
+    clock a few seconds ahead must not orphan every record (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T16:20:00Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T16:20:45Z"],
+    )
+
+    assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:00Z"]
+
+
+def test_the_fallback_actor_filter_ignores_login_case():
+    """GitHub logins are case-insensitive; `--agent-login orenashkenazy` must
+    still count `OrenAshkenazy`'s requests when provenance is unknown (PR #116 review)."""
+    events = [_gql_event("OrenAshkenazy", "2026-10-07T16:20:05Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="orenashkenazy", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z", loop_request_times=None,
+    )
+
+    assert len(counted) == 1
+
+
+def test_a_logged_re_review_in_the_first_review_second_counts():
+    """GitHub stamps to the second. A re-review recorded as countable whose
+    event shares the first review's second is still a re-review; the
+    cycle-zero cutoff belongs to the actor fallback only (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T15:46:14Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T15:46:13Z"],
+    )
+
+    assert len(counted) == 1
+
+
+def test_each_review_answers_the_earliest_request_at_or_before_it():
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z"], ["2026-10-07T16:30:00Z"]
+    ) == []
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:20:00Z", "2026-10-07T16:30:00Z"], ["2026-10-07T16:21:40Z"]
+    ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_a_second_same_second_request_stays_unanswered():
+    """Two requests and one review in one second: one request is still
+    waiting, which a plain timestamp comparison cannot see (PR #116 review)."""
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z", "2026-10-07T16:30:00Z"], ["2026-10-07T16:30:00Z"]
+    ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_unordered_and_blank_times_are_tolerated():
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z", "", "2026-10-07T16:10:00Z"], ["", "2026-10-07T16:20:00Z"]
+    ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_a_withdrawn_request_is_not_paired_with_a_later_review():
+    """Stale request A was withdrawn and replacement B posted; B's review
+    arrived in B's second. Without the removal, the review paired with A and
+    B stayed "unanswered" (PR #116 review)."""
+    a, removed, b = "2026-10-07T16:00:00Z", "2026-10-07T16:30:00Z", "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.unanswered_request_times([a, b], [b]) == [b]
+    assert reviewer_resolver.unanswered_request_times([a, b], [b], removed_times=[removed]) == []
+
+
+def test_a_removal_cancels_the_latest_request_strictly_before_it():
+    """Withdraw-then-post lands in one second: the removal must cancel the
+    old request, never the replacement posted in the same second."""
+    a, t = "2026-10-07T16:00:00Z", "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.unanswered_request_times([a, t], [], removed_times=[t]) == [t]
+    assert reviewer_resolver.unanswered_request_times([a], [], removed_times=["2026-10-07T15:00:00Z"]) == [a]
+
+
+def test_removed_events_normalize_from_both_apis():
+    rest = {"event": "review_request_removed", "created_at": "2026-10-07T16:30:00Z",
+            "actor": {"login": "agent"}, "requested_reviewer": {"login": "Copilot"}}
+    gql = {"__typename": "ReviewRequestRemovedEvent", "createdAt": "2026-10-07T16:30:00Z",
+           "actor": {"login": "agent"}, "requestedReviewer": {"login": "copilot-pull-request-reviewer"}}
+    assert reviewer_resolver.normalize_request_removed_event(rest)["reviewer_login"] == "Copilot"
+    assert reviewer_resolver.normalize_request_removed_event(gql)["created_at"] == "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.normalize_request_removed_event({"event": "review_requested"}) is None
+    assert reviewer_resolver.normalize_request_event(rest) is None
+    assert reviewer_resolver.normalize_request_event(gql) is None

@@ -93,6 +93,11 @@ Known files:
 ~/.config/gh-review-loop/preferences.json
 ~/.config/gh-review-loop/state.json
 ~/.config/gh-review-loop/runs.jsonl
+~/.config/gh-review-loop/provenance/<owner>_<repo>_<pr>.jsonl
+~/.config/gh-review-loop/provenance/<owner>_<repo>_<pr>.incomplete
+~/.config/gh-review-loop/provenance/<owner>_<repo>_<pr>.stamps.jsonl
+~/.config/gh-review-loop/locks/<owner>_<repo>_<pr>.lock
+~/.config/gh-review-loop/locks/<owner>_<repo>_<pr>.unconfirmed.json
 ```
 
 `preferences.json` stores user preferences such as judge mode, judge model, and whether the one time judge eval tip was shown.
@@ -100,6 +105,10 @@ Known files:
 `state.json` stores local sticky receipt state, such as pull request identifiers and GitHub comment IDs used to update an existing receipt comment instead of posting duplicate comments. It also holds per-run loop tracking (the run start timestamp and the set of finding identifiers seen during a run).
 
 `runs.jsonl` stores one append-only record per completed loop run: workflow counts (findings fetched, fixed, needs-human, addressed-by-reply, cycles used, verification result, outcome, duration), the repository name, and the pull request number. It contains no identity — no git author, GitHub login, or email — and is never transmitted. It exists solely to power the local run summary and the `--stats` command.
+
+`provenance/*.jsonl` stores one append-only line per review request the loop posted for a review-request reviewer (GitHub Copilot): the reviewer bot's login, the request timestamp, and whether it counted toward the re-review cap. It lets the cap tell the loop's own requests from ones you click in GitHub. Deleting it makes the cap fall back to counting every request made under your login. The empty `.incomplete` file beside it appears only if a request could not be written to that log, and has the same effect. The `.stamps.jsonl` file beside them holds one append-only line per re-review the loop posted (a timestamp and a random request id, no identity); it only numbers the loop's cycles in its narration.
+
+`locks/` holds an empty per-PR lock file that keeps two loop runs from requesting a review at the same time, and, briefly, a record of a request whose outcome GitHub had not confirmed yet (reviewer login, timestamp, the kind of uncertainty, and the GitHub login of the account that made the request, so a later run under another account can still tell the request is yours). That record is deleted once the request is confirmed or ruled out; if no later run settles it, it stays until you delete the file.
 
 The directory location is overridable with the `GGRL_STATE_DIR` environment variable.
 

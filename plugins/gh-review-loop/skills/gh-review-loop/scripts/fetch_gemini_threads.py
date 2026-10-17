@@ -42,6 +42,7 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     touch_sentinel,
 )
 from loop_state import safe_int as _safe_int  # noqa: E402
+import loop_state  # noqa: E402
 
 
 # There is no default reviewer. An unconfigured PR resolves to "none configured"
@@ -91,12 +92,70 @@ CODEX_PRIORITY_TO_SEVERITY = {
 }
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
+# Copilot puts severities in its review *overview* (the review body), one list
+# item per finding, each with an icon whose alt text is the severity and a
+# link to the inline thread's discussion anchor. The inline comments carry no
+# marker. Example item (picture sources elided):
+#   - <picture>…<img … alt="High severity" …></picture> [Title](#discussion_r4208919854) · New
+COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
+COPILOT_FINDING_RE = re.compile(
+    r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
+    # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
+    # is matched lazily up to the `](…#discussion_r` that ends it. The link
+    # is a bare fragment in older overviews and an absolute PR URL in current
+    # ones (live, 2026-10-16), so an optional URL precedes the fragment.
+    r"\[(?P<title>[^\n]*?)\]\((?:https?://[^\s)#]+)?#discussion_r(?P<id>\d+)\)",
+    re.IGNORECASE,
+)
+COPILOT_SEVERITY_ICON_RE = re.compile(
+    r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
+)
+COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
+# The open count, as Copilot has written it (live corpus, qizsecurity org,
+# 2026-09..10): "**0 open findings**" / "<strong>2 open findings</strong>"
+# (October 7-16), "<strong>14 open issues</strong>" and "**No open issues** 🎉"
+# (October 17), and before that "<summary><strong>Open (1)</strong></summary>"
+# with "**Findings:** None" on a clean review.
+COPILOT_OPEN_FINDINGS_RE = re.compile(
+    r"(?:<strong>|\*\*)(?:(?P<count>\d+)|(?P<none>No)) open (?:findings?|issues?)(?:</strong>|\*\*)",
+    re.IGNORECASE,
+)
+COPILOT_OPEN_LEGACY_RE = re.compile(
+    r"<strong>Open \((?P<count>\d+)\)</strong>|\*\*Findings:\*\* (?P<none>None)\b", re.IGNORECASE
+)
+# Match approval phrasing only; enumerating every way Copilot can decline would
+# miss one, and an unrecognized decline read as approval dismisses a review.
+# Informational either way: the clean gate reads open_findings, not this.
+COPILOT_APPROVING_RE = re.compile(
+    r"^(ready to approve|approval recommended|approved?|lgtm|looks good)\b", re.IGNORECASE
+)
+# What the agent should do for each `cleanBlockedBy` reason (spec §5.3).
+CLEAN_BLOCKED_HINTS = {
+    "no_review_for_head": (
+        "{reviewer} has not reviewed the current head; request a review if none "
+        "is pending, then wait, before calling this PR clean."
+    ),
+    "overview_unparseable": (
+        "{reviewer} reviewed the current head but its overview could not be read; "
+        "decide from the threads and the review itself, do not report clean on "
+        "this signal."
+    ),
+    "overview_reports_open_findings": (
+        "{reviewer}'s head overview reports findings with no thread in this "
+        "fetch (page limit or deleted thread); check the review before calling "
+        "this PR clean."
+    ),
+}
+
+DISCUSSION_ANCHOR_RE = re.compile(r"#discussion_r(\d+)$")
+
 # Page sizes embedded in QUERY below. Used by the pagination guard to detect
 # when we may be silently dropping data.
 PAGE_LIMIT_REVIEW_THREADS = 100
 PAGE_LIMIT_REVIEWS = 100
 PAGE_LIMIT_PR_COMMENTS = 100
 PAGE_LIMIT_THREAD_COMMENTS = 50
+PAGE_LIMIT_TIMELINE = 100
 
 # Minimum reply length to count a non-bot comment as a substantive reply.
 # Filters out token acks like "ok", "ack", "thanks", "👍".
@@ -210,6 +269,9 @@ query($owner:String!, $repo:String!, $number:Int!) {
       headRefOid
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
+      reviewRequests(first:50) {
+        nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
+      }
       comments(last:100) {
         nodes {
           id
@@ -227,6 +289,30 @@ query($owner:String!, $repo:String!, $number:Int!) {
           state
           submittedAt
           url
+          commit { oid }
+        }
+      }
+      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT]) {
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent {
+            createdAt
+            actor { login }
+            requestedReviewer {
+              __typename
+              ... on Bot { login }
+              ... on User { login }
+            }
+          }
+          ... on ReviewRequestRemovedEvent {
+            createdAt
+            actor { login }
+            requestedReviewer {
+              __typename
+              ... on Bot { login }
+              ... on User { login }
+            }
+          }
         }
       }
       reviewThreads(first:100) {
@@ -263,12 +349,34 @@ query($owner:String!, $repo:String!, $number:Int!) {
 }
 """
 
+REVIEW_AUTHORS_DISCOVERY_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $reviewsAfter:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviews(first:100, after:$reviewsAfter) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login __typename } }
+      }
+    }
+  }
+}
+"""
+
 REVIEWER_DISCOVERY_QUERY = """
 query($owner:String!, $repo:String!, $number:Int!, $threadsAfter:String) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number
       url
+      reviewRequests(first:50) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on Bot { login }
+            ... on User { login }
+          }
+        }
+      }
       reviewThreads(first:100, after:$threadsAfter) {
         pageInfo {
           hasNextPage
@@ -341,9 +449,86 @@ def fetch_threads(pr: PullRequest) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected gh GraphQL response.")
     try:
-        return result["data"]["repository"]["pullRequest"]
+        pull_request = result["data"]["repository"]["pullRequest"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected gh GraphQL shape: missing {exc}") from exc
+    if isinstance(pull_request, dict):
+        backfill_reviews(pr, pull_request)
+    return pull_request
+
+
+FULL_REVIEWS_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $reviewsAfter:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviews(first:100, after:$reviewsAfter) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          body
+          state
+          submittedAt
+          url
+          commit { oid }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def reviews_page_truncated(pull_request: dict[str, Any]) -> bool:
+    """True when the reviews list may be missing older reviews.
+
+    The main query reads ``reviews(last:100)``. A full page can hide the head
+    review or the vendor's first completed review (the free-cycle boundary),
+    unless ``backfill_reviews`` replaced it with the complete history.
+    """
+    reviews = pull_request.get("reviews") or {}
+    if reviews.get("complete"):
+        return False
+    return len(reviews.get("nodes") or []) >= PAGE_LIMIT_REVIEWS
+
+
+def backfill_reviews(pr: PullRequest, pull_request: dict[str, Any], *, max_pages: int = 20) -> None:
+    """Replace a full reviews page with the PR's whole review history, in place.
+
+    The waiter, the clean gate and the cap all read ``reviews``; on a PR with
+    more than 100 reviews the single page hides exactly the reviews they
+    need. Any failure leaves the original page untouched, so
+    ``reviews_page_truncated`` keeps reporting it as a bound.
+    """
+    if not reviews_page_truncated(pull_request):
+        return
+    nodes: list[dict[str, Any]] = []
+    after: str | None = None
+    try:
+        for _ in range(max_pages):
+            gh_args = [
+                "api", "graphql",
+                "-f", f"query={FULL_REVIEWS_QUERY}",
+                "-F", f"owner={pr.owner}",
+                "-F", f"repo={pr.repo}",
+                "-F", f"number={pr.number}",
+            ]
+            if after:
+                gh_args.extend(["-F", f"reviewsAfter={after}"])
+            result = run_gh(gh_args)
+            reviews = result["data"]["repository"]["pullRequest"]["reviews"]
+            nodes.extend(node for node in (reviews.get("nodes") or []) if isinstance(node, dict))
+            page_info = reviews.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+            if not after:
+                return
+        else:
+            return
+    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        return
+    pull_request["reviews"] = {"nodes": nodes, "complete": True}
 
 
 def fetch_remaining_discovery_comments(
@@ -392,6 +577,57 @@ def fetch_remaining_discovery_comments(
     return {"nodes": nodes, "partial": partial, "warnings": warnings}
 
 
+def fetch_discovery_review_authors(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
+    """Every review author on the PR, paginated.
+
+    Discovery cannot read this off one page. A clean Copilot pass leaves no
+    inline thread, so the review itself is the only evidence it reviewed at
+    all; on a PR with more than 100 reviews that review can fall outside a
+    single page, and once no request is pending discovery would report no
+    Copilot candidate and ask the user to choose a reviewer again.
+    """
+    nodes: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    partial = False
+    after: str | None = None
+    for _ in range(max_pages):
+        gh_args = [
+            "api", "graphql",
+            "-f", f"query={REVIEW_AUTHORS_DISCOVERY_QUERY}",
+            "-F", f"owner={pr.owner}",
+            "-F", f"repo={pr.repo}",
+            "-F", f"number={pr.number}",
+        ]
+        if after:
+            gh_args.extend(["-F", f"reviewsAfter={after}"])
+        result = run_gh(gh_args)
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected gh GraphQL response.")
+        if "errors" in result:
+            raise RuntimeError(f"gh GraphQL errors: {result['errors']}")
+        try:
+            reviews = result["data"]["repository"]["pullRequest"]["reviews"] or {}
+            if not isinstance(reviews, dict):
+                raise TypeError("reviews is not a dictionary")
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Unexpected gh GraphQL shape: missing or invalid reviews ({exc})"
+            ) from exc
+        nodes.extend(node for node in (reviews.get("nodes") or []) if isinstance(node, dict))
+        page_info = reviews.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+        if not after:
+            partial = True
+            warnings.append("reviewer discovery review pagination stopped without an end cursor")
+            break
+    else:
+        partial = True
+        warnings.append("reviewer discovery review page cap reached")
+    return {"nodes": nodes, "partial": partial, "warnings": warnings}
+
+
 def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
     """Fetch review-thread comment authors for reviewer discovery.
 
@@ -403,6 +639,14 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
     warnings: list[str] = []
     after: str | None = None
     partial = False
+    # Review authors come from their own paginated query; reviewRequests is not
+    # paginated with the threads, so the first page's copy is the one to keep
+    # (both are discovery sources — a clean Copilot pass has no thread
+    # comments).
+    review_authors = fetch_discovery_review_authors(pr, max_pages=max_pages)
+    partial = partial or review_authors["partial"]
+    warnings.extend(review_authors["warnings"])
+    extras: dict[str, Any] = {}
     for _ in range(max_pages):
         gh_args = [
             "api",
@@ -434,6 +678,11 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
             raise RuntimeError(
                 f"Unexpected gh GraphQL shape: missing or invalid data ({exc})"
             ) from exc
+        if not extras:
+            extras = {
+                "reviews": {"nodes": review_authors["nodes"]},
+                "reviewRequests": pull_request.get("reviewRequests") or {"nodes": []},
+            }
         nodes = review_threads.get("nodes") or []
         for thread in nodes:
             if not isinstance(thread, dict):
@@ -466,6 +715,9 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
         if not page_info.get("hasNextPage"):
             merged = dict(pull_request)
             merged["reviewThreads"] = {"nodes": all_threads}
+            # The thread query no longer carries reviews; the paginated authors
+            # are the only copy, and this is the common single-page exit.
+            merged["reviews"] = {"nodes": review_authors["nodes"]}
             return {"pull_request": merged, "partial": partial, "warnings": warnings}
         after = page_info.get("endCursor")
         if not after:
@@ -479,6 +731,7 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
         "pull_request": {
             "number": pr.number,
             "url": pr.url,
+            **extras,
             "reviewThreads": {"nodes": all_threads},
         },
         "partial": partial,
@@ -604,9 +857,14 @@ def _iter_comments(thread: dict[str, Any]) -> list[dict[str, Any]]:
 def thread_severity(thread: dict[str, Any]) -> str:
     """Return reviewer-assigned severity (critical/high/medium/low) or 'unknown'.
 
-    Gemini marks severity with a priority image; Codex uses a P0-P3 badge.
-    Both are unambiguous, so both are read regardless of selected reviewer.
+    A severity annotated onto the thread from the reviewer's overview (Copilot,
+    see ``annotate_reviewer_severity``) wins. Otherwise Gemini's priority image
+    or Codex's P0-P3 badge in a comment body decides; both are unambiguous, so
+    both are read regardless of selected reviewer.
     """
+    annotated = thread.get("reviewerSeverity")
+    if isinstance(annotated, str) and annotated in SEVERITY_ORDER and annotated != "unknown":
+        return annotated
     for comment in _iter_comments(thread):
         body = comment.get("body") or ""
         plain_match = PLAIN_PRIORITY_RE.match(body)
@@ -706,6 +964,7 @@ def _derive_outcome(
     *,
     gemini_confirmed: bool = True,
     likely_fixed_remaining: int = 0,
+    clean_blocked: str | None = None,
 ) -> str:
     """Best-effort outcome when the agent does not pass --outcome explicitly.
 
@@ -736,8 +995,12 @@ def _derive_outcome(
     likely_all_fixed = (
         remaining_actionable > 0 and likely_fixed_remaining >= remaining_actionable
     )
-    # No open threads and the suite passed — it *looks* resolved.
-    looks_resolved = remaining_actionable == 0 and verification == "passed"
+    # No open threads and the suite passed — it *looks* resolved. A blocking
+    # Copilot clean gate (``clean_blocked_by``) says zero threads is not
+    # clean yet, so the record must not say clean either.
+    looks_resolved = (
+        remaining_actionable == 0 and verification == "passed" and not clean_blocked
+    )
 
     # Final wait timed out (Gemini never re-confirmed) but state otherwise looks
     # fixed: never guess clean or capped — report pending confirmation.
@@ -751,21 +1014,31 @@ def _derive_outcome(
     return "human"
 
 
-def pagination_warnings(pull_request: dict[str, Any]) -> list[str]:
+def pagination_warnings(
+    pull_request: dict[str, Any], *, review_request_vendor: bool = False
+) -> list[str]:
     """Return human-readable warnings when any GraphQL page hit its limit.
 
     Hitting the limit means the script may be silently dropping data — the
     loop should surface this so the user knows to paginate or scope the PR.
+    The timeline warning applies only to review-request vendors (Copilot),
+    whose cap count is derived from it.
     """
     warnings: list[str] = []
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
+    if not review_request_count_complete(
+        pull_request, review_request_vendor=review_request_vendor
+    ):
+        warnings.append(
+            f"review-request events hit page limit ({PAGE_LIMIT_TIMELINE}); "
+            "the re-review count is a lower bound."
+        )
     if len(pr_comments) >= PAGE_LIMIT_PR_COMMENTS:
         warnings.append(
             f"PR comments hit page limit ({PAGE_LIMIT_PR_COMMENTS}); older comments may be missing."
         )
-    if len(reviews) >= PAGE_LIMIT_REVIEWS:
+    if reviews_page_truncated(pull_request):
         warnings.append(
             f"PR reviews hit page limit ({PAGE_LIMIT_REVIEWS}); older reviews may be missing."
         )
@@ -974,17 +1247,363 @@ def review_body_findings(
     return findings
 
 
+_PROVENANCE_UNSET = object()
+
+
+def review_request_count_complete(
+    pull_request: dict[str, Any],
+    *,
+    review_request_vendor: bool = True,
+    loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
+    counted_requests: int | None = None,
+    provenance_incomplete: bool = False,
+) -> bool:
+    """False when either page the count rests on is full, so it is a lower bound.
+
+    Two pages matter. The timeline page holds the request events themselves.
+    The reviews page fixes the free-cycle boundary — the vendor's first
+    completed review — and a full page can hide it, which makes later requests
+    look free and lets the loop run another fix/push cycle before
+    request_rereview.py (which paginates) refuses the write.
+
+    Only review-request vendors count timeline events; a comment vendor's
+    count comes from PR comments, so for it this is always True.
+    """
+    if not review_request_vendor:
+        return True
+    # Provenance is the third thing the count rests on: without a local record
+    # the loop cannot tell its own requests from the member's clicks. That only
+    # makes the number a bound when there is something to attribute — with no
+    # candidate requests at all, zero is exact. Callers that pass neither get
+    # the page-limit answer alone (back-compat).
+    if loop_request_times is None and counted_requests:
+        return False
+    # A posted request that could not be logged: its event may not have
+    # reached the timeline yet, so even zero matched events is a bound.
+    if provenance_incomplete:
+        return False
+    # A request the loop durably recorded but whose event the timeline does
+    # not show yet still consumed the cap: fewer matched events than records
+    # makes the count a lower bound, not an exact number.
+    if (
+        isinstance(loop_request_times, list)
+        and counted_requests is not None
+        and counted_requests < len(loop_request_times)
+    ):
+        return False
+    nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
+    return len(nodes) < PAGE_LIMIT_TIMELINE and not reviews_page_truncated(pull_request)
+
+
+def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
+    """Parse a Copilot review overview; None when ``body`` is not one.
+
+    ``complete`` is False when neither a heading nor an open-findings count
+    could be read; ``open_findings`` is then None so the clean gate cannot
+    treat the review as a confirmed zero.
+    """
+    if not isinstance(body, str) or COPILOT_OVERVIEW_MARKER not in body:
+        return None
+    assessment = ""
+    for heading in COPILOT_ASSESSMENT_RE.finditer(body):
+        # The status heading opens with an emoji ("🟡 Changes recommended").
+        # Early-October overviews put a "## Copilot review overview" title
+        # above it; that title is not the status (PR #116 review).
+        text = re.sub(r"^\W+", "", heading.group("assessment")).strip()
+        if text.casefold() == "copilot review overview":
+            continue
+        assessment = text
+        break
+    open_match = COPILOT_OPEN_FINDINGS_RE.search(body) or COPILOT_OPEN_LEGACY_RE.search(body)
+    open_findings: int | None = None
+    if open_match:
+        open_findings = int(open_match.group("count")) if open_match.group("count") else 0
+    # Findings are read from the open section only. The overview also lists
+    # "Previously missed (N)" items — in unchanged code, with no inline
+    # thread — whose severity icons would otherwise count as unlinked open
+    # findings and hold the clean gate shut on a "0 open" review (live,
+    # 2026-10-11). The section is the <details> block whose <summary> holds
+    # the count; a bold count outside any <summary> has no section.
+    section = body
+    if open_match:
+        head = body[: open_match.start()]
+        if head.rstrip().endswith("<summary>") or "<summary>" in head[head.rfind("\n") + 1 :]:
+            end = body.find("</details>", open_match.end())
+            section = body[open_match.end() : end if end != -1 else len(body)]
+        else:
+            section = ""
+    findings = [
+        {
+            "severity": match.group("severity").lower(),
+            "discussion_id": match.group("id"),
+            "title": match.group("title").strip(),
+        }
+        for match in COPILOT_FINDING_RE.finditer(section)
+    ]
+    icon_count = len(COPILOT_SEVERITY_ICON_RE.findall(section))
+    return {
+        "assessment": assessment,
+        "approving": bool(COPILOT_APPROVING_RE.match(assessment)),
+        "open_findings": open_findings,
+        "findings": findings,
+        "unlinked_findings": max(icon_count - len(findings), 0),
+        "complete": bool(assessment) and open_findings is not None,
+    }
+
+
+def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dict[str, Any]]:
+    """``author``'s submitted reviews, oldest first.
+
+    PENDING reviews are excluded, as ``head_review()`` excludes them: a draft
+    GraphQL happens to expose is not a review of the head. Counting one would
+    report the head as covered — sending the loop to ``overview_unparseable``
+    on an empty draft body, or clearing the clean gate on a zero-finding draft
+    that was never submitted.
+    """
+    return sorted(
+        (
+            review for review in filter_reviews(pull_request, author)
+            if review.get("state") not in ("PENDING", "DISMISSED")
+        ),
+        key=lambda review: review.get("submittedAt") or "",
+    )
+
+
+def copilot_overview_severities(
+    pull_request: dict[str, Any], author: str
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """discussion_id → {severity, review_url, commit} across ``author``'s overviews, newest wins.
+
+    Every overview is read, not only the newest: an open thread from cycle 1
+    that cycle 2's overview no longer lists would otherwise lose its grade.
+    Thread identity is the discussion id, which is stable across heads, so the
+    provenance (which review, which commit) travels with the grade. Findings an
+    overview lists without a discussion link have no thread to annotate; they
+    are reported as warnings so nothing is silently dropped.
+    """
+    severities: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for review in _reviews_oldest_first(pull_request, author):
+        parsed = parse_copilot_overview(review.get("body"))
+        if parsed is None:
+            continue
+        for finding in parsed["findings"]:
+            severities[finding["discussion_id"]] = {
+                "severity": finding["severity"],
+                "review_url": review.get("url"),
+                "commit": (review.get("commit") or {}).get("oid"),
+            }
+        if parsed["unlinked_findings"]:
+            warnings.append(
+                f"{parsed['unlinked_findings']} finding(s) in the {author} review "
+                f"overview at {review.get('url')} have no inline thread and are not "
+                "listed below."
+            )
+    return severities, warnings
+
+
+def annotate_reviewer_severity(
+    threads: list[dict[str, Any]], severities: dict[str, dict[str, Any]]
+) -> None:
+    """Attach overview severities (and their provenance) to threads by discussion anchor.
+
+    Additive only: a thread the overview does not grade is left exactly as it
+    was, so a parsing failure can never drop or demote a thread.
+    """
+    if not severities:
+        return
+    for thread in threads:
+        for comment in _iter_comments(thread):
+            match = DISCUSSION_ANCHOR_RE.search(comment.get("url") or "")
+            if match and match.group(1) in severities:
+                graded = severities[match.group(1)]
+                thread["reviewerSeverity"] = graded["severity"]
+                thread["reviewerSeveritySource"] = {
+                    "review_url": graded["review_url"],
+                    "commit": graded["commit"],
+                }
+                break
+
+
+def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head: str) -> dict[str, Any]:
+    commit = (review.get("commit") or {}).get("oid")
+    return {
+        "assessment": parsed["assessment"] if parsed else "",
+        "approving": parsed["approving"] if parsed else False,
+        "open_findings": parsed["open_findings"] if parsed else None,
+        "complete": bool(parsed and parsed["complete"]),
+        "covers_head": bool(commit) and commit == head,
+        "commit": commit,
+        "submitted_at": review.get("submittedAt"),
+        "url": review.get("url"),
+        "finding_ids": [f["discussion_id"] for f in parsed["findings"]] if parsed else [],
+        "unlinked_findings": parsed["unlinked_findings"] if parsed else 0,
+    }
+
+
+def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The reviewer overview, for a review-request vendor (Copilot) only.
+
+    Only Copilot writes an overview; for comment reviewers (Codex, Gemini)
+    a head review would otherwise come back as a fabricated, unparseable one.
+    """
+    if reviewer_resolver.trigger_kind_for(author) != "review_request":
+        return None
+    return latest_reviewer_overview(pull_request, author)
+
+
+def latest_reviewer_overview(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    """The overview that describes the PR head, or the newest one, or None.
+
+    The newest ``author`` review *of the head commit* wins even when its body
+    is not a readable overview: it still proves the head was reviewed
+    (``covers_head: true``, ``complete: false``), which is "unparseable", not
+    "no review for head" — the waiter is already satisfied, so telling the
+    loop to wait would be a dead end. With no head review, the newest
+    readable overview is reported with ``covers_head: false``.
+    """
+    head = pull_request.get("headRefOid") or ""
+    waiting = newest_unanswered_request_at(pull_request, author)
+    listed = vendor_request_listed(pull_request, author)
+    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
+
+    def current(review: dict[str, Any]) -> bool:
+        # Of the head, and not superseded by a later, still unanswered request
+        # on that head, whether that request shows on the timeline yet or is
+        # only listed. Same pairing as head_review() and the request side.
+        return bool(head) and not listed and (review.get("commit") or {}).get("oid") == head and not (
+            waiting and (review.get("submittedAt") or "") <= waiting
+        )
+
+    for review in newest_first:
+        if current(review):
+            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+    for review in newest_first:
+        parsed = parse_copilot_overview(review.get("body"))
+        if parsed is not None:
+            record = _overview_record(review, parsed, head)
+            if record["covers_head"] and not current(review):
+                record["covers_head"] = False
+            return record
+    return None
+
+
+def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
+    """Discussion ids of every review thread on the PR, in any state."""
+    ids: set[str] = set()
+    for thread in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+        if not isinstance(thread, dict):
+            continue
+        for comment in _iter_comments(thread):
+            match = DISCUSSION_ANCHOR_RE.search(comment.get("url") or "")
+            if match:
+                ids.add(match.group(1))
+    return ids
+
+
+def clean_blocked_by(
+    threads: list[dict[str, Any]],
+    overview: dict[str, Any] | None,
+    *,
+    review_request_vendor: bool,
+    known_thread_ids: set[str] | None = None,
+) -> str | None:
+    """Why zero actionable threads is *not yet* clean for a review-request vendor.
+
+    Threads always win: with any actionable thread the gate does not apply,
+    and the overview is never a reason to drop one. With none, a Copilot PR
+    is clean when a complete overview on the current head reports zero open
+    findings, or when every finding it does report has a thread on the PR
+    (``known_thread_ids``, any state): the overview is a snapshot taken at
+    review time, thread state is live, and the normal classification already
+    decided those threads (spec §5.3). A reported finding the fetch never saw
+    — no thread link, or a link to a thread that is not on the PR — still
+    blocks. Comment vendors have no overview gate.
+    """
+    if threads or not review_request_vendor:
+        return None
+    if overview is None or not overview.get("covers_head"):
+        return "no_review_for_head"
+    if not overview.get("complete") or overview.get("open_findings") is None:
+        return "overview_unparseable"
+    open_findings = overview.get("open_findings") or 0
+    if open_findings > 0:
+        if known_thread_ids is None or overview.get("unlinked_findings"):
+            return "overview_reports_open_findings"
+        linked = overview.get("finding_ids") or []
+        # `open_findings` is the authoritative count; `finding_ids` is only what
+        # the parser could recognize. Fewer links than findings means one is
+        # unaccounted for — a markup change that drops a severity icon must not
+        # read as clean just because the links that did parse are known.
+        if len(linked) < open_findings:
+            return "overview_reports_open_findings"
+        if any(fid not in known_thread_ids for fid in linked):
+            return "overview_reports_open_findings"
+    return None
+
+
+def rereview_limit_reached(
+    pull_request: dict[str, Any],
+    author: str | None,
+    used: int,
+    limit: int,
+    *,
+    provenance_known: bool = True,
+) -> bool:
+    """Has the loop used its re-review cap?
+
+    For a review-request vendor (Copilot) with no completed review yet, the
+    next request is the free cycle 0, which request_rereview.py allows even
+    at a cap of 0, so the limit cannot be reached before that first review.
+    Without local provenance (``provenance_known=False``) ``used`` is the
+    actor fallback: every request under the member's login, manual clicks
+    included, an upper bound that proves nothing; the request side reports
+    that count as unknown rather than capped, and so does this. A
+    page-limited count is a lower bound and still proves the cap.
+    """
+    vendor = review_vendors.vendor_for(author) if author else None
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        first = reviewer_resolver.first_completed_review_at(
+            (pull_request.get("reviews") or {}).get("nodes") or [], vendor
+        )
+        if not first or not provenance_known:
+            return False
+    return used >= limit
+
+
 def rereview_requests(
     pull_request: dict[str, Any],
     agent_login: str | None = None,
     *,
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
+    reviewer_login: str | None = None,
+    loop_request_times: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Count comments that ping the configured reviewer for a re-review.
+    """The re-review requests the loop cap counts.
 
-    When agent_login is provided, only comments authored by that login count.
-    This prevents arbitrary humans pinging Gemini from consuming the loop cap.
+    Comment vendors (Gemini, Codex): comments that mention the reviewer with
+    the word "review". Review-request vendors (Copilot): ReviewRequestedEvents
+    for that vendor made after its first completed review — the shared rule in
+    ``reviewer_resolver.counted_review_requests``, so this count can never
+    disagree with request_rereview.py's. When agent_login is provided, only
+    the agent's own requests count, so arbitrary humans cannot consume the cap.
     """
+    vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        return reviewer_resolver.counted_review_requests(
+            (pull_request.get("timelineItems") or {}).get("nodes") or [],
+            agent_login=agent_login,
+            vendor=vendor,
+            first_completed_review_at=reviewer_resolver.first_completed_review_at(
+                (pull_request.get("reviews") or {}).get("nodes") or [], vendor
+            ),
+            # The same local provenance request_rereview.py enforces the cap
+            # with, so the displayed count and the enforced count agree. A
+            # request the member clicked themselves is not the loop's.
+            loop_request_times=loop_request_times,
+        )
     if not review_trigger_mention:
         return []
     out = []
@@ -1154,6 +1773,25 @@ def _state_key(pr: PullRequest) -> str:
     return f"{pr.owner}/{pr.repo}#{pr.number}"
 
 
+def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str] | None:
+    """Timestamps this loop recorded for its own review requests on ``pr``.
+
+    None means "no usable record": the reviewer is not a review-request vendor
+    (the comment path counts mentions, not events), the PR has no local
+    history, or a state write failed after a POST and marked the history
+    incomplete. The caller then keeps the actor filter — an over-count, which
+    is the safe direction — and reports the count as incomplete.
+    """
+    vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return None
+    return reviewer_resolver.loop_request_times_from_entry(
+        load_sticky_state().get(_state_key(pr), {}),
+        vendor,
+        loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number),
+    )
+
+
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
     entry = load_sticky_state().get(_state_key(pr), {})
     reviewer = entry.get("reviewer") if isinstance(entry, dict) else None
@@ -1231,17 +1869,29 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
     Vendor facts are re-derived from the login rather than trusted from the
     record, so selections persisted before a vendor was known (Codex records
     written with ``review_trigger: null``) heal instead of permanently
-    disabling re-review requests for that PR.
+    disabling re-review requests for that PR. The login itself is canonicalized
+    for the same reason: a record holding an alias (``@copilot``) would request
+    the right reviewer and then never match its review, because review and
+    thread filtering compare authors exactly against this value.
     """
-    login = record["login"]
+    login = reviewer_resolver.canonical_login(record["login"])
     known_display_name = reviewer_resolver.display_name_for(login)
     display_name = record.get("display_name") or known_display_name
-    if reviewer_resolver.trigger_for(login):
+    if review_vendors.vendor_for(login):
         display_name = known_display_name
+    trigger_kind = reviewer_resolver.trigger_kind_for(login)
+    # A record saved before the vendor was known may carry a mention for a
+    # vendor that is re-reviewed by request; a comment never triggers it, so
+    # the mention is dropped rather than advertised.
+    review_trigger = None
+    if trigger_kind == "comment":
+        review_trigger = record.get("review_trigger") or reviewer_resolver.trigger_for(login)
     return {
         "login": login,
         "display_name": display_name,
-        "review_trigger": record.get("review_trigger") or reviewer_resolver.trigger_for(login),
+        "review_trigger": review_trigger,
+        "trigger_kind": trigger_kind,
+        "request_login": reviewer_resolver.request_login_for(login),
         "auto_reviews": reviewer_resolver.auto_reviews(login),
         "source": source,
         "confirmation_required": source in {"default_unconfirmed", "none_configured"},
@@ -1346,18 +1996,25 @@ def update_run_tracking(
     # review). Summary staleness is deliberately NOT part of this test: a
     # recovery fetch advances update_seq past last_summary_seq, which would
     # then block the legitimate bump for the rest of the run.
-    # Transition evidence is LOCAL: `request_rereview.py` bumps
-    # `rereviews_posted` exactly once per request it actually posts. Deriving
-    # it from the PR's comments failed three different ways (#111 review) —
-    # `comments(last:100)` makes the count non-monotonic on busy PRs, the
-    # all-user fallback count leaks other people's pings when the agent login
-    # cannot be resolved, and PR history outlives `clear_run_tracking()`.
+    # Transition evidence is LOCAL: `request_rereview.py` appends one cycle
+    # stamp per request it actually posts. Deriving it from the PR's comments
+    # failed three different ways (#111 review) — `comments(last:100)` makes
+    # the count non-monotonic on busy PRs, the all-user fallback count leaks
+    # other people's pings when the agent login cannot be resolved, and PR
+    # history outlives `clear_run_tracking()`. The stamps live in an
+    # append-only log beside the provenance log, not in this file: a fetch
+    # or hook that loaded state.json before the POST and saved afterwards
+    # erased an in-file counter, and the baseline below then never saw the
+    # transition (PR #116 review). The in-file `rereviews_posted` counter is
+    # still read for runs that were mid-cycle before the stamps moved.
     #
     # The summary is CONSUMED when it advances a cycle. `last_summary_seq > 0`
     # was a permanently-true flag once any summary had been emitted, so a
     # second re-review arriving before the new cycle wrote its own summary
     # advanced the ordinal twice off one stale summary (#111 review).
-    posted = _safe_int(run.get("rereviews_posted", 0))
+    posted = _safe_int(run.get("rereviews_posted", 0)) + loop_state.count_cycle_stamps(
+        f"{pr.owner}/{pr.repo}", pr.number
+    )
     posted_baseline = _safe_int(run.get("rereviews_posted_at_cycle_start", 0))
     summary_seq = _safe_int(run.get("last_summary_seq", 0))
     summary_consumed = _safe_int(run.get("summary_consumed_seq", 0))
@@ -1618,7 +2275,7 @@ def run_wait_chunk(
         if refusal is not None:
             clear_wait_state(pr)
             return {"status": "refused", "author": author, "pull_request": None, **refusal}
-        fingerprint = review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+        fingerprint = wait_activity_fingerprint(pull_request, author, after_iso)
         now_dt = _dt.datetime.now(_dt.timezone.utc)
         elapsed = wait_elapsed_seconds(wait, after_iso, now=now_dt)
 
@@ -2502,6 +3159,105 @@ def review_activity_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def newest_unanswered_request_at(pull_request: dict[str, Any], author: str) -> str:
+    """GitHub's time of the newest review request for ``author``'s vendor that
+    no submitted review has answered, or "".
+
+    Only review-request vendors have one. A head review submitted at or
+    before it is history: a re-request on an unchanged head asked for a new
+    review. Requests are paired with submitted reviews exactly as the request
+    side's state machine pairs them (``reviewer_resolver.unanswered_request_times``):
+    two requests in one second with one review leave one request waiting,
+    which the newest-request timestamp alone cannot show (PR #116 review).
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return ""
+    requested: list[str] = []
+    removed: list[str] = []
+    for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
+        event = reviewer_resolver.normalize_request_event(node)
+        if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
+            requested.append(event["created_at"])
+            continue
+        removal = reviewer_resolver.normalize_request_removed_event(node)
+        if removal and review_vendors.vendor_for(removal["reviewer_login"]) is vendor:
+            removed.append(removal["created_at"])
+    # Only a standing review answers a request: a draft is not a review yet
+    # and a dismissed one was withdrawn, as head_review() treats them. Letting
+    # a dismissed review pair would leave no request waiting and the older
+    # review of the same head would be taken for current (PR #116 review).
+    submitted = [
+        review.get("submittedAt") or ""
+        for review in filter_reviews(pull_request, author)
+        if review.get("state") not in ("PENDING", "DISMISSED")
+    ]
+    unanswered = reviewer_resolver.unanswered_request_times(requested, submitted, removed)
+    return unanswered[-1] if unanswered else ""
+
+
+def vendor_request_listed(pull_request: dict[str, Any], author: str) -> bool:
+    """Is ``author``'s review-request vendor currently a requested reviewer?
+
+    GitHub drops a reviewer from this list when it submits, so a listed
+    request has not been answered by any existing review, even when its
+    timeline event has not surfaced yet.
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return False
+    return any(
+        isinstance(node, dict)
+        and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
+        for node in (pull_request.get("reviewRequests") or {}).get("nodes") or []
+    )
+
+
+def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
+
+    For a review-request vendor no request newer than it may be waiting: a
+    re-request on an unchanged head makes the earlier head review history,
+    or the waiter and the clean gate would take the old review for the new
+    one. Requests are paired with reviews first, so a same-second answer
+    counts and a same-second second request does not (PR #116 review).
+    """
+    head = pull_request.get("headRefOid") or ""
+    if not head or vendor_request_listed(pull_request, author):
+        return None
+    waiting = newest_unanswered_request_at(pull_request, author)
+    for review in filter_reviews(pull_request, author):
+        # A draft is not a review yet; a dismissed one was withdrawn.
+        if review.get("state") in ("PENDING", "DISMISSED"):
+            continue
+        if ((review.get("commit") or {}).get("oid") or "") != head:
+            continue
+        if waiting and (review.get("submittedAt") or "") <= waiting:
+            continue
+        return review
+    return None
+
+
+def wait_activity_fingerprint(
+    pull_request: dict[str, Any], author: str, after_iso: str | None
+) -> str | None:
+    """What the waiters poll on.
+
+    Comment vendors keep the timestamp-anchored activity fingerprint. A
+    review_request vendor (Copilot) is anchored on the head commit instead:
+    nothing counts until a submitted review carries ``commit.oid ==
+    headRefOid``. A review of the previous head never ends the wait, and a
+    review submitted in the same second as the request does (spec §5.2).
+    ``after_iso`` then only selects settle mode (cycle 1 fast path vs. the
+    cycle-2+ quiet period) in the callers; it is never a filter here.
+    """
+    if reviewer_resolver.trigger_kind_for(author) == "review_request":
+        if head_review(pull_request, author) is None:
+            return None
+        return review_activity_fingerprint(pull_request, author, after_iso=None)
+    return review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+
+
 def wait_for_stable_review(
     pr: PullRequest,
     author: str,
@@ -2544,7 +3300,7 @@ def wait_for_stable_review(
         refusal = reviewer_refusal(pull_request, author, after_iso=after_iso)
         if refusal is not None:
             raise ReviewerRefused(refusal)
-        fingerprint = review_activity_fingerprint(pull_request, author, after_iso=after_iso)
+        fingerprint = wait_activity_fingerprint(pull_request, author, after_iso)
         now = time.monotonic()
 
         if fingerprint is None:
@@ -2552,8 +3308,13 @@ def wait_for_stable_review(
                 last_heartbeat is None
                 or now - last_heartbeat >= WAIT_HEARTBEAT_INTERVAL_SECONDS
             ):
+                if reviewer_resolver.trigger_kind_for(author) == "review_request":
+                    head7 = (pull_request.get("headRefOid") or "")[:7]
+                    waiting_for = f"Waiting for {author} review of {head7}..."
+                else:
+                    waiting_for = f"Waiting for {author} review activity..."
                 print(
-                    f"Waiting for {author} review activity... "
+                    f"{waiting_for} "
                     f"({int(now - start)}s elapsed, timeout {timeout_seconds}s)",
                     file=sys.stderr,
                 )
@@ -2805,9 +3566,20 @@ def render_markdown(
     judge_results: dict[str, dict[str, Any]] | None = None,
     baseline: dict[str, str] | None = None,
     full: bool = False,
+    loop_requests: list[str] | None = None,
+    agent_login: str | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
-    rereviews = rereview_requests(pr, review_trigger_mention=review_trigger_mention)
+    # `loop_requests` is the local provenance record, supplied by the caller
+    # that knows which PR this is; without it the count keeps the actor
+    # filter, so it needs the same agent login the enforced count uses.
+    rereviews = rereview_requests(
+        pr,
+        agent_login,
+        review_trigger_mention=review_trigger_mention,
+        reviewer_login=author,
+        loop_request_times=loop_requests,
+    )
     outdated = outdated_unresolved_threads(pr, author)
     deferred = addressed_by_reply_threads(pr, author)
     lines = [
@@ -3412,8 +4184,15 @@ def main() -> int:
                     print(f"warning: {warning}", file=sys.stderr)
                 if candidates:
                     for candidate in candidates:
-                        trigger = candidate.review_trigger or "(no safe trigger known)"
-                        print(f"- {candidate.display_name} `{candidate.login}` trigger={trigger}")
+                        if candidate.trigger_kind == "review_request":
+                            trigger = "review request (GitHub API)"
+                        else:
+                            trigger = candidate.review_trigger or "(no safe trigger known)"
+                        note = (
+                            " (requested, not yet reviewed)"
+                            if candidate.source == "requested" else ""
+                        )
+                        print(f"- {candidate.display_name} `{candidate.login}` trigger={trigger}{note}")
                 elif partial:
                     print("[loop] Reviewer discovery incomplete; retry or select a reviewer manually.")
                 else:
@@ -3544,12 +4323,21 @@ def main() -> int:
                     "falling back to counting all re-review pings.",
                     file=sys.stderr,
                 )
+        recorded_request_times = loop_request_times(pr, args.author)
         rereviews = rereview_requests(
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
+            reviewer_login=args.author,
+            loop_request_times=recorded_request_times,
         )
-        _limit_reached = len(rereviews) >= args.max_rereview_requests
+        # One decision for the stderr warning, the JSON flag and the
+        # `capped` outcome: cycle 0 is free and an actor-fallback count is
+        # not proof (PR #116 review).
+        _limit_reached = rereview_limit_reached(
+            pull_request, args.author, len(rereviews), args.max_rereview_requests,
+            provenance_known=recorded_request_times is not None,
+        )
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
                 pull_request, args.author, dry_run=args.dry_run
@@ -3582,6 +4370,21 @@ def main() -> int:
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
         threads.extend(review_body_findings(pull_request, args.author))
+        # Copilot grades findings in its overview, not inline; annotate before
+        # sorting so severity ordering and filters see the grade. Additive:
+        # an unparseable overview leaves every thread listed as `unknown`.
+        overview_severities, overview_warnings = copilot_overview_severities(
+            pull_request, args.author
+        )
+        annotate_reviewer_severity(threads, overview_severities)
+        reviewer_overview = reviewer_overview_for(pull_request, args.author)
+        if reviewer_overview is not None:
+            reviewer_overview["warnings"] = overview_warnings
+        for warning in overview_warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        review_request_vendor = (
+            reviewer_resolver.trigger_kind_for(args.author) == "review_request"
+        )
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:
@@ -3605,7 +4408,13 @@ def main() -> int:
                 else:
                     msg = f"--drop-unknown-severity: dropped {dropped} unknown-severity thread(s)."
                 print(msg, file=sys.stderr)
-        page_warnings = pagination_warnings(pull_request)
+        # Comment vendors keep the original one-argument call (their count
+        # never depends on the timeline page).
+        page_warnings = (
+            pagination_warnings(pull_request, review_request_vendor=True)
+            if review_request_vendor
+            else pagination_warnings(pull_request)
+        )
         for warning in page_warnings:
             print(f"warning: {warning}", file=sys.stderr)
 
@@ -3733,8 +4542,10 @@ def main() -> int:
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
+            reviewer_login=args.author,
+            loop_request_times=recorded_request_times,
         )
-        if len(rereviews) >= args.max_rereview_requests:
+        if _limit_reached:
             print(
                 f"warning: {len(rereviews)} reviewer re-review request(s) already exist; "
                 f"the configured loop cap is {args.max_rereview_requests}.",
@@ -3771,7 +4582,7 @@ def main() -> int:
                 accumulated_results = {}
             merged_judge_results = merge_judge_results(accumulated_results, judge_results)
             judge_ran = bool(run.get("judge_ran")) or bool(judge_status.get("ran"))
-            cap_reached = len(rereviews) >= args.max_rereview_requests
+            cap_reached = _limit_reached
             fixed_markers = read_fixed_markers(pr)
             changed_paths = changed_files_in_range(args.changed_base, args.changed_head)
             remaining_states = classify_remaining_finding_states(
@@ -3790,6 +4601,10 @@ def main() -> int:
                 cap_reached,
                 gemini_confirmed=args.gemini_confirmed,
                 likely_fixed_remaining=likely_fixed_remaining,
+                clean_blocked=clean_blocked_by(
+                    threads, reviewer_overview, review_request_vendor=review_request_vendor,
+                    known_thread_ids=discussion_ids_on_pr(pull_request),
+                ),
             )
             derived = derive_record_fields(
                 baseline_ids=baseline_ids,
@@ -4100,7 +4915,19 @@ def main() -> int:
                         "advisory": clustering_advisory,
                     },
                     "reviewerSelection": reviewer_selection,
+                    # The selected vendor's newest review overview (Copilot),
+                    # with whether it covers the current head. Corroboration
+                    # for a clean PR, never a reason to drop a thread.
+                    "reviewerOverview": reviewer_overview,
                     "loopStatus": {
+                        # Set only for review-request vendors with zero
+                        # actionable threads whose overview cannot confirm
+                        # clean (spec §5.3); null means no block from here.
+                        "cleanBlockedBy": clean_blocked_by(
+                            threads, reviewer_overview,
+                            review_request_vendor=review_request_vendor,
+                            known_thread_ids=discussion_ids_on_pr(pull_request),
+                        ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
                         "sessionCycle": _safe_int(
@@ -4108,7 +4935,20 @@ def main() -> int:
                         ) or None,
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
-                        "limitReached": len(rereviews) >= args.max_rereview_requests,
+                        "limitReached": _limit_reached,
+                        # False when a page the count rests on was full, or
+                        # when the loop has no local record of its own
+                        # requests: the count above is then a bound, not a
+                        # count (review-request vendors).
+                        "reReviewCountComplete": review_request_count_complete(
+                            pull_request,
+                            review_request_vendor=review_request_vendor,
+                            loop_request_times=loop_request_times(pr, args.author),
+                            counted_requests=len(rereviews),
+                            provenance_incomplete=loop_state.cap_count_uncertain(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
+                        ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
                         "addressedByReplyThreads": len(addressed_by_reply_threads(pull_request, args.author)),
@@ -4156,9 +4996,41 @@ def main() -> int:
                 judge_results=judge_results,
                 baseline=render_baseline,
                 full=args.full,
+                loop_requests=loop_request_times(pr, args.author),
+                agent_login=agent_login,
             ),
             end="",
         )
+        if reviewer_overview is not None:
+            count = reviewer_overview["open_findings"]
+            if count is None:
+                count_text, coverage = "? open findings", "unparsed"
+            else:
+                count_text = f"{count} open finding{'' if count == 1 else 's'}"
+                coverage = (
+                    "covers head" if reviewer_overview["covers_head"]
+                    else f"stale: {(reviewer_overview['commit'] or '')[:7]}"
+                )
+            print(
+                color_loop_block(
+                    f"[loop] reviewer overview: "
+                    f"{reviewer_overview['assessment'] or '(no assessment)'} — "
+                    f"{count_text} ({coverage})",
+                    enabled=color_enabled,
+                )
+            )
+        blocked = clean_blocked_by(
+            threads, reviewer_overview, review_request_vendor=review_request_vendor,
+            known_thread_ids=discussion_ids_on_pr(pull_request),
+        )
+        if blocked:
+            print(
+                color_loop_block(
+                    f"[loop] not clean: {blocked} — "
+                    + CLEAN_BLOCKED_HINTS[blocked].format(reviewer=args.reviewer_name),
+                    enabled=color_enabled,
+                )
+            )
         # The clustering warning is an ordering guard, so show it on the
         # initial fetch while the agent is deciding what to fix. Summary-mode
         # output repeats it later as an audit trail.

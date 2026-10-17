@@ -46,7 +46,7 @@ Checkable claims, with the honest scope of each:
 | Pattern clustering + sibling sweep | Findings cluster by signature and by the shape of the code they anchor to, so one defect described two ways still counts as one pattern. Two-site token sweeps report lines matching the shared tokens; one-site ranged sweeps report duplicate blocks as `mirror` candidates — text-identical by default in every language, comment-insensitive only for Python via stdlib `tokenize`, never across language families. Refuses generic shapes and never reads outside the changed files | `cluster_findings.py`, `sweep_siblings.py` |
 | Verification gate | Auto-detects Python / Node / Rust / Go. Required-check failure flips the run to `verification: failed`. **`Skip` is an offered menu option** — pick it and there is no gate | `detect_profile.py`, `run_profile.py` |
 | Cycle cap | Hard count, agent-scoped: only the agent's own pings consume it. Enforced at the write — `request_rereview.py` counts prior pings and refuses past the cap, rather than trusting the agent to stop | `request_rereview.py` |
-| Severity ordering | Parses Codex `![P0]`–`![P3]` badges, `![critical]`–`![low]` image alt text, and reviewer-leading plain-text `[P0]`–`[P3]` prefixes. Unrecognized markers yield `unknown`, kept by default | `thread_severity()`, `cluster_findings._severity()` |
+| Severity ordering | Parses Codex `![P0]`–`![P3]` badges, `![critical]`–`![low]` image alt text, reviewer-leading plain-text `[P0]`–`[P3]` prefixes, and Copilot's per-review overview (`High severity` … alt text). Unrecognized markers yield `unknown`, kept by default | `thread_severity()`, `cluster_findings._severity()` |
 | Optional judge | Second-model triage per finding (`false_positive`, `needs_human`, …). Off by default, needs an OpenAI key | `judge.py` |
 | Audit trail + local stats | One live-edited PR comment, per-run receipts, per-repo aggregates via `--stats`. Never transmitted | `metrics.py` |
 | Zero infrastructure | Stdlib Python + `gh` + `git`. No SDK, no server, no account | all scripts |
@@ -62,7 +62,8 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 - **Claude Code or Codex** with plugin support.
 - **`gh` CLI**, authenticated against the repos you'll run this on.
 - **Python 3.10+** and **git**.
-- **A reviewer bot that posts GitHub review threads on your PRs.** Codex and Gemini Code Assist ship with full vendor knowledge. CodeRabbit, Copilot, Qodo, Sourcery and others work once you give the loop their author login and re-review mention. There is no assumed default: on a PR with no reviewer configured the loop asks instead of guessing.
+- **A reviewer bot that posts GitHub review threads on your PRs.** Codex, Gemini Code Assist and GitHub Copilot code review ship with full vendor knowledge. CodeRabbit, Qodo, Sourcery and others work once you give the loop their author login and re-review mention. There is no assumed default: on a PR with no reviewer configured the loop asks instead of guessing.
+- **For Copilot:** a Copilot subscription with code review enabled on the repo, and a `gh` token allowed to request reviewers on the PR (write access). Copilot reviews only when asked, so the loop sends the review request for you. Without that plan GitHub accepts the request and silently adds nobody; the loop detects that and stops with `review_request_rejected` / `not_enabled` instead of waiting.
 
 > **Note on Gemini Code Assist.** Gemini is a first-class reviewer here and works exactly as it always did, automatic first review included, on the enterprise GitHub app. Google [deprecated the consumer app 2026-06-18 and shut it down 2026-07-17](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review), so it can no longer be installed on the free tier. Nothing about its support here changed. Select it with `--reviewer gemini-code-assist`.
 
@@ -72,11 +73,12 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 |---|---|---|---|
 | Codex (`chatgpt-codex-connector`) | Built-in, full support. Offered first on an unconfigured PR because it reviews on request, so accepting starts a cycle immediately | `@codex review` | `P0`–`P3`, normalized |
 | Gemini Code Assist | Built-in, full support. Needs the **enterprise** GitHub app ([consumer app shut down](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review)) | `@gemini-code-assist please review…` | `critical` / `high` / `medium` / `low` |
-| CodeRabbit, Copilot, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
+| GitHub Copilot (`copilot-pull-request-reviewer`) | Built-in, full support. Reviews only on request; the loop asks via the GitHub reviewer-request API, never a comment, and refuses to re-ask while a request is still pending or the current head is already reviewed | Review request (`gh api … /requested_reviewers`) | `High` / `Medium` / `Low` from the review overview, per head commit |
+| CodeRabbit, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
 
 `--list-reviewers` discovers which bots have commented on your PR; `--reviewer` persists your choice per PR.
 
-**Severity caveat, stated plainly:** three marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, and reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers). Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
+**Severity caveat, stated plainly:** four marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers), and Copilot's review-overview list (`alt="High severity"` next to a link to each finding). Copilot grades live in the overview, not the inline comment, so a finding is graded only by an overview that links to it; if the overview is missing or unparseable the finding stays `unknown` and is kept. Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
 
 ## Why this exists
 
