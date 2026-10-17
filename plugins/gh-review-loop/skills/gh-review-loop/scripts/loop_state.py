@@ -180,6 +180,27 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
     return _append_jsonl(request_log_path(repo, pr), record)
 
 
+def append_request_log_batch(repo: str, pr: int, records: list[dict[str, Any]]) -> bool:
+    """Append several records in one write; True once they are on disk.
+
+    One ``write`` of one buffer, so a crash leaves either nothing, the whole
+    batch, or a torn last line that ``read_request_log`` already reports as
+    incomplete: never a clean-looking prefix that a later reader would trust
+    (PR #120 review).
+    """
+    path = request_log_path(repo, pr)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def cycle_stamp_log_path(repo: str, pr: int) -> Path:
     return pr_scoped_path(repo, pr, "provenance", ".stamps.jsonl")
 

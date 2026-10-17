@@ -4454,10 +4454,12 @@ class TestHeadAnchoredWait:
         second machine); `reReviewCountComplete` still flags it as a bound.
         A page-limited count is a lower bound and still proves the cap."""
         reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
-        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=False) is True
-        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 2, 3, provenance_known=False) is False
-        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=True) is True
-        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, provenance_known=False) is True
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, attributable=True) is True
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 2, 3, attributable=True) is False
+        # No record and no login: the count is every actor's requests and
+        # proves nothing about this agent, so it never reaches the cap.
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, attributable=False) is False
+        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, attributable=False) is True
 
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
