@@ -3183,10 +3183,14 @@ def newest_unanswered_request_at(pull_request: dict[str, Any], author: str) -> s
         removal = reviewer_resolver.normalize_request_removed_event(node)
         if removal and review_vendors.vendor_for(removal["reviewer_login"]) is vendor:
             removed.append(removal["created_at"])
+    # Only a standing review answers a request: a draft is not a review yet
+    # and a dismissed one was withdrawn, as head_review() treats them. Letting
+    # a dismissed review pair would leave no request waiting and the older
+    # review of the same head would be taken for current (PR #116 review).
     submitted = [
         review.get("submittedAt") or ""
         for review in filter_reviews(pull_request, author)
-        if review.get("state") != "PENDING"
+        if review.get("state") not in ("PENDING", "DISMISSED")
     ]
     unanswered = reviewer_resolver.unanswered_request_times(requested, submitted, removed)
     return unanswered[-1] if unanswered else ""

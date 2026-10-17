@@ -4500,6 +4500,19 @@ class TestHeadAnchoredWait:
         assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
         assert _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is True
 
+    def test_a_dismissed_review_does_not_answer_the_request_it_followed(self):
+        """Valid review R0 on the head, a re-request, then R1 on the same
+        head dismissed by a maintainer. R1 must not count as the answer, or
+        the older review (and its overview) stands in for the dismissed one
+        (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:00:00Z", "d7efa49"),
+                      ("DISMISSED", "2026-10-07T16:40:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
     def test_the_fetch_query_reads_request_removals(self):
         assert "REVIEW_REQUEST_REMOVED_EVENT" in _fgt.QUERY
         assert "ReviewRequestRemovedEvent" in _fgt.QUERY

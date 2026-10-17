@@ -867,8 +867,8 @@ def request_state(
         review for review in reviews
         if review_vendors.vendor_for(_review_author(review)) is vendor
     ]
-    # Submitted reviews answered a request (pairing below). A dismissed one
-    # was withdrawn by a maintainer, so it no longer covers the head.
+    # A dismissed review was withdrawn by a maintainer: it neither covers the
+    # head nor answers a request (pairing below).
     completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
     covering = [review for review in completed if review.get("state") != "DISMISSED"]
     completed_head = any(_review_commit(review) == head for review in covering)
@@ -887,7 +887,11 @@ def request_state(
          if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor),
         key=lambda event: event["created_at"],
     )
-    completed_times = sorted(_review_submitted_at(review) or "" for review in completed)
+    # Only a review that still stands answers a request: a dismissed one was
+    # withdrawn by a maintainer, and letting it pair would hand the request
+    # to it and leave an older review of the same head as "current"
+    # (PR #116 review).
+    completed_times = sorted(_review_submitted_at(review) or "" for review in covering)
     # Pair each completed review with the earliest open request before it;
     # what is left unpaired is still waiting. Overlapping requests keep their
     # own ages, and a listed request whose event the timeline does not show

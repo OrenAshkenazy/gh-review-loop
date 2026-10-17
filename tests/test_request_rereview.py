@@ -980,6 +980,24 @@ class TestRequestState:
         assert state["state"] == "COMPLETED_HEAD"
         assert state["pending_since"] is None
 
+    def test_a_dismissed_review_does_not_answer_the_request_it_followed(self):
+        """Mirror of the fetch-side rule: after a re-request on a reviewed
+        head, a dismissed review is not the answer, so the head is not
+        COMPLETED_HEAD on the strength of the older review (PR #116 review)."""
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:00:00Z", "d7efa49000"),
+                         (COPILOT_LOGIN, "DISMISSED", "2026-10-07T16:40:00Z", "d7efa49000")],
+                events=[("agent", "2026-10-07T16:30:00Z")],
+            ),
+            now=_at("2026-10-07T16:45:00Z"),
+        )
+
+        assert state["state"] == "PENDING"
+        assert state["pending_since"] == "2026-10-07T16:30:00Z"
+
     def test_request_state_completed_head(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,
