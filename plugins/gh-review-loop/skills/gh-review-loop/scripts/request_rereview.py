@@ -14,6 +14,7 @@ import argparse
 import contextlib
 import datetime as _dt
 import json
+import hashlib
 import re
 import subprocess
 import sys
@@ -22,19 +23,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no flock
-    fcntl = None  # type: ignore[assignment]
-try:
-    import msvcrt
-except ImportError:  # POSIX
-    msvcrt = None  # type: ignore[assignment]
 
 import judge
 import review_vendors
 import reviewer_resolver
 
+import loop_lock
 import loop_state  # noqa: E402 — sibling module, stdlib-only
 
 
@@ -82,6 +76,7 @@ STATE_QUERY = """
 query($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
+      id
       headRefOid
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
@@ -93,7 +88,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
 
 
 class ReviewRequestRejected(RuntimeError):
-    """The requested-reviewers POST did not succeed.
+    """The review-request mutation did not succeed.
 
     ``reason`` classifies it (spec §6): permission, validation, not_found,
     rate_limited, transient, or uncertain (no HTTP status — the request may
@@ -109,6 +104,8 @@ class ReviewRequestRejected(RuntimeError):
         http_status: int | None = None,
         retryable: bool = False,
         requested_at: str | None = None,
+        outcome_unknown: bool | None = None,
+        allow_timeline_confirmation: bool = True,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
@@ -116,6 +113,8 @@ class ReviewRequestRejected(RuntimeError):
         self.http_status = http_status
         self.retryable = retryable
         self.requested_at = requested_at
+        self.outcome_unknown = (reason == "uncertain" or (http_status is not None and http_status >= 500)) if outcome_unknown is None else outcome_unknown
+        self.allow_timeline_confirmation = allow_timeline_confirmation
 
 
 _HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
@@ -215,7 +214,7 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
     settle = f"{REGISTRATION_SETTLE_SECONDS // 60} minutes"
     if exc.reason == "registration_pending":
         message = (
-            f"GitHub accepted the review request for `{reviewer}` (HTTP 201), but it is "
+            f"GitHub accepted the review request for `{reviewer}` (HTTP {exc.http_status}), but it is "
             "not on the PR yet. It may still appear, so nothing was recorded as posted. "
             f"Do not request again now: re-run this script after {settle}. It reports "
             "review_pending if the request landed, or not_enabled if it never appeared."
@@ -303,7 +302,7 @@ def not_enabled_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRej
 
 
 def rejected_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejected) -> dict[str, Any]:
-    if exc.reason == "uncertain":
+    if exc.outcome_unknown:
         return uncertain_payload(repo, pr, reviewer, exc)
     if exc.reason == "not_enabled":
         return not_enabled_payload(repo, pr, reviewer, exc)
@@ -347,20 +346,7 @@ def load_state() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
-    """The key this PR's state already lives under, whatever its casing.
-
-    GitHub accepts `--repo owner/Repo` for a PR the fetch resolved as
-    `owner/repo`, but the shared state key is built from the raw string. A
-    case-mismatched write lands in a second entry, so the fetch never sees it
-    — the re-review stamp goes missing and the session ordinal sticks (#111
-    review). Prefer the existing entry; fall back to the literal key.
-    """
-    target = f"{repo}#{pr}".casefold()
-    for key in state:
-        if isinstance(key, str) and key.casefold() == target:
-            return key
-    return f"{repo}#{pr}"
+state_key_for = loop_state.state_key_for
 
 
 # How far after the local pre-POST timestamp a timeline event may appear and
@@ -393,6 +379,8 @@ def record_rereview_posted(
     count_cycle: bool = True,
     countable: bool = True,
     request_id: str | None = None,
+    comment_id: int | None = None,
+    initial_review: bool = False,
 ) -> bool:
     """Stamp the cycle transition this re-review request completes.
 
@@ -411,6 +399,11 @@ def record_rereview_posted(
     Fails open: a state write failure must never block the re-review that was
     already posted. The ordinal simply holds instead of drifting.
     """
+    if initial_review:
+        countable = False
+    if request_id and any(item.get("request_id") == request_id for item in (loop_state.read_request_log(repo, pr) or [])):
+        stamp_cycle(repo, pr, request_id, count=count_cycle)
+        return True
     logged = True
     marked = False
     if reviewer:
@@ -423,6 +416,7 @@ def record_rereview_posted(
             # A re-review (cap-countable) or the free first request: known
             # now, so never re-derived later from clock comparisons.
             "countable": countable,
+            **({"comment_id": comment_id} if comment_id is not None else {}),
             # The reservation this request was made under, so settling a
             # leftover reservation after a crash never records it twice.
             **({"request_id": request_id} if request_id else {}),
@@ -438,6 +432,7 @@ def record_rereview_posted(
     return logged or marked
 
 
+@loop_state.state_transaction
 def stamp_cycle(repo: str, pr: int, request_id: str | None, *, count: bool = True) -> None:
     """Advance the run's cycle ordinal for a posted re-review, once per request.
 
@@ -446,7 +441,6 @@ def stamp_cycle(repo: str, pr: int, request_id: str | None, *, count: bool = Tru
     one that landed. ``count=False`` touches the entry without advancing.
     Fails open: the ordinal holds rather than drifting.
     """
-    path = state_path()
     state = load_state()
     key = state_key_for(state, repo, pr)
     entry = state.get(key)
@@ -466,8 +460,7 @@ def stamp_cycle(repo: str, pr: int, request_id: str | None, *, count: bool = Tru
         entry["run"] = run
     state[key] = entry
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        loop_state.save_sticky_state(state)
     except OSError as exc:
         print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
 
@@ -499,7 +492,7 @@ def record_unconfirmed_request(
 ) -> bool:
     """Remember a request whose outcome this run could not confirm; True if saved.
 
-    ``kind`` is ``accepted`` (GitHub answered 201, the read-back did not see
+    ``kind`` is ``accepted`` (GitHub accepted the call, the read-back did not see
     it yet) or ``maybe`` (5xx or no HTTP status: it may or may not have
     landed). ``countable`` says whether it was a re-review. The next run
     settles it instead of posting a possible duplicate.
@@ -700,7 +693,7 @@ def gh_login(runner: Any = None) -> str | None:
         result = runner(
             ["gh", "api", "user", "--jq", ".login"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -732,7 +725,7 @@ def count_agent_pings(
             ["gh", "api", "--paginate",
              f"repos/{owner}/{repo_name}/issues/{pr}/comments"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -742,15 +735,22 @@ def count_agent_pings(
     if comments is None:
         return None
     pattern = _trigger_re(trigger)
-    count = 0
+    matching_comments = []
     for comment in comments:
         if not isinstance(comment, dict):
             continue
         if (comment.get("user") or {}).get("login") != agent_login:
             continue
         if pattern.search(comment.get("body") or ""):
-            count += 1
-    return count
+            matching_comments.append(comment)
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    entry = entry if isinstance(entry, dict) else {}
+    logged = loop_state.read_request_log(repo, pr)
+    if entry.get("review_requests_incomplete") or entry.get("review_request_in_flight") or any(item.get("incomplete") for item in (logged or [])):
+        return None
+    receipts = (entry.get("review_requests") or []) + (logged or [])
+    return len(reviewer_resolver.merge_comment_receipts(matching_comments, trigger, receipts))
 
 
 def _gh_json(cmd: list[str], runner: Any) -> Any:
@@ -758,13 +758,15 @@ def _gh_json(cmd: list[str], runner: Any) -> Any:
     try:
         result = runner(
             cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
     if "--paginate" in cmd:
+        if not (result.stdout or "").strip():
+            return None
         return parse_paginated_json(result.stdout)
     try:
         return json.loads(result.stdout or "null")
@@ -882,6 +884,11 @@ def request_state(
     # was withdrawn by a maintainer, so it no longer covers the head.
     completed = [review for review in vendor_reviews if review.get("state") != "PENDING"]
     covering = [review for review in completed if review.get("state") != "DISMISSED"]
+    bot_ids = {
+        user["node_id"] for review in completed
+        if (user := review.get("user") or {}).get("type") == "Bot"
+        and isinstance(user.get("node_id"), str) and user["node_id"]
+    }
     completed_head = any(_review_commit(review) == head for review in covering)
 
     requests = (pull.get("reviewRequests") or {}).get("nodes") or []
@@ -947,6 +954,7 @@ def request_state(
     else:
         state = "ABSENT"
     return {
+        "rerequest_ids": (pull["id"], next(iter(bot_ids))) if isinstance(pull.get("id"), str) and pull["id"] and len(bot_ids) == 1 else None,
         "state": state,
         "head": head,
         "pending_since": pending_since,
@@ -987,6 +995,10 @@ def count_agent_review_requests(
     itself lives in ``reviewer_resolver.counted_review_requests`` so the fetch
     and this script can never disagree. None when it cannot be established.
     """
+    state = load_state()
+    entry = state.get(state_key_for(state, repo, pr))
+    if isinstance(entry, dict) and (entry.get("review_requests_incomplete") or entry.get("review_request_in_flight")):
+        return None
     if not agent_login:
         return None
     if runner is None:
@@ -1003,9 +1015,11 @@ def count_agent_review_requests(
         loop_request_times=recorded,
         match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
     )
-    if provenance_incomplete(repo, pr):
+    if loop_state.cap_count_uncertain(repo, pr):
         # A posted request could not be logged. Its event may not have reached
         # the timeline yet, so even zero matching events is not zero used.
+        return None
+    if recorded is None and isinstance(entry, dict) and isinstance(entry.get("review_requests"), list):
         return None
     if recorded is None and counted:
         # No local record, yet requests under this login exist after the
@@ -1284,6 +1298,7 @@ def post_rereview(
     phrase: str,
     runner: Any = None,
     dry_run: bool = False,
+    expect_head: str | None = None,
 ) -> dict[str, Any]:
     """Post the top-level PR comment and return the normalized result payload.
 
@@ -1308,6 +1323,13 @@ def post_rereview(
             "posted": False,
         }
 
+    if expect_head is not None:
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except RuntimeError as exc:
+            raise ReviewRequestRejected(str(exc), reason="head_mismatch") from exc
+
+    requested_at = utc_now_iso()
     cmd = [
         "gh",
         "api",
@@ -1318,32 +1340,36 @@ def post_rereview(
         f"body={phrase}",
     ]
     try:
-        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not run gh api: {exc}") from exc
+        raise ReviewRequestRejected(f"could not run gh api: {exc}", requested_at=requested_at) from exc
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"gh api failed{suffix}")
+        reason, http_status, retryable = classify_gh_failure(detail)
+        raise ReviewRequestRejected(detail or "gh api failed", reason=reason, http_status=http_status,
+                                    retryable=retryable, requested_at=requested_at)
 
     try:
         response = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise RuntimeError("gh api returned invalid JSON") from exc
+        raise ReviewRequestRejected("gh api returned invalid JSON", requested_at=requested_at) from exc
     if not isinstance(response, dict):
-        raise RuntimeError("gh api returned non-object JSON")
+        raise ReviewRequestRejected("gh api returned non-object JSON", requested_at=requested_at)
 
     created_at = response.get("created_at")
     if not isinstance(created_at, str) or not created_at:
-        raise RuntimeError("gh api response missing created_at")
+        raise ReviewRequestRejected("gh api response missing created_at", requested_at=requested_at)
 
-    return {
+    payload = {
         "created_at": created_at,
         "repo": repo,
         "pr": pr,
         "phrase": phrase,
     }
+    if type(response.get("id")) is int:
+        payload["comment_id"] = response["id"]
+    return confirm_posted_head(payload, repo, pr, expect_head, runner)
 
 
 def request_review(
@@ -1352,11 +1378,16 @@ def request_review(
     request_login: str,
     runner: Any = None,
     dry_run: bool = False,
+    expect_head: str | None = None,
+    rerequest_ids: tuple[str, str] | None = None,
+    registration_head: str | None = None,
+    request_actor: str | None = None,
+    request_event_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Add ``request_login`` as a requested reviewer and return the result payload.
 
     This is how review_request vendors (Copilot) are asked for another look:
-    the same call for the first request and every re-request. ``created_at``
+    REST for the first request, GraphQL when prior bot IDs are known. ``created_at``
     is local UTC taken just before the POST (the response is the PR object
     and carries no event timestamp); it is narration and the reconciliation
     anchor for an uncertain outcome, never what the waiter keys on.
@@ -1380,6 +1411,11 @@ def request_review(
             "posted": False,
         }
 
+    if expect_head is not None:
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except RuntimeError as exc:
+            raise ReviewRequestRejected(str(exc), reason="head_mismatch", retryable=False) from exc
     requested_at = utc_now_iso()
     cmd = [
         "gh",
@@ -1390,8 +1426,12 @@ def request_review(
         "--raw-field",
         f"reviewers[]={request_login}",
     ]
+    if rerequest_ids:
+        pull_id, bot_id = rerequest_ids
+        query = "mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }"
+        cmd = ["gh", "api", "graphql", "-f", "query=" + query, "-f", "pr=" + pull_id, "-f", "bot=" + bot_id]
     try:
-        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ReviewRequestRejected(
             f"could not run gh api: {exc}", reason="uncertain", requested_at=requested_at
@@ -1406,14 +1446,45 @@ def request_review(
             retryable=retryable,
             requested_at=requested_at,
         )
-    return {
+    registered = False
+    if rerequest_ids:
+        try:
+            data = json.loads(result.stdout)
+            pull = ((data.get("data") or {}).get("rerequestReviews") or {}).get("pullRequest") or {}
+            if data.get("errors") or pull.get("id") != rerequest_ids[0]:
+                raise ValueError("missing mutation result or GraphQL errors")
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ReviewRequestRejected("GraphQL re-request outcome uncertain", reason="uncertain", requested_at=requested_at) from exc
+    else:
+        try:
+            data = json.loads(result.stdout)
+            registered = any(isinstance(reviewer, dict)
+                             and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
+                             for reviewer in data["requested_reviewers"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            registered = False
+    if not registered:
+        for attempt in range(2):
+            if attempt:
+                time.sleep(1)
+            if _registered_review(repo, pr, request_login, registration_head or expect_head, runner, actor=request_actor, request_event_ids=request_event_ids):
+                registered = True
+                break
+    if not registered:
+        transport = "GraphQL re-request" if rerequest_ids else "REST"
+        raise ReviewRequestRejected(f"{transport} accepted the call but selected reviewer registration is unconfirmed",
+                                    reason="registration_pending", http_status=200 if rerequest_ids else 201,
+                                    requested_at=requested_at, outcome_unknown=True, allow_timeline_confirmation=False)
+    payload = {
         "created_at": requested_at,
         "repo": repo,
         "pr": pr,
         "kind": "review_request",
         "reviewer": request_login,
         "posted": True,
+        "registered": True,
     }
+    return confirm_posted_head(payload, repo, pr, expect_head or registration_head, runner)
 
 
 def cancel_review_request(
@@ -1421,6 +1492,7 @@ def cancel_review_request(
     pr: int,
     request_login: str,
     runner: Any = None,
+    expect_head: str | None = None,
 ) -> bool:
     """Withdraw an open review request for ``request_login``; True on success.
 
@@ -1435,6 +1507,11 @@ def cancel_review_request(
     owner, repo_name = parse_repo(repo)
     if not request_login:
         return False
+    if expect_head is not None:
+        try:
+            ensure_expected_head(repo, pr, expect_head, runner)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return False
     cmd = [
         "gh",
         "api",
@@ -1446,7 +1523,7 @@ def cancel_review_request(
     ]
     try:
         result = runner(cmd, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", check=False)
+                        errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
@@ -1474,77 +1551,30 @@ def stale_not_replaced_payload(repo: str, pr: int, reviewer: str, pending_since:
 LOCK_WAIT_SECONDS = 30
 
 
-def lock_path(repo: str, pr: int) -> Path:
-    """One lock file per PR. GitHub owner and repo names are case-insensitive,
-    so `Acme/Widget` and `acme/widget` must map to the same file even on a
-    case-sensitive filesystem."""
-    return loop_state.pr_scoped_path(repo, pr, "locks", ".lock")
+lock_path = loop_lock.pr_lock_path
 
 
-def _try_lock(handle: Any) -> bool:
-    """One non-blocking attempt. Raises BlockingIOError/PermissionError when busy."""
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-    return True
 
 
-def _unlock(handle: Any) -> None:
-    try:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        else:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    except OSError:
-        pass
+
+
 
 
 @contextlib.contextmanager
 def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
-    """Serialize the state-check/count/POST sequence per PR on this machine.
-
-    GitHub does not dedupe review requests, so two loops that both read
-    ABSENT (or the same remaining cap) would both POST and get two reviews.
-    Yields True when the lock is held, False when another run kept it past
-    ``LOCK_WAIT_SECONDS``, and None when no lock can be established (no
-    flock/msvcrt, unwritable state dir). The caller posts only on True: an
-    unserialized run is exactly the duplicate this lock exists to prevent.
-    Runs on other machines are not covered; the pending-state dedupe and the
-    unconfirmed-request record are the guard there.
-    """
-    if fcntl is None and msvcrt is None:
-        yield None
-        return
+    manager = loop_lock.file_lock(lock_path(repo, pr), timeout=0)
     try:
-        path = lock_path(repo, pr)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        handle = open(path, "a+", encoding="utf-8")
+        manager.__enter__()
+    except loop_lock.LockBusy:
+        yield False
+        return
     except (OSError, ValueError):
         yield None
         return
     try:
-        deadline = time.monotonic() + LOCK_WAIT_SECONDS
-        while True:
-            try:
-                _try_lock(handle)
-                break
-            except (BlockingIOError, PermissionError):
-                if time.monotonic() >= deadline:
-                    yield False
-                    return
-                time.sleep(0.5)
-            except OSError:
-                yield None
-                return
-        try:
-            yield True
-        finally:
-            _unlock(handle)
+        yield True
     finally:
-        handle.close()
+        manager.__exit__(*sys.exc_info())
 
 
 def unconfirmed_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
@@ -1662,7 +1692,7 @@ def _settle_unconfirmed_request(
 
     Returns a payload to emit (and post nothing), or None to continue with a
     normal request. Inside the settle time: refuse. Past it: if the request
-    landed, record its provenance and continue; if it never appeared, a 201
+    landed, record its provenance and continue; if it never appeared, an accepted call
     is the definite not_enabled signal, and a 5xx/no-status one simply did not
     land, so a fresh request is safe.
     """
@@ -1686,41 +1716,38 @@ def _settle_unconfirmed_request(
         )
     if landed:
         _record_settled_request(args.repo, args.pr, reviewer, marker)
+        if read_unconfirmed_request(args.repo, args.pr) is not None:
+            return uncertain_payload(
+                args.repo, args.pr, reviewer,
+                ReviewRequestRejected("earlier request could not be recorded durably", reason="state_unwritable", requested_at=at),
+            )
         return None
     clear_unconfirmed_request(args.repo, args.pr)
     if marker.get("kind") == "accepted":
         return rejected_payload(
             args.repo, args.pr, reviewer,
             ReviewRequestRejected(
-                "GitHub returned 201 but the reviewer was never added",
-                reason="not_enabled", http_status=201, retryable=False, requested_at=at,
+                "GitHub accepted the call but the reviewer was never added",
+                reason="not_enabled", http_status=(marker.get("prior") or {}).get("http_status", 201), retryable=False, requested_at=at,
             ),
         )
     return None
 
 
 def run_review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
-    """The review_request path (spec §3), serialized per PR (see ``pr_request_lock``)."""
-    with pr_request_lock(args.repo, args.pr) as held:
-        if held is None:
-            _emit(
-                lock_unavailable_payload(args.repo, args.pr, vendor.request_login),
-                json_output=args.json_output,
-            )
-            return 0
-        if not held:
-            _emit(
-                request_in_progress_payload(args.repo, args.pr, vendor.request_login),
-                json_output=args.json_output,
-            )
-            return 0
-        return _run_review_request_locked(args, vendor)
+    payload = _locked_request(args)
+    if args.json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif "message" in payload:
+        _emit(payload, json_output=False)
+    else:
+        print(f"[loop] {vendor.display_name} review requested at {payload.get('created_at')}")
+    return 0
 
 
-def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> int:
+def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> dict[str, Any]:
     """Resolve state, dedupe, cap, POST, stamp — called with the PR lock held."""
     reviewer = vendor.request_login
-    json_output = args.json_output
     if args.phrase is not None or args.reviewer_mention:
         print(
             f"warning: {vendor.display_name} is re-reviewed through a review "
@@ -1729,12 +1756,10 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         )
     state = request_state(args.repo, args.pr, vendor)
     if state is None:
-        _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
-        return 0
+        return state_unreadable_payload(args.repo, args.pr, reviewer)
     marker = read_unconfirmed_request(args.repo, args.pr)
     if marker is not None and marker.get("unreadable"):
-        _emit(unconfirmed_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
-        return 0
+        return unconfirmed_unreadable_payload(args.repo, args.pr, reviewer)
     if marker is not None and state["state"] != "ABSENT" and not args.dry_run:
         # A request is listed or the head is reviewed, so the state machine
         # below sees it. The marker is forgotten only once its provenance is
@@ -1746,23 +1771,19 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     elif marker is not None and not args.dry_run:
         settled = _settle_unconfirmed_request(args, vendor, marker)
         if settled is not None:
-            _emit(settled, json_output=json_output)
-            return 0
+            return settled
         # Settling took reads and time; the earlier request may have become
         # visible meanwhile. Never post on the snapshot taken before it.
         state = request_state(args.repo, args.pr, vendor)
         if state is None:
-            _emit(state_unreadable_payload(args.repo, args.pr, reviewer), json_output=json_output)
-            return 0
+            return state_unreadable_payload(args.repo, args.pr, reviewer)
     if args.expect_head and args.expect_head != state["head"]:
-        _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"]), json_output=json_output)
-        return 0
+        return head_mismatch_payload(args.repo, args.pr, args.expect_head, state["head"])
+    original_state = state["state"]
     if state["state"] == "COMPLETED_HEAD":
-        _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
-        return 0
+        return already_reviewed_payload(args.repo, args.pr, reviewer, state["head"])
     if state["state"] == "PENDING":
-        _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
-        return 0
+        return review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"])
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
     # needs. With no completed vendor review there is nothing to count: zero
     # would mean "no first review", not "no re-reviews", and a cap of 0 or an
@@ -1773,16 +1794,23 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]
         )
         if used is None:
-            _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
-            return 0
+            return uncountable_count_payload(args.repo, args.pr, cap)
         if used >= cap:
-            _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
-            return 0
+            return capped_payload(args.repo, args.pr, used, cap)
     # The open request is withdrawn only once the cap has cleared, so a cap
     # refusal never leaves the PR with nothing pending. A dry run withdraws
     # nothing. If the replacement POST then fails, a retryable failure gets
     # one more POST (it re-creates the request); a definite failure is
     # reported as a withdrawal, never as "the old request is still there".
+    if state["first_completed_review_at"] and not state.get("rerequest_ids"):
+        return missing_rerequest_ids_payload(args.repo, args.pr, reviewer)
+    actor = gh_login() if not args.dry_run else None
+    if not args.dry_run and (state["first_completed_review_at"] or state["state"] == "STALE_PENDING") and not actor:
+        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr, "message": "Cannot establish the actor; nothing was cancelled or posted."}
+    event_ids = _snapshot_request_event_ids(args.repo, args.pr) if not args.dry_run else None
+    if not args.dry_run and (state["first_completed_review_at"] or state["state"] == "STALE_PENDING"):
+        if event_ids is None:
+            return {"status": "uncountable_provenance", "posted": False, "repo": args.repo, "pr": args.pr, "message": "Cannot establish request event IDs; nothing was cancelled or posted."}
     # A re-review once the vendor has completed a review; before that it is
     # the free first request. Stored with every record of this request.
     countable = bool(state["first_completed_review_at"])
@@ -1794,35 +1822,52 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     prior = {
         "events": list(state.get("vendor_event_times") or []),
         "reviews": list(state.get("vendor_review_times") or []),
+        "request_event_ids": event_ids, "actor": actor, "head": state["head"],
     }
     if not args.dry_run and not record_unconfirmed_request(
         args.repo, args.pr, reviewer=reviewer, at=utc_now_iso(), kind="maybe", countable=countable,
         request_id=request_id, prior=prior,
     ):
-        _emit(state_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
-        return 0
+        return state_unwritable_payload(args.repo, args.pr, reviewer)
     withdrew = False
     if state["state"] == "STALE_PENDING" and not args.dry_run:
-        if not cancel_review_request(args.repo, args.pr, reviewer):
+        if not cancel_review_request(args.repo, args.pr, reviewer, expect_head=args.expect_head or state["head"]):
             clear_unconfirmed_request(args.repo, args.pr)
-            _emit(
-                stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"]),
-                json_output=json_output,
-            )
-            return 0
+            return stale_not_replaced_payload(args.repo, args.pr, reviewer, state["pending_since"])
         withdrew = True
+        refreshed = request_state(args.repo, args.pr, vendor)
+        if refreshed is None or (args.expect_head and refreshed["head"] != args.expect_head):
+            clear_unconfirmed_request(args.repo, args.pr)
+            return _note_withdrawal(state_unreadable_payload(args.repo, args.pr, reviewer) if refreshed is None else head_mismatch_payload(args.repo, args.pr, args.expect_head, refreshed["head"]))
+        if refreshed["state"] != "ABSENT":
+            clear_unconfirmed_request(args.repo, args.pr)
+            return already_reviewed_payload(args.repo, args.pr, reviewer, refreshed["head"]) if refreshed["state"] == "COMPLETED_HEAD" else stale_not_replaced_payload(args.repo, args.pr, reviewer, refreshed["pending_since"])
+        if refreshed["first_completed_review_at"] and not refreshed.get("rerequest_ids"):
+            clear_unconfirmed_request(args.repo, args.pr)
+            return missing_rerequest_ids_payload(args.repo, args.pr, reviewer)
+        if not args.no_cap_check and refreshed["first_completed_review_at"] and refreshed["first_completed_review_at"] != state["first_completed_review_at"]:
+            used = count_agent_review_requests(args.repo, args.pr, vendor, actor, refreshed["first_completed_review_at"])
+            if used is None or used >= effective_cap(args.max_rereview_requests):
+                clear_unconfirmed_request(args.repo, args.pr)
+                return uncountable_count_payload(args.repo, args.pr, effective_cap(args.max_rereview_requests)) if used is None else capped_payload(args.repo, args.pr, used, effective_cap(args.max_rereview_requests))
+        state = refreshed
+        countable = bool(state["first_completed_review_at"])
+        prior.update(events=list(state.get("vendor_event_times") or []), reviews=list(state.get("vendor_review_times") or []), head=state["head"])
+        if not record_unconfirmed_request(args.repo, args.pr, reviewer=reviewer, at=utc_now_iso(), kind="maybe", countable=countable, request_id=request_id, prior=prior):
+            return _note_withdrawal(state_unwritable_payload(args.repo, args.pr, reviewer))
     try:
-        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run)
+        payload = request_review(args.repo, args.pr, reviewer, dry_run=args.dry_run, expect_head=args.expect_head or state["head"], rerequest_ids=state.get("rerequest_ids"), registration_head=state["head"], request_actor=actor, request_event_ids=event_ids)
     except ReviewRequestRejected as exc:
         # A 5xx is not a clean refusal: GitHub can register the request and
         # still fail the response, and it does not dedupe. Never replay it;
         # reconcile it like a missing status (PR #116 review).
-        maybe_landed = exc.reason in ("uncertain", "transient")
-        if maybe_landed and confirm_posted_after_uncertain(
+        maybe_landed = exc.reason in ("uncertain", "transient", "registration_pending")
+        event = _new_request_event(args.repo, args.pr, vendor, actor, event_ids, subprocess.run) if maybe_landed and exc.allow_timeline_confirmation and actor and event_ids is not None else None
+        if event is not None or (maybe_landed and exc.allow_timeline_confirmation and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at, prior=prior
-        ):
+        )):
             payload = {
-                "created_at": exc.requested_at,
+                "created_at": event["created_at"] if event is not None else exc.requested_at,
                 "repo": args.repo,
                 "pr": args.pr,
                 "kind": "review_request",
@@ -1834,9 +1879,11 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             }
         else:
             if maybe_landed:
+                if exc.reason == "registration_pending":
+                    prior["http_status"] = exc.http_status
                 saved = record_unconfirmed_request(
                     args.repo, args.pr, reviewer=reviewer, at=exc.requested_at,
-                    kind="maybe", countable=countable, request_id=request_id, prior=prior,
+                    kind="accepted" if exc.reason == "registration_pending" else "maybe", countable=countable, request_id=request_id, prior=prior,
                 )
                 refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:
@@ -1844,13 +1891,11 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                 refused = rejected_payload(args.repo, args.pr, reviewer, exc)
             if withdrew:
                 refused = _note_withdrawal(refused)
-            _emit(refused, json_output=json_output)
-            return 0
-    except ValueError as exc:
+            return refused
+    except ValueError:
         if not args.dry_run:
             clear_unconfirmed_request(args.repo, args.pr)
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        raise
     if not payload.get("dry_run") and "registered" not in payload:
         # A 201 is not proof: without Copilot code review GitHub accepts the
         # request and adds nobody (spec §6.1). Confirm before stamping, so a
@@ -1872,8 +1917,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                     requested_at=payload.get("created_at"),
                 ),
             )
-            _emit(_remembered(unseen, saved), json_output=json_output)
-            return 0
+            return _remembered(unseen, saved)
         if registered is None:
             saved = record_unconfirmed_request(
                 args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
@@ -1881,40 +1925,36 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             )
             # The read-back failed: unknown, not posted and not rejected. It is
             # not recorded as posted; the next run settles it.
-            _emit(
-                _remembered(uncertain_payload(
+            return _remembered(uncertain_payload(
                     args.repo, args.pr, reviewer,
                     ReviewRequestRejected(
                         "the requested-reviewers read-back failed",
                         reason="registration_unknown", http_status=201, retryable=False,
                         requested_at=payload.get("created_at"),
                     ),
-                ), saved),
-                json_output=json_output,
-            )
-            return 0
+                ), saved)
         payload["registered"] = True
-    payload["state"] = state["state"]
-    payload["replaced_stale_request"] = state["state"] == "STALE_PENDING"
+    if payload.get("confirmed_after_uncertain"):
+        payload = confirm_posted_head(payload, args.repo, args.pr, args.expect_head or state["head"], subprocess.run)
+    payload["state"] = original_state
+    payload["replaced_stale_request"] = original_state == "STALE_PENDING"
     if payload.get("dry_run"):
         payload["would_post"] = True
-    elif record_rereview_posted(
-            args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
-            count_cycle=countable, countable=countable, request_id=request_id,
-        ):
-            # The record (or the incomplete flag) is durable; the reservation
-            # has done its job. Otherwise it stays as the only record.
-            clear_unconfirmed_request(args.repo, args.pr)
-    if json_output:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    elif payload.get("dry_run"):
-        print(
-            f"[loop] dry run — would request a review from {reviewer} on "
-            f"{args.repo}#{args.pr} (state {state['state']})"
-        )
     else:
-        print(f"[loop] {vendor.display_name} review requested at {payload['created_at']}")
-    return 0
+        try:
+            if record_rereview_posted(args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"),
+                                     count_cycle=countable, countable=countable, request_id=request_id):
+                clear_unconfirmed_request(args.repo, args.pr)
+            else:
+                raise RuntimeError("request log and incomplete marker could not be saved")
+        except (RuntimeError, OSError) as exc:
+            payload.update(status="state_record_failed", posted=True, recording_error=str(exc),
+                           message="Review was posted, but recording failed. Reconcile its reservation before requesting again.")
+    return payload
+
+
+def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendor) -> dict[str, Any]:
+    return _run_review_request_locked(args, vendor)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1977,6 +2017,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not post; emit a controlled no_safe_trigger result instead.",
     )
     parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Confirm and record an in-flight request from GitHub evidence, without posting again.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
@@ -1986,29 +2031,172 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args = build_parser().parse_args(argv)
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 2
-        return code
-
+        return exc.code if isinstance(exc.code, int) else 2
     try:
-        parse_repo(args.repo)
+        payload = _locked_request(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif "message" in payload:
+        _emit(payload, json_output=False)
+    elif payload.get("kind") == "review_request":
+        if payload.get("dry_run"):
+            print(f"[loop] dry run — would request a review from {payload['reviewer']} on {args.repo}#{args.pr} (state {payload['state']})")
+        else:
+            vendor = review_vendors.vendor_for(payload["reviewer"])
+            print(f"[loop] {vendor.display_name} review requested at {payload['created_at']}")
+    elif payload.get("dry_run"):
+        print(f"[loop] dry run — would post to {payload['repo']}#{payload['pr']}: {payload['phrase']}")
+    else:
+        print(f"[loop] Re-review requested at {payload['created_at']}")
+    return 0
 
+
+@loop_state.state_transaction
+def _mark_request_in_flight(repo: str, pr: int, pending: dict[str, Any] | None) -> None:
+    state = load_state()
+    key = state_key_for(state, repo, pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    if pending is None:
+        entry.pop("review_request_in_flight", None)
+    else:
+        if entry.get("review_request_in_flight"):
+            raise RuntimeError("reconcile the previous review request before requesting again")
+        entry["review_request_in_flight"] = pending
+    state[key] = entry
+    loop_state.save_sticky_state(state)
+
+def _record_posted_payload(args: argparse.Namespace, payload: dict[str, Any], reviewer: str | None = None, *, initial_review: bool = False) -> None:
+    try:
+        state = load_state()
+        entry = state.get(state_key_for(state, args.repo, args.pr), {})
+        marker = entry.get("review_request_in_flight") or {}
+        initial_review = initial_review or marker.get("initial_review") is True
+        request_id = marker.get("id") or "legacy-" + hashlib.sha256(json.dumps(marker, sort_keys=True).encode()).hexdigest()
+        if not record_rereview_posted(args.repo, args.pr, reviewer=reviewer, requested_at=payload.get("created_at"), comment_id=payload.get("comment_id"),
+                                     initial_review=initial_review, countable=not initial_review, count_cycle=not initial_review, request_id=request_id):
+            raise RuntimeError("request log and incomplete marker could not be saved")
+        _mark_request_in_flight(args.repo, args.pr, None)
+    except (RuntimeError, OSError) as exc:
+        payload.update(status="state_record_failed", posted=True, recording_error=str(exc),
+                       message="Review was posted, but local recording failed. Reconcile its in-flight marker before requesting again.")
+
+def _snapshot_comment_ids(repo: str, pr: int, runner: Any = None) -> list[int] | None:
+    owner, repo_name = parse_repo(repo)
+    comments = _gh_json(["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{pr}/comments"], runner or subprocess.run)
+    if not isinstance(comments, list):
+        return None
+    if any(not isinstance(comment, dict) or type(comment.get("id")) is not int or comment["id"] <= 0 for comment in comments):
+        return None
+    return sorted({comment["id"] for comment in comments})
+
+def _snapshot_request_event_ids(repo: str, pr: int, runner: Any = None) -> list[int] | None:
+    events = _timeline_events(repo, pr, runner or subprocess.run)
+    if events is None:
+        return None
+    ids = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        if event.get("event") == "review_requested":
+            if type(event.get("id")) is not int or event["id"] <= 0:
+                return None
+            ids.append(event["id"])
+    return sorted(set(ids))
+
+def _new_request_event(repo: str, pr: int, vendor: review_vendors.ReviewVendor, actor: str, baseline: Any, runner: Any) -> dict[str, Any] | None:
+    if not isinstance(baseline, list) or any(type(event_id) is not int or event_id <= 0 for event_id in baseline):
+        return None
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return None
+    prior = set(baseline)
+    for raw in events:
+        if not isinstance(raw, dict) or type(raw.get("id")) is not int or raw["id"] <= 0 or raw["id"] in prior:
+            continue
+        event = reviewer_resolver.normalize_request_event(raw)
+        if event and event["actor_login"] == actor and review_vendors.vendor_for(event["reviewer_login"]) is vendor and _parse_iso(event["created_at"]) is not None:
+            return event
+    return None
+
+def _completed_registration(reviews: list[dict[str, Any]], request_login: str, head: str, after: str) -> bool:
+    anchor = _parse_iso(after)
+    if anchor is None:
+        return False
+    return any(isinstance(review.get("user"), dict) and review["user"].get("type") == "Bot"
+               and review.get("state") in {"COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+               and isinstance(review["user"].get("login"), str)
+               and review["user"]["login"].casefold().removesuffix("[bot]") == request_login.casefold().removesuffix("[bot]")
+               and _review_commit(review) == head
+               and (submitted := _parse_iso(_review_submitted_at(review))) is not None and submitted >= anchor
+               for review in reviews if isinstance(review, dict))
+
+def ensure_expected_head(repo: str, pr: int, expect_head: str, runner: Any) -> None:
+    """Best-effort check immediately before writing; GitHub has no atomic head guard."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", expect_head):
+        raise ValueError("--expect-head must be a full commit SHA")
+    owner, repo_name = parse_repo(repo)
+    info = _gh_json(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], runner)
+    if not isinstance(info, dict) or info.get("state") != "open" or not isinstance(info.get("head"), dict) or info["head"].get("sha") != expect_head:
+        raise RuntimeError("PR head changed or could not be established; no re-review posted")
+
+def confirm_posted_head(payload: dict[str, Any], repo: str, pr: int, expect_head: str | None, runner: Any) -> dict[str, Any]:
+    """A successful write remains posted even if its head cannot be reconfirmed."""
+    if expect_head is not None:
+        info = _gh_json(["gh", "api", f"repos/{repo}/pulls/{pr}"], runner)
+        head_info = info.get("head") if isinstance(info, dict) else None
+        head = head_info.get("sha") if isinstance(head_info, dict) else None
+        if not isinstance(info, dict) or info.get("state") != "open" or head != expect_head:
+            payload.update(status="review_head_unconfirmed", posted=True, expected_head=expect_head, observed_head=head,
+                           message="Review request was posted, but the open PR head could not be reconfirmed. Fetch current feedback; do not automatically request another review.")
+    return payload
+
+def _registered_review(repo: str, pr: int, request_login: str, expect_head: str | None, runner: Any, *, actor: str | None = None, request_event_ids: list[int] | None = None) -> bool:
+    owner, repo_name = parse_repo(repo)
+    data = _gh_json(["gh", "api", "graphql", "-f", f"query={STATE_QUERY}",
+                     "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"], runner)
+    try:
+        pull = data["data"]["repository"]["pullRequest"]
+        if data.get("errors") or (expect_head is not None and pull.get("headRefOid") != expect_head):
+            return False
+        if any(isinstance(node, dict) and isinstance(reviewer := node.get("requestedReviewer"), dict)
+               and reviewer_resolver.canonical_login(reviewer.get("login")) == reviewer_resolver.canonical_login(request_login)
+               for node in pull["reviewRequests"]["nodes"]):
+            return True
+    except (KeyError, TypeError, AttributeError):
+        return False
+    head = expect_head or pull.get("headRefOid")
+    vendor = review_vendors.vendor_for(request_login)
+    if not actor or request_event_ids is None or vendor is None or not isinstance(head, str) or not head:
+        return False
+    event = _new_request_event(repo, pr, vendor, actor, request_event_ids, runner)
+    if event is None:
+        return False
+    reviews = _all_reviews(repo, pr, runner)
+    if reviews is None:
+        return False
+    return _completed_registration(reviews, request_login, head, event["created_at"])
+
+def missing_rerequest_ids_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    return {"status": "uncountable_rerequest_ids", "posted": False, "repo": repo, "pr": pr, "reviewer": reviewer,
+            "message": "Cannot establish PR and bot IDs for re-review; no request was posted. Restore readable, unambiguous IDs before retrying."}
+
+def _request(args: argparse.Namespace) -> dict[str, Any]:
     if args.no_safe_trigger:
         reviewer_login = args.reviewer_login or (
             args.reviewer_mention.lstrip("@") if args.reviewer_mention else "unknown reviewer"
         )
         payload = no_safe_trigger_payload(reviewer_login)
-        if args.json_output:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            print(f"[loop] {payload['message']}")
-        return 0
+        return payload
 
     # Review-request vendors (Copilot) never get a comment; resolve the vendor
     # from the login before the comment path's no-safe-trigger logic runs.
@@ -2020,111 +2208,209 @@ def main(argv: list[str] | None = None) -> int:
     )
     vendor = review_vendors.vendor_for(reviewer_login)
     if vendor is not None and vendor.trigger_kind == "review_request":
-        return run_review_request(args, vendor)
+        return _review_request(args, vendor)
 
     # The comment path honors --expect-head too: the ping is what buys the
     # review, so it must not be posted against a head GitHub has not seen yet.
     if args.expect_head:
         head = current_head(args.repo, args.pr)
         if head is None:
-            _emit(state_unreadable_payload(args.repo, args.pr, reviewer_login or "the reviewer"),
-                  json_output=args.json_output)
-            return 0
+            return state_unreadable_payload(args.repo, args.pr, reviewer_login or "the reviewer")
         if head != args.expect_head:
-            _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, head),
-                  json_output=args.json_output)
-            return 0
+            return head_mismatch_payload(args.repo, args.pr, args.expect_head, head)
 
-    try:
-        trigger = None
-        if args.phrase is not None:
-            phrase = args.phrase
-            trigger = args.reviewer_mention
-        else:
-            trigger, reviewer_login = resolve_review_trigger(
-                repo=args.repo,
-                pr=args.pr,
-                reviewer_login=args.reviewer_login,
-                reviewer_mention=args.reviewer_mention,
-            )
-            if trigger is None:
-                payload = no_safe_trigger_payload(reviewer_login)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            # Known vendors accept an exact phrase (Codex matches "@codex
-            # review" literally); everything else gets the generic sentence.
-            phrase = (
-                reviewer_resolver.phrase_for(reviewer_login)
-                or reviewer_resolver.phrase_for(trigger)
-                or build_default_phrase(trigger)
-            )
-        # The cap is the loop's only guarantee that it cannot spam a PR, so it
-        # is enforced here at the write itself rather than trusted to a caller.
-        if not args.no_cap_check:
-            cap = effective_cap(args.max_rereview_requests)
-            # Count by mention, never by the full sentence: a ping worded
-            # differently in an earlier cycle is still a ping.
-            countable = trigger or mention_in(phrase)
-            if countable is None:
-                # No mention to count by. Refuse rather than post uncounted:
-                # an uncountable write is an uncapped write.
-                payload = {
-                    "status": "uncountable_trigger",
-                    "posted": False,
-                    "repo": args.repo,
-                    "pr": args.pr,
-                    "message": (
-                        "Cannot count prior re-review requests: --phrase contains "
-                        "no @mention to match on. Pass --reviewer-mention so the "
-                        "cap can be enforced, or --no-cap-check to bypass it."
-                    ),
-                }
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            used = count_agent_pings(args.repo, args.pr, countable, gh_login())
-            if used is None:
-                # The count could not be established (gh login unresolved, the
-                # comments query failed, or its output was unparseable). Posting
-                # anyway would make the cap advisory exactly when it matters, so
-                # refuse for the same reason as an uncountable trigger.
-                payload = uncountable_count_payload(args.repo, args.pr, cap)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-            if used >= cap:
-                payload = capped_payload(args.repo, args.pr, used, cap)
-                if args.json_output:
-                    print(json.dumps(payload, indent=2, sort_keys=True))
-                else:
-                    print(f"[loop] {payload['message']}")
-                return 0
-        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run)
-        # A dry run posts nothing, so it closes no cycle.
-        if payload.get("posted") is not False and not payload.get("dry_run"):
-            record_rereview_posted(args.repo, args.pr)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    if args.json_output:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    elif payload.get("dry_run"):
-        print(f"[loop] dry run — would post to {payload['repo']}#{payload['pr']}: {payload['phrase']}")
+    trigger = None
+    if args.phrase is not None:
+        phrase = args.phrase
+        trigger = args.reviewer_mention
     else:
-        print(f"[loop] Re-review requested at {payload['created_at']}")
-    return 0
+        trigger, reviewer_login = resolve_review_trigger(
+            repo=args.repo,
+            pr=args.pr,
+            reviewer_login=args.reviewer_login,
+            reviewer_mention=args.reviewer_mention,
+        )
+        if trigger is None:
+            payload = no_safe_trigger_payload(reviewer_login)
+            return payload
+        # Known vendors accept an exact phrase (Codex matches "@codex
+        # review" literally); everything else gets the generic sentence.
+        phrase = (
+            reviewer_resolver.phrase_for(reviewer_login)
+            or reviewer_resolver.phrase_for(trigger)
+            or build_default_phrase(trigger)
+        )
+    # The cap is the loop's only guarantee that it cannot spam a PR, so it
+    # is enforced here at the write itself rather than trusted to a caller.
+    if not args.no_cap_check:
+        cap = effective_cap(args.max_rereview_requests)
+        # Count by mention, never by the full sentence: a ping worded
+        # differently in an earlier cycle is still a ping.
+        countable = trigger or mention_in(phrase)
+        if countable is None:
+            # No mention to count by. Refuse rather than post uncounted:
+            # an uncountable write is an uncapped write.
+            payload = {
+                "status": "uncountable_trigger",
+                "posted": False,
+                "repo": args.repo,
+                "pr": args.pr,
+                "message": (
+                    "Cannot count prior re-review requests: --phrase contains "
+                    "no @mention to match on. Pass --reviewer-mention so the "
+                    "cap can be enforced, or --no-cap-check to bypass it."
+                ),
+            }
+            return payload
+        used = count_agent_pings(args.repo, args.pr, countable, gh_login())
+        if used is None:
+            # The count could not be established (gh login unresolved, the
+            # comments query failed, or its output was unparseable). Posting
+            # anyway would make the cap advisory exactly when it matters, so
+            # refuse for the same reason as an uncountable trigger.
+            payload = uncountable_count_payload(args.repo, args.pr, cap)
+            return payload
+        if used >= cap:
+            payload = capped_payload(args.repo, args.pr, used, cap)
+            return payload
+    actor = gh_login() if not args.dry_run else None
+    if not args.dry_run and not actor:
+        return {"status": "uncountable_actor", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish the authenticated actor for request recovery; nothing was posted."}
+    comment_ids = _snapshot_comment_ids(args.repo, args.pr) if not args.dry_run else None
+    if not args.dry_run and comment_ids is None:
+        return {"status": "uncountable_provenance", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Cannot establish comment IDs for recovery; nothing was posted."}
+    if not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, {"reviewer": trigger or mention_in(phrase) or reviewer_login,
+                                                  "at": utc_now_iso(), "actor": actor, "kind": "comment", "phrase": phrase, "id": uuid.uuid4().hex,
+                                                  "comment_ids": comment_ids})
+    try:
+        payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run, expect_head=args.expect_head)
+    except ReviewRequestRejected as exc:
+        if not exc.outcome_unknown and not args.dry_run:
+            _mark_request_in_flight(args.repo, args.pr, None)
+        return rejected_payload(args.repo, args.pr, reviewer_login or trigger or "the reviewer", exc)
+    # A dry run posts nothing, so it closes no cycle.
+    if payload.get("posted") is not False and not payload.get("dry_run"):
+        _record_posted_payload(args, payload, trigger or mention_in(phrase) or reviewer_login)
+    elif not args.dry_run:
+        _mark_request_in_flight(args.repo, args.pr, None)
+    return payload
 
+def request_rereview(repo: str, pr: int, expect_head: str, max_rereview_requests: int | None = None) -> dict[str, Any]:
+    """Structured API for publishing callers; shares the standalone PR lock."""
+    argv = ["--repo", repo, "--pr", str(pr), "--expect-head", expect_head]
+    if max_rereview_requests is not None:
+        argv.extend(["--max-rereview-requests", str(max_rereview_requests)])
+    return _locked_request(build_parser().parse_args(argv))
+
+def _reconcile_request(args: argparse.Namespace, marker: Any) -> dict[str, Any]:
+    payload = {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr,
+               "message": "No matching GitHub evidence yet; the marker is retained. Reconcile again later; do not repost."}
+    if not isinstance(marker, dict) or not marker:
+        payload.update(status="no_request_in_flight", posted=False, message="No in-flight request to reconcile; nothing was posted.")
+        return payload
+    reviewer, at, actor = marker.get("reviewer"), marker.get("at"), marker.get("actor")
+    if not isinstance(reviewer, str) or _parse_iso(at) is None or not isinstance(actor, str) or not actor:
+        return payload
+    vendor = review_vendors.vendor_for(reviewer)
+    confirmed = {"created_at": at, "repo": args.repo, "pr": args.pr, "reviewer": reviewer,
+                 "posted": True, "reconciled": True}
+    if marker.get("kind") == "review_request" and vendor is not None:
+        if "request_event_ids" in marker:
+            event = _new_request_event(args.repo, args.pr, vendor, actor, marker["request_event_ids"], subprocess.run)
+            if event is None:
+                return payload
+            confirmed["created_at"] = event["created_at"]
+        else:
+            head = marker.get("head")
+            if not isinstance(head, str) or (args.expect_head and args.expect_head != head):
+                return payload
+            state = request_state(args.repo, args.pr, vendor)
+            if state is None or state["head"] != head:
+                return payload
+            if not confirm_posted_after_uncertain(args.repo, args.pr, vendor, actor, at):
+                return payload
+            if state["state"] not in ("PENDING", "STALE_PENDING"):
+                reviews = _all_reviews(args.repo, args.pr, subprocess.run)
+                if reviews is None:
+                    return payload
+                completed = any(review_vendors.vendor_for(_review_author(review)) is vendor
+                                and review.get("state") != "PENDING" and _review_commit(review) == head
+                                and _review_submitted_at(review) >= at for review in reviews)
+                if not completed:
+                    return payload
+        confirmed["kind"] = "review_request"
+    elif marker.get("kind") == "comment" and isinstance(marker.get("phrase"), str):
+        baseline = marker.get("comment_ids")
+        if "comment_ids" in marker and (not isinstance(baseline, list) or any(type(comment_id) is not int or comment_id <= 0 for comment_id in baseline)):
+            return payload
+        owner, repo_name = parse_repo(args.repo)
+        comments = _gh_json(["gh", "api", "--paginate", f"repos/{owner}/{repo_name}/issues/{args.pr}/comments"], subprocess.run)
+        if not isinstance(comments, list):
+            return payload
+        match = next((comment for comment in comments if isinstance(comment, dict)
+                      and isinstance(comment.get("user"), dict) and comment["user"].get("login") == actor
+                      and comment.get("body") == marker["phrase"] and _parse_iso(comment.get("created_at")) is not None
+                      and type(comment.get("id")) is int and comment["id"] > 0
+                      and (comment["id"] not in baseline if "comment_ids" in marker else comment["created_at"] >= at)), None)
+        if match is None:
+            return payload
+        confirmed.update(created_at=match["created_at"], comment_id=match["id"], phrase=marker["phrase"])
+    else:
+        return payload
+    if args.dry_run:
+        confirmed.update(posted=False, dry_run=True, would_record=True, message="GitHub confirms the request; dry run recorded nothing.")
+        return confirmed
+    _record_posted_payload(args, confirmed, reviewer, initial_review=marker.get("initial_review") is True)
+    if confirmed.get("status") != "state_record_failed":
+        confirmed.update(status="request_reconciled", message="Confirmed the previous request from GitHub and recorded it once; no new request was posted.")
+    return confirmed
+
+def _locked_request(args: argparse.Namespace) -> dict[str, Any]:
+    parse_repo(args.repo)
+    try:
+        with pr_request_lock(args.repo, args.pr) as held:
+            if held is None:
+                return lock_unavailable_payload(args.repo, args.pr, args.reviewer_login or "the reviewer")
+            if not held:
+                return request_in_progress_payload(args.repo, args.pr, args.reviewer_login or "the reviewer")
+            state = loop_state.load_sticky_state(strict=True)
+            entry = state.get(state_key_for(state, args.repo, args.pr))
+            if args.reconcile:
+                marker = entry.get("review_request_in_flight") if isinstance(entry, dict) else None
+                if marker:
+                    return _reconcile_request(args, marker)
+                reservation = read_unconfirmed_request(args.repo, args.pr)
+                if reservation:
+                    vendor = review_vendors.vendor_for(reservation.get("reviewer"))
+                    prior = reservation.get("prior") or {}
+                    event = _new_request_event(args.repo, args.pr, vendor, prior.get("actor"), prior.get("request_event_ids"), subprocess.run) if vendor and prior.get("actor") and isinstance(prior.get("request_event_ids"), list) else None
+                    if not reservation.get("unreadable") and vendor and (event is not None or request_landed_since(args.repo, args.pr, vendor, gh_login(), reservation["at"], prior=prior)):
+                        confirmed_at = event["created_at"] if event else reservation["at"]
+                        if args.dry_run:
+                            return {"posted": False, "dry_run": True, "would_record": True, "created_at": confirmed_at, "repo": args.repo, "pr": args.pr,
+                                    "message": "GitHub confirms the request; dry run recorded nothing."}
+                        try:
+                            _record_settled_request(args.repo, args.pr, vendor.request_login, {**reservation, "at": confirmed_at})
+                            if read_unconfirmed_request(args.repo, args.pr) is not None:
+                                raise RuntimeError("the prior reservation could not be recorded durably")
+                        except (RuntimeError, OSError) as exc:
+                            return {"status": "state_record_failed", "posted": True, "created_at": confirmed_at, "repo": args.repo, "pr": args.pr,
+                                    "message": f"GitHub confirms the prior request, but recording failed: {exc}. Reconcile again; do not repost."}
+                        return {"status": "request_reconciled", "posted": True, "created_at": confirmed_at, "repo": args.repo, "pr": args.pr, "message": "Recorded the prior request; no new request was posted."}
+                    return {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr, "message": "The previous reservation remains unconfirmed; no new request was posted."}
+                return _reconcile_request(args, None)
+            if isinstance(entry, dict) and entry.get("review_request_in_flight"):
+                return {"status": "request_in_flight", "posted": None, "repo": args.repo, "pr": args.pr,
+                        "message": "A previous review request is not fully recorded. Reconcile its in-flight marker before requesting again."}
+            return _request(args)
+    except loop_lock.LockBusy:
+        return {"status": "busy", "posted": False, "repo": args.repo, "pr": args.pr,
+                "message": "Another local publish/re-review owns this PR; retry after it finishes."}
 
 if __name__ == "__main__":
+    from loop_color import configure_utf8_output
+    configure_utf8_output()
     raise SystemExit(main())

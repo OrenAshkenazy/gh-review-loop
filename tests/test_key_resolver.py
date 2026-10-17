@@ -107,7 +107,7 @@ class TestDotenvIO:
         assert path.exists()
         assert key_resolver._read_dotenv() == "sk-stored"
         # chmod check is best-effort on systems that support it
-        if hasattr(path, "stat"):
+        if sys.platform != "win32":
             mode = path.stat().st_mode & 0o777
             # Not every OS honors chmod, but where it does, owner-only.
             if mode != 0:

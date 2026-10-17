@@ -1,11 +1,10 @@
 # Script usage catalog
 
-Resolve `$GGRL_PLUGIN_ROOT` first (see SKILL.md — run as its own Bash call). All commands below assume it is exported.
+Resolve the installed root from the selected SKILL.md's absolute path. Bash examples assume `$GGRL_PLUGIN_ROOT` is exported; on Windows use `python` and quoted absolute script paths with the same arguments.
 
 ```bash
-# Default fetch: resolves unresolved outdated reviewer threads AND
-# addressed-by-reply threads (substantive non-bot reply, >=30 chars) before
-# printing current feedback. The re-review cap does not block this cleanup.
+# Default fetch leaves resolution unchanged and prints current feedback.
+# Explicit resolution uses --resolve-outdated / --resolve-addressed-by-reply.
 # Delta mode: threads unchanged since the previous cycle collapse to one line;
 # any change (new reply, edited body, moved anchor) renders full. The output
 # ends with the profile-intro + planned-verification blocks (relay from here).
@@ -16,10 +15,8 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # standard truncation cap.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --full
 
-# Wait for configured reviewer activity to appear (cycle 1 / initial review).
-# No --after → returns as soon as activity is present; it does NOT wait for a
-# quiet/settle period — at the initial review there either are comments or
-# there aren't.
+# Wait for initial reviewer activity; without --after it returns immediately
+# once activity appears, without waiting for a settle period.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --wait
 
 # Wait for a NEW reviewer response after a re-review request (cycle 2+).
@@ -48,15 +45,14 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # Parse JSON stdout and capture `created_at` as REREVIEW_AT.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/request_rereview.py" \
     --repo OWNER/REPO --pr PR_NUMBER \
-    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --json
+    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --expect-head "$PUBLISHED_HEAD" --json
 # Copilot (persisted trigger_kind: review_request): same command without the
-# mention; it posts a GitHub reviewer request, not a comment. Add
-# --expect-head "$(git rev-parse HEAD)" to refuse if the PR head moved.
+# mention; it posts a GitHub reviewer request. PUBLISHED_HEAD is the publish
+# helper's JSON head; a moved or closed PR blocks the write.
 
 # Render deterministic human-readable formatter blocks for relay.
-# NOTE: the default fetch already appends both blocks to its output (and JSON
-# fetches carry them as humanBlocks.profileIntro/.plannedVerification), so on a
-# repo that already has a profile these standalone forms are out-of-band only.
+# Default fetch includes both blocks (JSON: humanBlocks.profileIntro and
+# .plannedVerification); with a saved profile these forms are out-of-band.
 # They ARE part of the first-run cycle: with no profile saved, the fetch emits
 # a regenerate notice instead of the blocks (humanBlocks.profileBlocksProvisional
 # is true, plannedVerification is empty), because the profile decision lands
@@ -66,7 +62,8 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
     --planned-verification --repo OWNER/REPO
 
-# Run the verification profile (feed its JSON into --verification-details).
+# Standalone diagnosis only; publish_changes.py already runs this once.
+# Do not run the full profile separately before publishing.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/run_profile.py" owner/repo /path/to/repo
 
 # Read-only fetch (no GraphQL mutations)
@@ -108,3 +105,9 @@ The script emits `warning: ... hit page limit ...` to stderr if any GraphQL page
 #   upgrade/add credits then re-run the same wait); do NOT re-request the review.
 # - timed_out -> record --gemini-unconfirmed; do not guess clean. Say the wait
 #   timed out — never invent feedback.
+
+## Explicit lifecycle (all runtimes)
+
+Use installed absolute paths for `start_loop.py`, `publish_changes.py`, and `finish_loop.py`; each accepts `--repo OWNER/REPO --pr N --repo-root ROOT`. Start before editing, publish each fix cycle, and finish after the final reviewer wait or a terminal path with no publication. Full arguments, report metadata, and examples: `references/lifecycle.md`.
+
+The publisher verifies once and generates the cycle receipt. Do not run a separate full profile or cycle summary first. Relay `cycle_summary.output`; pass its `verification` object to finish and relay `receipt.output`.

@@ -1,4 +1,5 @@
 from cluster_findings import Cluster
+import pytest
 import metrics
 from metrics import (
     RECORD_SCHEMA_VERSION,
@@ -25,6 +26,7 @@ class TestHelpers:
         # the machine running the tests — a fresh install writes the new name.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         result = metrics.runs_log_path()
         assert result.name == "runs.jsonl"
         assert "gh-review-loop" in str(result)
@@ -34,6 +36,7 @@ class TestHelpers:
         # Pre-rename state dir, not yet migrated: existing data stays readable.
         monkeypatch.delenv("GGRL_STATE_DIR", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         (tmp_path / ".config" / "gh-gemini-review-loop").mkdir(parents=True)
         assert "gh-gemini-review-loop" in str(metrics.runs_log_path())
 
@@ -435,13 +438,21 @@ class TestFormatSuiteBlock:
         ]}
         out = metrics.format_suite_block(details).splitlines()
         assert out[0] == "Verification suite:"
-        assert "uv run pytest" in out[1] and "(root, required)" in out[1] and "passed" in out[1]
-        assert "npm test" in out[2] and "(web, optional)" in out[2] and "skipped" in out[2]
+        assert out[1] == "  - root (required) → passed"
+        assert out[2] == "  - web (optional) → skipped"
+
+    @pytest.mark.parametrize("command", [r"C:\Users\Alice\private\venv\python.exe -m pytest", ["/home/alice/venv/bin/python", "-m", "pytest", "--private-token=secret"]])
+    def test_public_suite_keeps_private_commands_and_runner_output_local(self, command):
+        check = {"name": "tests", "command": command, "required": True, "status": "passed",
+                 "stdout_tail": "/home/alice/private", "stderr_tail": r"C:\Users\Alice\private"}
+        details = {"checks": [check]}
+        assert metrics.format_suite_block(details) == "Verification suite:\n  - tests (required) → passed"
+        assert check["command"] == command and check["stdout_tail"] == "/home/alice/private"
 
     def test_ignores_non_dict_checks(self):
         details = {"checks": ["junk", {"name": "root", "command": "pytest", "required": True, "status": "passed"}]}
         out = metrics.format_suite_block(details)
-        assert "pytest" in out and "junk" not in out
+        assert out == "Verification suite:\n  - root (required) → passed"
 
 
 class TestFormatFindingsBlock:

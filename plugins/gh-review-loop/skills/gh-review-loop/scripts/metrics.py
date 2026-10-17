@@ -247,17 +247,15 @@ def _duration_seconds(started_at: str, ts: str) -> int:
 
 
 def format_auto_snapshot(record: dict[str, Any]) -> str:
-    """Lean receipt for the Stop-hook backstop (agent didn't post a summary).
+    """Lean diagnostic receipt without agent-supplied verification claims.
 
-    The hook can't know agent-only facts — fixed count, verification result,
+    A diagnostic can't know agent-only facts — fixed count, verification result,
     terminal outcome — so this shows ONLY GitHub-observable state and is
     explicitly labelled automatic. It never prints a guessed Fixed/
     Verification/Outcome, which is what made the full receipt misleading when
     fired without agent inputs.
     """
-    # One line on purpose: Claude Code collapses multi-line hook output behind
-    # "ctrl+o to expand", so a multi-line backstop summary wouldn't actually be
-    # visible to someone watching the chat.
+    # Keep the diagnostic compact when only GitHub-observable counts are needed.
     snapshot = (
         "[loop] Summary (auto, agent didn't post one): "
         f"{record['findings_fetched']} seen, "
@@ -322,6 +320,8 @@ def _profile_checks(profile: Any) -> list[dict[str, Any]]:
         if not isinstance(check, dict):
             continue
         command = check.get("command")
+        if isinstance(command, list) and command and all(isinstance(arg, str) and "\0" not in arg for arg in command):
+            command = json.dumps(command, ensure_ascii=False)
         if not isinstance(command, str) or not command.strip():
             continue
         name = check.get("name")
@@ -654,10 +654,9 @@ def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
 def format_suite_block(verification_details: dict[str, Any] | None) -> str:
     """One line per detected verification check, or '' when none.
 
-    Surfaces the repo-aware test toolset (e.g. ``uv run pytest``) that
-    ``run_profile.py`` detected, so it is visible in the chat receipt instead
-    of buried in the collapsed profile-runner JSON. ``verification_details`` is
-    the parsed ``ProfileRunResult.to_details()`` dict.
+    Receipts publish check names and results. Command lines can contain local
+    paths or private arguments, so they stay in local verification details.
+    ``verification_details`` is the parsed ``ProfileRunResult.to_details()`` dict.
     """
     if not isinstance(verification_details, dict):
         return ""
@@ -668,11 +667,10 @@ def format_suite_block(verification_details: dict[str, Any] | None) -> str:
     for check in checks:
         if not isinstance(check, dict):
             continue
-        command = check.get("command", "?")
         name = check.get("name", "?")
         scope = "required" if check.get("required") else "optional"
         status = check.get("status", "?")
-        lines.append(f"  - {command}  ({name}, {scope}) → {status}")
+        lines.append(f"  - {name} ({scope}) → {status}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 

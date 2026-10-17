@@ -206,7 +206,7 @@ def loop_request_times_from_entry(
     append-only request log (``loop_state.read_request_log``); records in
     ``entry`` are the older state.json form, still honored.
     """
-    if isinstance(entry, dict) and entry.get("review_requests_incomplete"):
+    if isinstance(entry, dict) and (entry.get("review_requests_incomplete") or entry.get("review_request_in_flight")):
         return None
     if logged and any(isinstance(item, dict) and item.get("incomplete") for item in logged):
         return None
@@ -216,13 +216,14 @@ def loop_request_times_from_entry(
     requests = (stored if isinstance(stored, list) else []) + (logged or [])
     out = []
     for item in requests:
-        if not isinstance(item, dict) or item.get("countable") is False:
+        if not isinstance(item, dict) or item.get("countable") is False or item.get("initial_review") is True:
             continue
         if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
             continue
         at = item.get("at")
-        if isinstance(at, str) and at:
-            out.append(at)
+        if _parse_instant(at) is None:
+            return None
+        out.append(at)
     return sorted(out)
 
 
@@ -408,3 +409,63 @@ def discover_candidates(
             seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
         )
     ]
+
+
+def recorded_review_request_times(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
+    """Read loop-owned re-review timestamps; None means unknown, not empty."""
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        # Unknown provenance must not look like zero cap usage after a POST.
+        return None
+    requests = entry.get("review_requests")
+    if not isinstance(requests, list):
+        return None
+    out = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        if item.get("initial_review") is True:
+            continue
+        at = item.get("at")
+        if _parse_instant(at) is None:
+            return None
+        out.append(at)
+    return sorted(out)
+
+
+def merge_comment_receipts(comments: list[dict[str, Any]], trigger: str, receipts: Any) -> list[dict[str, Any]]:
+    """Union filtered GitHub comments with successful local posts by database ID."""
+    out = []
+    observed_ids = set()
+    for comment in comments:
+        comment_id = comment.get("fullDatabaseId")
+        if isinstance(comment_id, str) and comment_id.isascii() and comment_id.isdecimal():
+            comment_id = int(comment_id)
+        if type(comment_id) is not int or comment_id <= 0:
+            comment_id = comment.get("id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if known_id and comment_id in observed_ids:
+            continue
+        out.append(comment)
+        if known_id:
+            observed_ids.add(comment_id)
+    vendor = review_vendors.vendor_for(trigger)
+    for receipt in receipts if isinstance(receipts, list) else []:
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("reviewer"), str):
+            continue
+        reviewer = receipt["reviewer"]
+        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
+        comment_id = receipt.get("comment_id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if matches and (not known_id or comment_id not in observed_ids):
+            out.append({"createdAt": receipt.get("at"), "localReceipt": True})
+            if known_id:
+                observed_ids.add(comment_id)
+    return out
+
+
+def known_rereview_times(receipts: Any, vendor: review_vendors.ReviewVendor) -> list[str]:
+    return [receipt["at"] for receipt in receipts if isinstance(receipt, dict)
+            and review_vendors.vendor_for(receipt.get("reviewer")) is vendor
+            and receipt.get("initial_review") is False and _parse_instant(receipt.get("at")) is not None] if isinstance(receipts, list) else []

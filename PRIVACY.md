@@ -1,6 +1,6 @@
 # Privacy and Data Handling
 
-**Last updated: 2026-06-04**
+**Last updated: 2026-10-17**
 
 ## Summary
 
@@ -32,13 +32,13 @@ The plugin may use GitHub APIs to:
 
 1. Fetch pull request metadata
 2. Fetch review threads and comments
-3. Resolve outdated review threads
-4. Resolve threads that were addressed by a substantive maintainer reply
+3. Resolve outdated review threads only when explicitly requested
+4. Resolve explicitly deferred owner/collaborator threads only when explicitly requested
 5. Post pull request comments
 6. Update sticky receipt comments
 7. Request Gemini Code Assist re review
 
-The plugin may also push commits when Claude Code applies fixes and the user allows the loop to continue.
+The plugin may also push commits when the user authorizes a fix loop. The verified publish helper gates the changed files against required checks on Claude Code and Codex.
 
 The plugin does not merge pull requests, approve reviews, submit GitHub reviews, change repository settings, or grant repository access.
 
@@ -119,7 +119,7 @@ This plugin does not include telemetry.
 
 It does not send analytics, usage events, crash reports, repository names, usernames, prompts, PR content, or command output to the plugin author.
 
-Workflow metrics (the per-run summary and the `--stats` aggregate) are generated and stored locally by default and are never exported. There is no remote export path; any future remote export would require explicit user configuration.
+Detailed run records and the `--stats` aggregate are stored locally. Loop receipt summaries are posted to GitHub and include counts, repository-relative finding paths, verification check names, and results. Verification command lines and runner output remain local because they can contain machine paths or private arguments.
 
 ## User controls
 

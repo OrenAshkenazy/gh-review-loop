@@ -151,8 +151,8 @@ def test_phrase_for_returns_the_exact_vendor_phrase():
     )
 
 
-def test_phrase_for_unknown_reviewer_is_none():
-    assert reviewer_resolver.phrase_for("coderabbitai") is None
+def test_phrase_for_coderabbit_is_its_review_command():
+    assert reviewer_resolver.phrase_for("coderabbitai") == "@coderabbitai review"
 
 
 def test_make_reviewer_record_marks_codex_as_not_self_starting():

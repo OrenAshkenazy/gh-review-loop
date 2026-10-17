@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import os
+import sys
 
 PURPLE = "\033[95m"
 RESET = "\033[0m"
+
+
+def configure_utf8_output() -> None:
+    """Keep redirected Windows CLI output compatible with gh and JSON readers."""
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8")
 
 
 def colors_enabled(*, no_color: bool = False) -> bool:

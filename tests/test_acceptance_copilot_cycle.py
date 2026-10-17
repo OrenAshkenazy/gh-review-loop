@@ -1,7 +1,7 @@
 """Acceptance test: one full Copilot review cycle over recorded PR payloads.
 
 Copilot differs from Codex in three ways this test pins: it is re-reviewed by
-a review request (REST), not a comment; the cap counts ReviewRequestedEvents
+a review request, not a comment; the cap counts ReviewRequestedEvents
 the agent caused after the first completed review, not mentions; and
 severities live in the review overview, not in the inline comments. The wait
 is anchored on the head commit. Only the `gh` boundary is stubbed.
@@ -147,7 +147,8 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
     monkeypatch.setattr(
         request_rereview, "request_state",
         lambda *a, **k: {"state": "ABSENT", "head": NEW_HEAD, "pending_since": None,
-                         "first_completed_review_at": "2026-10-07T15:46:14Z"},
+                         "first_completed_review_at": "2026-10-07T15:46:14Z",
+                         "rerequest_ids": ("PR_widget", "BOT_copilot")},
     )
     monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
     requested = {}
@@ -358,3 +359,93 @@ def test_human_mode_names_the_clean_blocker(loop, monkeypatch, capsys):
 def test_copilot_vendor_facts_used_by_this_cycle():
     assert review_vendors.COPILOT.request_login == COPILOT_REQUEST
     assert review_vendors.vendor_for("Copilot") is review_vendors.COPILOT
+
+
+@pytest.mark.parametrize("unparsed", [False, True])
+@pytest.mark.parametrize("linked", [False, True])
+def test_filtered_body_findings_only_block_clean_when_unparsed(loop, monkeypatch, capsys, unparsed, linked):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    payload["reviewThreads"] = {"nodes": []}
+    review = payload["reviews"]["nodes"][-1]
+    review["body"] = '''<!-- ccr-overview-v2 -->
+### 🟡 Changes recommended
+<summary><strong>0 open findings</strong></summary>
+<details><summary><picture><img alt="Low severity"></picture> Rename test</summary>
+`tests/example.py:1`
+The test name is misleading.
+</details>
+'''
+    if unparsed:
+        review["body"] += '<picture><img alt="Medium severity"></picture> Unrecognized markup'
+    if linked:
+        review["body"] = review["body"].replace('Rename test</summary>', '[Rename test](#discussion_r11)</summary>')
+        review["body"] = review["body"].replace('0 open findings', '2 open findings' if unparsed else '1 open findings')
+        if unparsed:
+            review["body"] = review["body"].replace('<picture><img alt="Medium severity"></picture> Unrecognized markup', 'Unparsed iconless finding')
+    loop["payload"] = payload
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed", "--min-severity", "high")
+    assert result["threads"] == []
+    assert result["loopStatus"]["cleanBlockedBy"] == ("overview_reports_open_findings" if unparsed else None)
+
+
+@pytest.mark.parametrize("state", ["open", "resolved", "outdated", "deferred"])
+def test_linked_body_finding_preserves_live_thread_state(loop, monkeypatch, capsys, state):
+    payload = copy.deepcopy(FIXTURE["initial"])
+    thread = payload["reviewThreads"]["nodes"][0]
+    payload["reviewThreads"]["nodes"] = [thread]
+    thread["isResolved"] = state == "resolved"
+    thread["isOutdated"] = state == "outdated"
+    if state == "deferred":
+        thread["comments"]["nodes"].append({"author": {"login": "maintainer", "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": "/review-loop defer", "createdAt": "2026-10-07T17:00:00Z"})
+    payload["reviews"]["nodes"][-1]["body"] = '''<!-- ccr-overview-v2 -->
+### 🟡 Changes recommended
+<summary><strong>1 open findings</strong></summary>
+<details><summary><picture><img alt="Low severity"></picture> [Existing finding](#discussion_r4208919854)</summary>
+`tests/example.py:1`
+This finding already has an inline thread.
+</details>
+'''
+    loop["payload"] = payload
+    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
+    assert len(result["threads"]) == (1 if state == "open" else 0)
+    assert all(not finding.get("isReviewBodyFinding") for finding in result["threads"])
+    assert result["loopStatus"]["cleanBlockedBy"] is None
+
+
+@pytest.mark.parametrize("scenario", ["actionable", "filtered", "unparsed", "pending"])
+def test_terminal_summary_accounts_for_body_findings_and_newer_requests(loop, monkeypatch, capsys, scenario):
+    from metrics import runs_log_path
+
+    payload = copy.deepcopy(FIXTURE["initial"])
+    payload["reviewThreads"] = {"nodes": []}
+    payload["reviews"]["nodes"][-1]["body"] = '''<!-- ccr-overview-v2 -->
+### Changes recommended
+**0 open findings**
+<details><summary><picture><img alt="Low severity"></picture> Rename test</summary>
+`tests/example.py:1`
+The test name is misleading.
+</details>
+'''
+    if scenario == "unparsed":
+        payload["reviews"]["nodes"][-1]["body"] += '<picture><img alt="Medium severity"></picture> Unrecognized markup'
+    if scenario == "pending":
+        payload["timelineItems"]["nodes"].append({
+            "__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:30:00Z",
+            "actor": {"login": AGENT}, "requestedReviewer": {"login": COPILOT},
+        })
+    loop["payload"] = payload
+    posted = []
+    monkeypatch.setattr(fgt, "post_or_update_sticky_receipt", lambda pr, body: posted.append(body) or 99)
+    argv = ["fetch_gemini_threads.py", "--pr", "https://github.com/acme/widget/pull/159",
+            "--reviewer", COPILOT, "--reviewer-source", "confirmed", "--record-run",
+            "--verification", "passed", "--gemini-confirmed", "--judge-mode", "off"]
+    if scenario != "actionable":
+        argv.extend(["--min-severity", "high"])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert fgt.main() == 0
+
+    capsys.readouterr()
+    record = json.loads(runs_log_path().read_text(encoding="utf-8").splitlines()[-1])
+    assert (record["outcome"] == "clean") is (scenario == "filtered")
+    assert ("DONE" if scenario == "filtered" else "STOPPED") in posted[0]

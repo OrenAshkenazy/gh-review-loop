@@ -46,6 +46,19 @@ def _isolate_user_state(tmp_path_factory, monkeypatch):
     themselves and override this.
     """
     monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path_factory.mktemp("ggrl-state")))
+    isolated_home = str(tmp_path_factory.mktemp("ggrl-home"))
+    monkeypatch.setenv("HOME", isolated_home)
+    monkeypatch.setenv("USERPROFILE", isolated_home)
+
+
+@pytest.fixture
+def symlinks_available(tmp_path):
+    target = tmp_path / "symlink-target"
+    target.mkdir()
+    try:
+        (tmp_path / "symlink-probe").symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("filesystem or account does not allow creating symlinks")
 
 
 def stub_cap_check_known_under_cap(monkeypatch):
@@ -55,7 +68,8 @@ def stub_cap_check_known_under_cap(monkeypatch):
     `gh`. Since an unknown count now refuses to post (an uncountable write is
     an uncapped write), "inert" means a *known* count of zero, not an unknown
     one. Unit tests of the counter pass an explicit runner and still reach the
-    real function.
+    real function. Write snapshots are neutralized in the same way;
+    explicit-runner tests retain the real reader.
     """
     import request_rereview
 
@@ -66,5 +80,20 @@ def stub_cap_check_known_under_cap(monkeypatch):
             return 0
         return real_count(repo, pr, trigger, agent_login, runner=runner)
 
+    real_confirm = request_rereview.confirm_posted_after_uncertain
+    def confirm_or_false(repo, pr, vendor, login, at, runner=None, **kwargs):
+        if runner is None:
+            return False
+        return real_confirm(repo, pr, vendor, login, at, runner=runner, **kwargs)
+    monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", confirm_or_false)
     monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
     monkeypatch.setattr(request_rereview, "count_agent_pings", count_or_zero)
+    for name in ("_snapshot_request_event_ids", "_snapshot_comment_ids"):
+        real_snapshot = getattr(request_rereview, name)
+
+        def snapshot_or_empty(repo, pr, runner=None, _reader=real_snapshot):
+            if runner is None:
+                return []
+            return _reader(repo, pr, runner=runner)
+
+        monkeypatch.setattr(request_rereview, name, snapshot_or_empty)

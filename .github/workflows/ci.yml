@@ -4,13 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,19 +25,21 @@ jobs:
       - name: Lint (ruff)
         run: ruff check plugins/ tests/
       - name: Compile scripts
-        run: python -m py_compile plugins/gh-review-loop/skills/gh-review-loop/scripts/*.py
+        shell: bash
+        run: |
+          python -m py_compile plugins/gh-review-loop/skills/gh-review-loop/scripts/*.py
       - name: Validate plugin packaging
+        shell: bash
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
           root = Path("plugins/gh-review-loop")
-          claude = json.loads((root / ".claude-plugin/plugin.json").read_text())
-          codex = json.loads((root / ".codex-plugin/plugin.json").read_text())
-          marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text())
-          catalog = json.loads(Path(".claude-plugin/marketplace.json").read_text())
-          hooks = json.loads((root / "hooks/hooks.json").read_text())
+          claude = json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+          codex = json.loads((root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+          marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
+          catalog = json.loads(Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
 
           assert claude["name"] == codex["name"] == "gh-review-loop"
           assert claude["version"] == codex["version"]
@@ -52,13 +56,15 @@ jobs:
           assert claude["keywords"] == codex["keywords"]
           assert codex["skills"] == "./skills/"
           assert (root / "skills/gh-review-loop/SKILL.md").exists()
-          assert (root / "hooks/hooks.json").exists()
-          assert "hooks" in hooks and "PreToolUse" in hooks["hooks"] and "Stop" in hooks["hooks"]
+          assert not (root / "hooks/hooks.json").exists()
+          for script in ("start_loop.py", "publish_changes.py", "finish_loop.py"):
+              assert (root / "skills/gh-review-loop/scripts" / script).is_file()
           assert marketplace["plugins"][0]["name"] == "gh-review-loop"
           assert marketplace["plugins"][0]["source"] == {
               "source": "local",
               "path": "./plugins/gh-review-loop",
           }
+
           PY
       - name: Pytest
         run: pytest tests/ -v

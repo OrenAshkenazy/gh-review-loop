@@ -6,7 +6,7 @@ After printing the `[loop] Summary` block, when remaining actionable threads exi
 
 **Classification (in priority order):**
 
-1. Judge verdict `needs_human` → bucket 1.
+1. Finding still awaiting a user decision, identified by the agent or a judge verdict `needs_human` → bucket 1.
 2. Thread from a prior reviewer pass where you applied a code fix at that file/line this session → bucket 3.
 3. All other `valid_actionable` threads (new from latest review, or no fix attempted) → bucket 2.
 
@@ -15,6 +15,8 @@ After printing the `[loop] Summary` block, when remaining actionable threads exi
 ## Bucket 1 — Human decision required
 
 Product/format/design calls, not code changes.
+
+Use [User decisions](user-decisions.md) to ask about unanswered findings and act on the answer. If the user is away, report the pending decision without treating it as a deferral or a clean PR.
 
 ```
 Human decision required
@@ -58,7 +60,7 @@ Remaining because cap was reached
 
 ## Bucket 3 — Already fixed but still unresolved on GitHub
 
-Fix applied this loop, thread still UNRESOLVED. Not open work — the thread auto-resolves as OUTDATED on the next reviewer pass.
+Fix applied this loop, thread still UNRESOLVED. Await reviewer confirmation; an OUTDATED anchor alone does not establish that the finding was fixed.
 
 ```
 Already fixed but still unresolved on GitHub
@@ -66,7 +68,7 @@ Already fixed but still unresolved on GitHub
 1. <file>:<line> · <GitHub comment URL>
    Finding: <what the reviewer originally flagged>
    Status: fix applied in this session
-   Why still shown: code change shifts the line anchor; thread auto-resolves as OUTDATED on the next reviewer pass
+   Why still shown: the anchor may become OUTDATED; reviewer confirmation is still required
 ```
 
 ## After the buckets

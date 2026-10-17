@@ -18,7 +18,7 @@ import fetch_gemini_threads as fgt
 import metrics
 
 from fetch_gemini_threads import (
-    ADDRESSED_BY_REPLY_MIN_CHARS,
+    ADDRESSED_BY_REPLY_MARKER,
     PAGE_LIMIT_REVIEW_THREADS,
     PAGE_LIMIT_THREAD_COMMENTS,
     STICKY_RECEIPT_MARKER,
@@ -91,11 +91,11 @@ def make_thread(*, resolved=False, outdated=False, comments):
 
 
 def bot_comment(body="Use snake_case here."):
-    return {"author": {"login": BOT}, "body": body}
+    return {"author": {"login": BOT}, "body": body, "createdAt": "2026-10-15T10:00:00Z"}
 
 
 def human_comment(body, login="alice"):
-    return {"author": {"login": login}, "body": body}
+    return {"author": {"login": login, "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": body, "createdAt": "2026-10-15T11:00:00Z"}
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class TestIsAddressedByReply:
         assert is_addressed_by_reply(t, BOT) is False
 
     def test_substantive_reply_returns_true(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         t = make_thread(comments=[bot_comment(), human_comment(long)])
         assert is_addressed_by_reply(t, BOT) is True
 
@@ -144,22 +144,22 @@ class TestIsAddressedByReply:
         assert is_addressed_by_reply(t, BOT) is False
 
     def test_resolved_returns_false(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         t = make_thread(resolved=True, comments=[bot_comment(), human_comment(long)])
         assert is_addressed_by_reply(t, BOT) is False
 
     def test_outdated_returns_false(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         t = make_thread(outdated=True, comments=[bot_comment(), human_comment(long)])
         assert is_addressed_by_reply(t, BOT) is False
 
-    def test_exactly_min_chars_returns_true(self):
-        body = "x" * ADDRESSED_BY_REPLY_MIN_CHARS
+    def test_explicit_marker_returns_true(self):
+        body = ADDRESSED_BY_REPLY_MARKER
         t = make_thread(comments=[bot_comment(), human_comment(body)])
         assert is_addressed_by_reply(t, BOT) is True
 
-    def test_one_below_min_chars_returns_false(self):
-        body = "x" * (ADDRESSED_BY_REPLY_MIN_CHARS - 1)
+    def test_long_objection_is_still_actionable(self):
+        body = "This is still broken; please fix the reported problem."
         t = make_thread(comments=[bot_comment(), human_comment(body)])
         assert is_addressed_by_reply(t, BOT) is False
 
@@ -174,7 +174,7 @@ def _pr_with_threads(threads):
 
 class TestThreadFiltering:
     def test_addressed_by_reply_threads_isolation(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         threads = [
             make_thread(comments=[bot_comment()]),  # actionable
             make_thread(comments=[bot_comment(), human_comment(long)]),  # addressed
@@ -184,7 +184,7 @@ class TestThreadFiltering:
         assert len(addressed_by_reply_threads(_pr_with_threads(threads), BOT)) == 1
 
     def test_filter_threads_default_excludes_addressed_by_reply(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         threads = [
             make_thread(comments=[bot_comment()]),
             make_thread(comments=[bot_comment(), human_comment(long)]),
@@ -194,7 +194,7 @@ class TestThreadFiltering:
         assert len(result) == 1
 
     def test_filter_threads_include_addressed_by_reply(self):
-        long = "Wontfix: existing convention in this module is camelCase."
+        long = ADDRESSED_BY_REPLY_MARKER + "\nExisting convention in this module is camelCase."
         threads = [
             make_thread(comments=[bot_comment()]),
             make_thread(comments=[bot_comment(), human_comment(long)]),
@@ -562,6 +562,20 @@ class TestReviewerSelectionCli:
         monkeypatch.setattr(fgt, "resolve_pr", lambda arg: self.PR)
         monkeypatch.setattr(fgt, "fetch_threads", lambda pr: self._pull_request())
         monkeypatch.setattr(fgt, "gh_authenticated_login", lambda: "codex-agent")
+
+    @pytest.mark.parametrize("opt_in", [False, True])
+    def test_fetch_resolution_requires_explicit_opt_in(self, tmp_path, monkeypatch, capsys, opt_in):
+        self._patch_common(monkeypatch, tmp_path)
+        calls = []
+        monkeypatch.setattr(fgt, "resolve_outdated_threads", lambda *a, **k: calls.append("outdated") or 0)
+        monkeypatch.setattr(fgt, "resolve_addressed_by_reply", lambda *a, **k: calls.append("deferred") or 0)
+        args = ["fetch_gemini_threads.py", "--pr", "https://github.com/o/r/pull/5", "--reviewer", "coderabbitai", "--format", "json"]
+        if opt_in:
+            args.extend(["--resolve-outdated", "--resolve-addressed-by-reply"])
+        monkeypatch.setattr(sys, "argv", args)
+        assert fgt.main() == 0
+        assert calls == (["outdated", "deferred"] if opt_in else [])
+        json.loads(capsys.readouterr().out)
 
     def test_default_author_is_marked_unconfirmed_in_json(
         self, tmp_path, monkeypatch, capsys

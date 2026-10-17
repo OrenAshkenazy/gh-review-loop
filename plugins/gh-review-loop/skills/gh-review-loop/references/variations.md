@@ -32,6 +32,6 @@ This table is authoritative; if a phrasing isn't here, fall back to defaults.
 | **Customize profile** | "add mypy to this repo's checks" / "change the verification checks to X" | Edit checks, `save_profile(..., source="customized")` |
 | **Skip profile** | "skip verification profile" / "use ad-hoc checks for this repo" | `save_profile(repo, source="skipped")` — suppress automatic re-prompt |
 
-If the user explicitly opts out of any default behavior (e.g. "don't auto-resolve anything"), respect it for the rest of the session via `--no-resolve-outdated --no-resolve-addressed-by-reply`.
+Resolution is off by default. Explicit user opt-in enables `--resolve-outdated` / `--resolve-addressed-by-reply`; respect later opt-out for the rest of the session.
 
 One configured reviewer bot per run — the loop does not aggregate several reviewers. Severity parsing reads markdown image alt text (shared scale and Codex `P0`–`P3`); reviewers without either marker fall back to `unknown`.

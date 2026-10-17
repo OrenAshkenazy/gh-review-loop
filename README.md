@@ -10,7 +10,7 @@
 
 A skill for **Claude Code** and **Codex** that clears AI reviewer feedback on your PR without you leaving the terminal. It reads real GitHub review-thread state, fixes what's actionable, **sweeps the sibling instances the reviewer didn't flag**, gates every push on your repo's own tests, and asks for re-review, hard-capped so it can't spam the PR.
 
-Works with whatever AI reviewer assistance your repo already has. MIT, no server, no account, no vendor plan.
+Works with whatever AI reviewer assistance your repo already has. MIT, no plugin backend or plugin account; the selected reviewer may require its own plan.
 
 ## Install
 
@@ -42,11 +42,11 @@ Checkable claims, with the honest scope of each:
 
 | Capability | Scope | Where |
 |---|---|---|
-| Thread-state filtering | `reviewThreads` GraphQL, `isResolved` / `isOutdated`, plus `ADDRESSED_BY_REPLY` for maintainer *"wontfix"* replies | `fetch_gemini_threads.py` |
+| Thread-state filtering | `reviewThreads` GraphQL, `isResolved` / `isOutdated`, plus `ADDRESSED_BY_REPLY` for explicit OWNER/COLLABORATOR `/review-loop defer` replies; resolution is off by default | `fetch_gemini_threads.py` |
 | Pattern clustering + sibling sweep | Findings cluster by signature and by the shape of the code they anchor to, so one defect described two ways still counts as one pattern. Two-site token sweeps report lines matching the shared tokens; one-site ranged sweeps report duplicate blocks as `mirror` candidates — text-identical by default in every language, comment-insensitive only for Python via stdlib `tokenize`, never across language families. Refuses generic shapes and never reads outside the changed files | `cluster_findings.py`, `sweep_siblings.py` |
-| Verification gate | Auto-detects Python / Node / Rust / Go. Required-check failure flips the run to `verification: failed`. **`Skip` is an offered menu option** — pick it and there is no gate | `detect_profile.py`, `run_profile.py` |
+| Verification gate | Auto-detects Python / Node / Rust / Go. Required-check failure flips the run to `verification: failed`. `publish_changes.py` requires a confirmed/customized profile with at least one required check; skipped/empty/optional-only profiles block publication | `detect_profile.py`, `run_profile.py`, `publish_changes.py` |
 | Cycle cap | Hard count, agent-scoped: only the agent's own pings consume it. Enforced at the write — `request_rereview.py` counts prior pings and refuses past the cap, rather than trusting the agent to stop | `request_rereview.py` |
-| Severity ordering | Parses Codex `![P0]`–`![P3]` badges, `![critical]`–`![low]` image alt text, reviewer-leading plain-text `[P0]`–`[P3]` prefixes, and Copilot's per-review overview (`High severity` … alt text). Unrecognized markers yield `unknown`, kept by default | `thread_severity()`, `cluster_findings._severity()` |
+| Severity ordering | Parses Codex `![P0]`–`![P3]` badges, `![critical]`–`![low]` image alt text, CodeRabbit Potential issue Critical/Major/Minor headers, reviewer-leading plain-text `[P0]`–`[P3]` prefixes, and Copilot's per-review overview (`High severity` … alt text). Unrecognized markers yield `unknown`, kept by default | `thread_severity()`, `cluster_findings._severity()` |
 | Optional judge | Second-model triage per finding (`false_positive`, `needs_human`, …). Off by default, needs an OpenAI key | `judge.py` |
 | Audit trail + local stats | One live-edited PR comment, per-run receipts, per-repo aggregates via `--stats`. Never transmitted | `metrics.py` |
 | Zero infrastructure | Stdlib Python + `gh` + `git`. No SDK, no server, no account | all scripts |
@@ -62,8 +62,8 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 - **Claude Code or Codex** with plugin support.
 - **`gh` CLI**, authenticated against the repos you'll run this on.
 - **Python 3.10+** and **git**.
-- **A reviewer bot that posts GitHub review threads on your PRs.** Codex, Gemini Code Assist and GitHub Copilot code review ship with full vendor knowledge. CodeRabbit, Qodo, Sourcery and others work once you give the loop their author login and re-review mention. There is no assumed default: on a PR with no reviewer configured the loop asks instead of guessing.
-- **For Copilot:** a Copilot subscription with code review enabled on the repo, and a `gh` token allowed to request reviewers on the PR (write access). Copilot reviews only when asked, so the loop sends the review request for you. Without that plan GitHub accepts the request and silently adds nobody; the loop detects that and stops with `review_request_rejected` / `not_enabled` instead of waiting.
+- **A reviewer bot that posts GitHub review threads on your PRs.** Codex, CodeRabbit, Gemini Code Assist and GitHub Copilot code review ship with full vendor knowledge. Qodo, Sourcery and others work once you give the loop their author login and re-review mention. There is no assumed default: on a PR with no reviewer configured the loop asks instead of guessing.
+- **For Copilot:** a Copilot subscription with code review enabled on the repo, and a `gh` token allowed to request reviewers on the PR (write access). The loop sends native review requests when needed; Copilot can also be configured to review new pushes automatically. Without that plan GitHub accepts the request and silently adds nobody; the loop detects that and stops with `review_request_rejected` / `not_enabled` instead of waiting.
 
 > **Note on Gemini Code Assist.** Gemini is a first-class reviewer here and works exactly as it always did, automatic first review included, on the enterprise GitHub app. Google [deprecated the consumer app 2026-06-18 and shut it down 2026-07-17](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review), so it can no longer be installed on the free tier. Nothing about its support here changed. Select it with `--reviewer gemini-code-assist`.
 
@@ -73,12 +73,13 @@ If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https:/
 |---|---|---|---|
 | Codex (`chatgpt-codex-connector`) | Built-in, full support. Offered first on an unconfigured PR because it reviews on request, so accepting starts a cycle immediately | `@codex review` | `P0`–`P3`, normalized |
 | Gemini Code Assist | Built-in, full support. Needs the **enterprise** GitHub app ([consumer app shut down](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review)) | `@gemini-code-assist please review…` | `critical` / `high` / `medium` / `low` |
-| GitHub Copilot (`copilot-pull-request-reviewer`) | Built-in, full support. Reviews only on request; the loop asks via the GitHub reviewer-request API, never a comment, and refuses to re-ask while a request is still pending or the current head is already reviewed | Review request (`gh api … /requested_reviewers`) | `High` / `Medium` / `Low` from the review overview, per head commit |
-| CodeRabbit, Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
+| GitHub Copilot (`copilot-pull-request-reviewer`) | Built-in, full support. The loop asks via the GitHub reviewer-request API, never a comment, and refuses to re-ask while a request is still pending or the current head is already reviewed | Initial request: REST `/requested_reviewers`; re-review: GraphQL `rerequestReviews` | `High` / `Medium` / `Low` from the review overview, per head commit |
+| CodeRabbit (`coderabbitai`) | Built-in | `@coderabbitai review` | `Critical` / `Major` / `Minor`, normalized |
+| Qodo, Sourcery, … | Configurable | Supplied via `--review-trigger-mention` | Leading `[P0]`–`[P3]` text markers are recognized when present; other formats yield `unknown` |
 
 `--list-reviewers` discovers which bots have commented on your PR; `--reviewer` persists your choice per PR.
 
-**Severity caveat, stated plainly:** four marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers), and Copilot's review-overview list (`alt="High severity"` next to a link to each finding). Copilot grades live in the overview, not the inline comment, so a finding is graded only by an overview that links to it; if the overview is missing or unparseable the finding stays `unknown` and is kept. Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
+**Severity caveat, stated plainly:** five marker conventions are parsed: Codex `![P0]`–`![P3]` image badges, Gemini `![critical]`–`![low]` image alt text, CodeRabbit severity headers, reviewer-leading plain-text `[P0]`–`[P3]` prefixes (including those used by some non-built-in reviewers), and Copilot's review-overview list (`alt="High severity"` next to a link to each finding). Copilot grades live in the overview, not the inline comment, so a finding is graded only by an overview that links to it; if the overview is missing or unparseable the finding stays `unknown` and is kept. Other marker formats still yield `unknown`. With unknown severity, `--min-severity high` retains findings by default while `--drop-unknown-severity` removes them. Use severity filtering only when the reviewer's format is recognized.
 
 ## Why this exists
 
@@ -96,7 +97,7 @@ Intersecting across sites is the token sweep's safety property: a candidate has 
 
 **It has a brake, not a timeout.** The cycle cap is a hard count of re-review requests, default 3, and it counts *only the agent's own pings* — a human asking the bot to look again doesn't burn a cycle. That's a bound on rounds, not a "stop when the bot goes quiet for ten minutes" heuristic.
 
-Everything else it does — reading `isResolved`/`isOutdated` off the `reviewThreads` GraphQL, honoring a maintainer's *"wontfix"* reply, sorting by severity, keeping one live-edited status comment instead of comment spam — is table stakes done carefully. Correct, but not why you'd pick this.
+Everything else it does — reading `isResolved`/`isOutdated` off the `reviewThreads` GraphQL, honoring an explicit maintainer `/review-loop defer` reply, sorting by severity, keeping one live-edited status comment instead of comment spam — is table stakes done carefully. Correct, but not why you'd pick this.
 
 
 ## Other install paths
@@ -187,7 +188,7 @@ See [`SKILL.md`](plugins/gh-review-loop/skills/gh-review-loop/SKILL.md) for the 
 
 On the first cycle with actionable findings, the agent scans for build signals (`pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`) and offers a short preset menu: **All detected · Tests only · Skip · Customize**. Your pick persists under `profiles["owner/repo"]` in `~/.config/gh-review-loop/preferences.json`; later runs are prompt-free.
 
-Every saved check is a required gate — a failure flips the verify step to `--verification failed`. **`Skip` is remembered** and leaves the loop on ad-hoc verification with no gate; saying *"set up a verification profile for this repo"* re-runs detection and overrides it.
+Every saved check is a required gate — a failure flips the verify step to `--verification failed`. **`Skip` is remembered** and blocks publication until a confirmed/customized profile with at least one required check is saved; saying *"set up a verification profile for this repo"* re-runs detection and overrides it.
 
 ```json
 {
@@ -301,7 +302,7 @@ Judge settings live in the same file; the script preserves `max_rereview_request
 
 The skill drives a set of small stdlib Python scripts under [`plugins/gh-review-loop/skills/gh-review-loop/scripts/`](plugins/gh-review-loop/skills/gh-review-loop/scripts/). Each is independently runnable and `--json`-clean on stdout with progress on stderr, so you can drive the loop by hand or from CI.
 
-Every write the scripts make to your PR supports `--dry-run`, including the re-review request. The `git push` itself is an ordinary git command run by the agent, not a script write.
+Every write the scripts make to your PR supports `--dry-run`, including the re-review request. `publish_changes.py` performs the verified commit and push; its `--dry-run` verifies without staging, committing, or pushing.
 
 ## Feedback wanted
 
@@ -318,3 +319,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Publication safeguards and platform support
+
+Use the installed skill's explicit lifecycle: `start_loop.py` before fixes, `publish_changes.py` for each publication, and `finish_loop.py` at loop end. It validates PR/checkout/remote identity, a fetched run, known cap, explicit changed paths, and a required verification profile before committing. It runs the full verification profile once and emits the cycle receipt before publication; finish reuses those results without rerunning checks. It rejects edits made during verification and commit-hook changes, never forces a push, and preserves local commits after failures. Manual Git commands are outside this enforcement.
+
+Python argv arrays preserve Windows paths and quotes; string commands use host quoting. The test matrix covers Ubuntu and Windows on Python 3.10–3.13. No lifecycle hooks or POSIX shell guards are installed; unavailable symlink capabilities are marked separately.
+
+For Copilot, publication uses the native request counter, and guarded requests recheck the open PR's head immediately before each write.
+
+Copilot review effort selection is not exposed by this version; GitHub determines the effort from its existing settings and prior PR selection.

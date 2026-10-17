@@ -26,20 +26,19 @@ import metrics  # noqa: E402 — sibling module, pure/stdlib-only
 import cluster_findings  # noqa: E402 — sibling module, pure/stdlib-only
 import reviewer_resolver  # noqa: E402 — sibling module, pure/stdlib-only
 import review_vendors  # noqa: E402 — sibling module, pure/stdlib-only
-from loop_color import color_loop, colors_enabled  # noqa: E402 — sibling module
+from loop_color import color_loop, colors_enabled, configure_utf8_output  # noqa: E402 — sibling module
 from loop_state import (  # noqa: E402 — sibling module, stdlib-only
-    any_active_run,
-    clear_sentinel,
-    find_active_run,  # noqa: F401 — re-exported; hooks/tests import via this module
+    any_active_run,  # noqa: F401 — compatibility re-export for state consumers
+    find_active_run,  # noqa: F401 — re-exported; state consumers import via this module
     load_sticky_state,
     migrate_legacy_state_dir,
     resolve_current_repo,
     save_sticky_state,
-    sentinel_path,
     state_dir,
-    sticky_state_path,  # noqa: F401 — re-exported; hooks/tests import via this module
-    summary_is_stale,  # noqa: F401 — re-exported; hooks/tests import via this module
-    touch_sentinel,
+    state_key_for,
+    state_transaction,
+    sticky_state_path,  # noqa: F401 — re-exported; state consumers import via this module
+    summary_is_stale,  # noqa: F401 — re-exported; state consumers import via this module
 )
 from loop_state import safe_int as _safe_int  # noqa: E402
 import loop_state  # noqa: E402
@@ -101,12 +100,17 @@ COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
     # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
-    # is matched lazily up to the `](#discussion_r` that ends it.
-    r"\[(?P<title>[^\n]*?)\]\(#discussion_r(?P<id>\d+)\)",
+    # is matched lazily up to the discussion link that ends it.
+    r"\[(?P<title>[^\n]*?)\]\((?:https?://[^\s()]+)?#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
+)
+COPILOT_BODY_FINDING_RE = re.compile(
+    r'<details[^>]*>\s*<summary>\s*<picture>.*?'
+    r'</picture>\s*(?P<title>[^<]+)</summary>(?P<body>.*?)</details>',
+    re.IGNORECASE | re.DOTALL,
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
 # "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
@@ -147,9 +151,7 @@ PAGE_LIMIT_PR_COMMENTS = 100
 PAGE_LIMIT_THREAD_COMMENTS = 50
 PAGE_LIMIT_TIMELINE = 100
 
-# Minimum reply length to count a non-bot comment as a substantive reply.
-# Filters out token acks like "ok", "ack", "thanks", "👍".
-ADDRESSED_BY_REPLY_MIN_CHARS = 30
+ADDRESSED_BY_REPLY_MARKER = "/review-loop defer"
 
 
 @dataclass(frozen=True)
@@ -173,9 +175,13 @@ def run_gh(args: list[str], cwd: str | None = None) -> Any:
             cwd=cwd,
             check=False,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=120,
         )
+    except (UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"gh output could not be read within 120s as UTF-8: {exc}") from exc
     except FileNotFoundError as exc:
         # A missing binary must surface as the same clean `error: ...` line the
         # rest of the script prints, not a traceback -- reviewers running the
@@ -265,6 +271,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
       comments(last:100) {
         nodes {
           id
+          fullDatabaseId
           author { login __typename }
           body
           createdAt
@@ -308,9 +315,11 @@ query($owner:String!, $repo:String!, $number:Int!) {
           originalStartLine
           diffSide
           comments(first:50) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               id
               author { login __typename }
+              authorAssociation
               body
               createdAt
               updatedAt
@@ -412,6 +421,34 @@ mutation($threadId:ID!) {
 """
 
 
+THREAD_COMMENTS_QUERY = """
+query($threadId:ID!, $after:String!) {
+  node(id:$threadId) {
+    ... on PullRequestReviewThread {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          authorAssociation
+          body
+          createdAt
+          updatedAt
+          url
+          path
+          line
+          startLine
+          originalLine
+          originalStartLine
+          diffHunk
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def fetch_threads(pr: PullRequest) -> dict[str, Any]:
     result = run_gh(
         [
@@ -433,8 +470,31 @@ def fetch_threads(pr: PullRequest) -> dict[str, Any]:
         pull_request = result["data"]["repository"]["pullRequest"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected gh GraphQL shape: missing {exc}") from exc
-    if isinstance(pull_request, dict):
-        backfill_reviews(pr, pull_request)
+    for thread in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+        comments = thread.get("comments") or {}
+        seen = set()
+        for _ in range(20):
+            if not (comments.get("pageInfo") or {}).get("hasNextPage"):
+                break
+            cursor = comments["pageInfo"].get("endCursor")
+            if not cursor or cursor in seen or not thread.get("id"):
+                break
+            seen.add(cursor)
+            try:
+                page = run_gh(["api", "graphql", "-f", f"query={THREAD_COMMENTS_QUERY}",
+                               "-F", f"threadId={thread['id']}", "-f", f"after={cursor}"])
+                if not isinstance(page, dict) or page.get("errors"):
+                    break
+                connection = page["data"]["node"]["comments"]
+                nodes, info = connection["nodes"], connection["pageInfo"]
+                if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes) or not isinstance(info.get("hasNextPage"), bool):
+                    break
+            except (RuntimeError, KeyError, TypeError, AttributeError) as exc:
+                print(f"warning: could not complete thread {thread.get('id')} comments: {exc}", file=sys.stderr)
+                break
+            comments.setdefault("nodes", []).extend(nodes)
+            comments["pageInfo"] = info
+    backfill_reviews(pr, pull_request)
     return pull_request
 
 
@@ -612,7 +672,7 @@ def fetch_discovery_review_authors(pr: PullRequest, *, max_pages: int = 20) -> d
 def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
     """Fetch review-thread comment authors for reviewer discovery.
 
-    Normal loop fetches intentionally stay single-page for compatibility. This
+    Normal loop fetches keep the thread list single-page for compatibility. This
     discovery-only path paginates review threads so a high-activity PR does not
     falsely appear to have no AI reviewer candidates.
     """
@@ -737,21 +797,35 @@ def resolve_thread(thread_id: str, *, dry_run: bool = False, label: str = "threa
 
 
 def is_addressed_by_reply(thread: dict[str, Any], bot_author: str) -> bool:
-    """An unresolved thread where a non-bot human posted a substantive reply.
-
-    The reply is treated as a deliberate deferral (defer/wontfix/explanation).
-    The loop should not retry fixing the same thread cycle after cycle.
-    """
+    """An explicit deferral by a repository owner or collaborator after review."""
     if thread.get("isResolved") or thread.get("isOutdated"):
         return False
-    for comment in (thread.get("comments") or {}).get("nodes") or []:
-        login = (comment.get("author") or {}).get("login") or ""
-        if not login or login == bot_author or login.endswith("[bot]"):
+    comments = thread.get("comments") or {}
+    if (comments.get("pageInfo") or {}).get("hasNextPage"):
+        return False
+    reviewer_seen = False
+    deferred = False
+    feedback_times = []
+    authorization_at = None
+    for comment in comments.get("nodes") or []:
+        author = comment.get("author") or {}
+        login = author.get("login") or ""
+        if login == bot_author:
+            feedback_at = _parse_iso_utc(comment.get("updatedAt") if "updatedAt" in comment else comment.get("createdAt"))
+            if feedback_at is None:
+                return False
+            feedback_times.append(feedback_at)
+            reviewer_seen = True
+            deferred = False
             continue
-        body = (comment.get("body") or "").strip()
-        if len(body) >= ADDRESSED_BY_REPLY_MIN_CHARS:
-            return True
-    return False
+        if not reviewer_seen or not login or author.get("__typename") == "Bot" or login.endswith("[bot]"):
+            continue
+        if comment.get("authorAssociation") not in {"OWNER", "COLLABORATOR"}:
+            continue
+        body = comment.get("body") or ""
+        deferred = bool(body.splitlines() and body.splitlines()[0] == ADDRESSED_BY_REPLY_MARKER)
+        authorization_at = _parse_iso_utc(comment.get("createdAt"))
+    return bool(deferred and authorization_at and feedback_times and authorization_at > max(feedback_times))
 
 
 def filter_threads(
@@ -857,6 +931,11 @@ def thread_severity(thread: dict[str, Any]) -> str:
         codex_match = CODEX_PRIORITY_RE.search(body)
         if codex_match:
             return CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+        author = (comment.get("author") or {}).get("login", "").removesuffix("[bot]")
+        if author.lower() == "coderabbitai":
+            match = re.search(r"^\s*_(?:⚠️?\s*)?Potential issue_\s*\|\s*_(?:[🔴🟠🟡]\s*)?(Critical|Major|Minor)_\s*$", body, re.IGNORECASE | re.MULTILINE)
+            if match:
+                return {"critical": "critical", "major": "high", "minor": "low"}[match.group(1).lower()]
     return "unknown"
 
 
@@ -1008,7 +1087,7 @@ def pagination_warnings(
     warnings: list[str] = []
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
-    if not review_request_count_complete(
+    if review_request_vendor and not review_request_count_complete(
         pull_request, review_request_vendor=review_request_vendor
     ):
         warnings.append(
@@ -1029,7 +1108,8 @@ def pagination_warnings(
         )
     for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []
-        if len(comments) >= PAGE_LIMIT_THREAD_COMMENTS:
+        page_info = (thread.get("comments") or {}).get("pageInfo") or {}
+        if page_info.get("hasNextPage", len(comments) >= PAGE_LIMIT_THREAD_COMMENTS):
             thread_id = thread.get("id") or "(unknown)"
             warnings.append(
                 f"thread {thread_id} comments hit page limit "
@@ -1177,16 +1257,23 @@ def review_body_findings(
     """Surface priority-badged findings that live in the review body.
 
     Codex usually publishes inline review comments, but it can put a finding
-    directly in the review body, where no thread exists to fetch. Only the
-    newest review counts: a later re-review supersedes older body findings, so
-    these synthetic entries go stale the same way threads do.
+    directly in the review body, where no thread exists to fetch. Copilot can
+    also embed findings in its overview. Its current-head review takes
+    precedence; otherwise the newest review supersedes older body findings.
     """
     reviews = filter_reviews(pull_request, author)
     if not reviews:
         return []
-    latest = max(reviews, key=lambda review: review.get("submittedAt") or "")
+    latest = (
+        _latest_overview_review(pull_request, author)
+        if review_vendors.vendor_for(author) is review_vendors.COPILOT
+        else max(reviews, key=lambda review: review.get("submittedAt") or "")
+    )
+    if latest is None:
+        return []
     body = latest.get("body") or ""
-    badges = list(CODEX_PRIORITY_RE.finditer(body))
+    copilot = COPILOT_OVERVIEW_MARKER in body
+    badges = list((COPILOT_BODY_FINDING_RE if copilot else CODEX_PRIORITY_RE).finditer(body))
     if not badges:
         return []
 
@@ -1200,6 +1287,16 @@ def review_body_findings(
         anchor = anchors[-1] if anchors else None
         path = anchor.group(1) if anchor else "(review body)"
         line = int(anchor.group(2)) if anchor else None
+        finding_body = body[badge.start():end].strip()
+        severity = None
+        if copilot:
+            severity = COPILOT_SEVERITY_ICON_RE.search(badge.group())
+            if not severity:
+                continue
+            finding_body = badge.group("title").strip() + "\n\n" + badge.group("body").strip()
+            location = re.search(r"`([^`\n]+):(\d+)`", badge.group("body"))
+            path = location.group(1).replace("\u200b", "") if location else "(review body)"
+            line = int(location.group(2)) if location else None
         findings.append({
             "id": f"review-body:{review_id}:{index + 1}",
             "isResolved": False,
@@ -1213,7 +1310,7 @@ def review_body_findings(
             "comments": [{
                 "id": f"{review_id}:{index + 1}",
                 "author": {"login": author},
-                "body": body[badge.start():end].strip(),
+                "body": finding_body,
                 "createdAt": latest.get("submittedAt"),
                 "updatedAt": latest.get("submittedAt"),
                 "url": latest.get("url"),
@@ -1225,6 +1322,11 @@ def review_body_findings(
                 "diffHunk": "",
             }],
         })
+        if severity:
+            findings[-1]["reviewerSeverity"] = severity.group(1).lower()
+            linked = COPILOT_FINDING_RE.search(badge.group())
+            if linked:
+                findings[-1]["reviewerDiscussionId"] = linked.group("id")
     return findings
 
 
@@ -1238,6 +1340,8 @@ def review_request_count_complete(
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
     provenance_incomplete: bool = False,
+    comment_receipts: list[dict[str, Any]] | None | object = _PROVENANCE_UNSET,
+    ambiguous_receipts: bool = False,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1250,8 +1354,15 @@ def review_request_count_complete(
     Only review-request vendors count timeline events; a comment vendor's
     count comes from PR comments, so for it this is always True.
     """
+    if comment_receipts is None or ambiguous_receipts:
+        return False
     if not review_request_vendor:
-        return True
+        return len((pull_request.get("comments") or {}).get("nodes") or []) < PAGE_LIMIT_PR_COMMENTS
+    if loop_request_times is None and isinstance(comment_receipts, list):
+        for receipt in comment_receipts:
+            vendor = review_vendors.vendor_for(receipt.get("reviewer")) if isinstance(receipt, dict) else None
+            if vendor and vendor.trigger_kind == "review_request" and receipt.get("initial_review") is not True and receipt.get("countable") is not False and _parse_iso_utc(receipt.get("at")) is None:
+                return False
     # Provenance is the third thing the count rests on: without a local record
     # the loop cannot tell its own requests from the member's clicks. That only
     # makes the number a bound when there is something to attribute — with no
@@ -1356,8 +1467,8 @@ def copilot_overview_severities(
         if parsed["unlinked_findings"]:
             warnings.append(
                 f"{parsed['unlinked_findings']} finding(s) in the {author} review "
-                f"overview at {review.get('url')} have no inline thread and are not "
-                "listed below."
+                f"overview at {review.get('url')} have no linked inline thread; "
+                "check the review-body findings and overview."
             )
     return severities, warnings
 
@@ -1412,18 +1523,10 @@ def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str
     return latest_reviewer_overview(pull_request, author)
 
 
-def latest_reviewer_overview(
+def _latest_overview_review(
     pull_request: dict[str, Any], author: str
 ) -> dict[str, Any] | None:
-    """The overview that describes the PR head, or the newest one, or None.
-
-    The newest ``author`` review *of the head commit* wins even when its body
-    is not a readable overview: it still proves the head was reviewed
-    (``covers_head: true``, ``complete: false``), which is "unparseable", not
-    "no review for head" — the waiter is already satisfied, so telling the
-    loop to wait would be a dead end. With no head review, the newest
-    readable overview is reported with ``covers_head: false``.
-    """
+    """Select the same submitted review for overview grading and body findings."""
     head = pull_request.get("headRefOid") or ""
     newest_request = newest_request_at(pull_request, author)
     listed = vendor_request_listed(pull_request, author)
@@ -1438,15 +1541,33 @@ def latest_reviewer_overview(
 
     for review in newest_first:
         if current(review):
-            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+            return review
     for review in newest_first:
         parsed = parse_copilot_overview(review.get("body"))
         if parsed is not None:
-            record = _overview_record(review, parsed, head)
-            if record["covers_head"] and not current(review):
-                record["covers_head"] = False
-            return record
+            return review
     return None
+
+
+def latest_reviewer_overview(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    """The overview that describes the PR head, or the newest one, or None.
+
+    The newest ``author`` review *of the head commit* wins even when its body
+    is not a readable overview: it still proves the head was reviewed
+    (``covers_head: true``, ``complete: false``), which is "unparseable", not
+    "no review for head" — the waiter is already satisfied, so telling the
+    loop to wait would be a dead end. With no head review, the newest
+    readable overview is reported with ``covers_head: false``.
+    """
+    review = _latest_overview_review(pull_request, author)
+    if review is None:
+        return None
+    record = _overview_record(review, parse_copilot_overview(review.get("body")), pull_request.get("headRefOid") or "")
+    if vendor_request_listed(pull_request, author) or (review.get("submittedAt") or "") < newest_request_at(pull_request, author):
+        record["covers_head"] = False
+    return record
 
 
 def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
@@ -1468,6 +1589,7 @@ def clean_blocked_by(
     *,
     review_request_vendor: bool,
     known_thread_ids: set[str] | None = None,
+    parsed_body_findings: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Why zero actionable threads is *not yet* clean for a review-request vendor.
 
@@ -1479,7 +1601,9 @@ def clean_blocked_by(
     review time, thread state is live, and the normal classification already
     decided those threads (spec §5.3). A reported finding the fetch never saw
     — no thread link, or a link to a thread that is not on the PR — still
-    blocks. Comment vendors have no overview gate.
+    blocks. Successfully parsed body findings are accounted for before
+    severity filtering; genuinely unparsed findings still block.
+    Comment vendors have no overview gate.
     """
     if threads or not review_request_vendor:
         return None
@@ -1487,18 +1611,22 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
+    body_links = {finding["reviewerDiscussionId"] for finding in parsed_body_findings or [] if finding.get("reviewerDiscussionId")}
+    unlinked_body = sum(not finding.get("reviewerDiscussionId") for finding in parsed_body_findings or [])
+    if (overview.get("unlinked_findings") or 0) > unlinked_body:
+        return "overview_reports_open_findings"
     open_findings = overview.get("open_findings") or 0
     if open_findings > 0:
-        if known_thread_ids is None or overview.get("unlinked_findings"):
+        if known_thread_ids is None:
             return "overview_reports_open_findings"
         linked = overview.get("finding_ids") or []
         # `open_findings` is the authoritative count; `finding_ids` is only what
         # the parser could recognize. Fewer links than findings means one is
         # unaccounted for — a markup change that drops a severity icon must not
         # read as clean just because the links that did parse are known.
-        if len(linked) < open_findings:
+        if len(set(linked)) + unlinked_body < open_findings:
             return "overview_reports_open_findings"
-        if any(fid not in known_thread_ids for fid in linked):
+        if any(fid not in known_thread_ids and fid not in body_links for fid in linked):
             return "overview_reports_open_findings"
     return None
 
@@ -1529,6 +1657,7 @@ def rereview_requests(
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
     reviewer_login: str | None = None,
     loop_request_times: list[str] | None = None,
+    comment_receipts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The re-review requests the loop cap counts.
 
@@ -1565,7 +1694,7 @@ def rereview_requests(
             if login != agent_login:
                 continue
         out.append(comment)
-    return out
+    return reviewer_resolver.merge_comment_receipts(out, review_trigger_mention, comment_receipts)
 
 
 def gh_authenticated_login() -> str | None:
@@ -1713,13 +1842,12 @@ def post_pr_comment(pr: PullRequest, body: str, *, dry_run: bool = False) -> Non
 STICKY_RECEIPT_MARKER = "<!-- gh-review-loop:sticky-receipt -->"
 
 
-# State-file primitives (sticky_state_path/load/save, active-run queries,
-# the loop-active sentinel) live in loop_state so the hook gates can import
-# them without paying this module's full import cost. Re-exported above.
+# State-file primitives and active-run queries live in loop_state.
+# Compatibility re-exports above preserve existing state consumers.
 
 
 def _state_key(pr: PullRequest) -> str:
-    return f"{pr.owner}/{pr.repo}#{pr.number}"
+    return state_key_for(load_sticky_state(), f"{pr.owner}/{pr.repo}", pr.number)
 
 
 def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str] | None:
@@ -1752,6 +1880,7 @@ def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
     return dict(reviewer)
 
 
+@state_transaction
 def save_reviewer_selection(pr: PullRequest, reviewer: dict[str, Any]) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -1762,6 +1891,7 @@ def save_reviewer_selection(pr: PullRequest, reviewer: dict[str, Any]) -> None:
     save_sticky_state(state)
 
 
+@state_transaction
 def clear_reviewer_selection(pr: PullRequest) -> bool:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -1793,6 +1923,7 @@ def read_render_baseline(pr: PullRequest, author: str) -> dict[str, str]:
     return {k: v for k, v in fps.items() if isinstance(k, str) and isinstance(v, str)}
 
 
+@state_transaction
 def save_render_baseline(pr: PullRequest, author: str, fps: dict[str, str]) -> None:
     """Replace the (pr, author) render baseline with this cycle's fingerprints.
 
@@ -1901,6 +2032,7 @@ def resolve_reviewer_selection(args: argparse.Namespace, pr: PullRequest) -> dic
     return state
 
 
+@state_transaction
 def update_run_tracking(
     pr: PullRequest,
     findings: list[tuple[str, str | None]],
@@ -1926,9 +2058,8 @@ def update_run_tracking(
     run = entry.get("run", {})
     if "started_at" not in run:
         run["started_at"] = _now_iso()
-    # Monotonic counter bumped on every fetch. The loop's Stop-hook backstop
-    # compares it against last_summary_seq to tell whether the run advanced
-    # since the agent last emitted a summary (see summary_is_stale).
+    # Monotonic counter bumped on every fetch. The publisher compares it
+    # against last_summary_seq to require a current cycle receipt.
     prev_seq = _safe_int(run.get("update_seq", 0))
     run["update_seq"] = prev_seq + 1
     # Script-owned session-cycle ordinal (#104): 1 on the run's first fetch,
@@ -1983,23 +2114,13 @@ def update_run_tracking(
     entry["run"] = run
     state[key] = entry
     save_sticky_state(state)
-    # Freshen the loop-active sentinel so the hooks.json shell guard lets the
-    # gates run for the duration of this loop (and the 24h TTL restarts).
-    # Without the marker the guard exits before Python starts, so the gates are
-    # off even though this run is active — never let that happen silently.
-    if not touch_sentinel():
-        print(
-            f"warning: could not write the loop-active sentinel at {sentinel_path()}. "
-            "The loop continues, but its edit gate, push gate, and Stop-hook "
-            "summary backstop stay disabled until the sentinel can be created.",
-            file=sys.stderr,
-        )
 
 
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
     return load_sticky_state().get(_state_key(pr), {}).get("run", {})
 
 
+@state_transaction
 def clear_run_tracking(pr: PullRequest) -> None:
     """Tear down the run accumulator and the delta baseline for this PR.
 
@@ -2018,12 +2139,9 @@ def clear_run_tracking(pr: PullRequest) -> None:
             del entry[field]
         if stale:
             save_sticky_state(state)
-    # Drop the sentinel only when no loop remains anywhere — another repo's
-    # concurrent loop still needs the hooks live.
-    if not any_active_run():
-        clear_sentinel()
 
 
+@state_transaction
 def begin_wait_chunk(pr: PullRequest, after_iso: str | None) -> dict[str, Any]:
     """Open one wait chunk: load cross-chunk wait state, applying the reset rule.
 
@@ -2062,6 +2180,7 @@ def read_wait_state(pr: PullRequest) -> dict[str, Any]:
     return dict(wait) if isinstance(wait, dict) else {}
 
 
+@state_transaction
 def _update_wait_state(pr: PullRequest, updates: dict[str, Any]) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -2091,6 +2210,7 @@ def save_wait_snapshot(pr: PullRequest, snapshot: dict[str, Any]) -> None:
     _update_wait_state(pr, {"last_snapshot": dict(snapshot)})
 
 
+@state_transaction
 def clear_wait_state(pr: PullRequest) -> None:
     state = load_sticky_state()
     key = _state_key(pr)
@@ -2271,6 +2391,7 @@ def run_wait_chunk(
         time.sleep(min(interval_seconds, max(0.0, chunk_deadline - time.monotonic())))
 
 
+@state_transaction
 def accumulate_fixed_markers(
     pr: PullRequest,
     *,
@@ -2325,6 +2446,7 @@ def read_fixed_markers(pr: PullRequest) -> dict[str, set[str]]:
     }
 
 
+@state_transaction
 def accumulate_swept_patterns(pr: PullRequest, signatures: list[str]) -> None:
     """Union agent-supplied --swept-pattern signatures into run tracking.
 
@@ -2588,6 +2710,7 @@ def count_likely_fixed_remaining(states: dict[str, str]) -> int:
     return sum(1 for state in states.values() if state in LIKELY_FIXED_FINDING_STATES)
 
 
+@state_transaction
 def track_finding_fingerprints(pr: PullRequest, current_fps: set[str]) -> dict[str, set[str]]:
     """Snapshot the prior cycle's finding fingerprints, then union the current.
 
@@ -2631,6 +2754,7 @@ def prior_finding_fingerprints(pr: PullRequest) -> set[str]:
     return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
 
+@state_transaction
 def track_pattern_signatures(pr: PullRequest, current_sigs: set[str]) -> dict[str, set[str]]:
     """Pattern-granularity twin of track_finding_fingerprints.
 
@@ -2666,6 +2790,7 @@ def prior_pattern_signatures(pr: PullRequest) -> set[str]:
     return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
 
+@state_transaction
 def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
     """True when the actionable thread fingerprint is unchanged from last cycle.
 
@@ -2705,11 +2830,12 @@ def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
     )
 
 
+@state_transaction
 def stamp_summary_emitted(pr: PullRequest) -> None:
     """Record that a summary covering the current run state was just emitted.
 
-    Sets ``last_summary_seq`` to the current ``update_seq`` so the Stop-hook
-    backstop won't re-emit a summary the agent already showed. A no-op when no
+    Sets ``last_summary_seq`` to the current ``update_seq`` so the publisher
+    can check receipt freshness. A no-op when no
     run is being tracked, so it never resurrects a cleared/absent run block.
     """
     state = load_sticky_state()
@@ -2730,6 +2856,7 @@ def stamp_summary_emitted(pr: PullRequest) -> None:
     save_sticky_state(state)
 
 
+@state_transaction
 def accumulate_judge_results(
     pr: PullRequest, judge_results: dict[str, dict[str, Any]]
 ) -> None:
@@ -2787,6 +2914,7 @@ def resolve_judge_phase(explicit_phase: str | None, *, record_run: bool) -> str:
     return "complete" if record_run else "cycle"
 
 
+@state_transaction
 def record_cycle(
     pr: PullRequest,
     started_at: str,
@@ -2865,6 +2993,17 @@ def find_existing_sticky_comment(pr: PullRequest) -> int | None:
     return None
 
 
+@state_transaction
+def _save_receipt_state(pr: PullRequest, receipt: dict[str, Any]) -> None:
+    state = load_sticky_state()
+    key = _state_key(pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    entry.update({field: receipt[field] for field in ("comment_id", "started_at", "updated_at") if field in receipt})
+    state[key] = entry
+    save_sticky_state(state)
+
+
 def post_or_update_sticky_receipt(
     pr: PullRequest, body: str, *, dry_run: bool = False
 ) -> int | None:
@@ -2936,8 +3075,7 @@ def post_or_update_sticky_receipt(
         entry["started_at"] = _now_iso()
         entry["updated_at"] = entry["started_at"]
 
-    state[key] = entry
-    save_sticky_state(state)
+    _save_receipt_state(pr, entry)
     return comment_id
 
 
@@ -3488,12 +3626,13 @@ def render_markdown(
     full: bool = False,
     loop_requests: list[str] | None = None,
     agent_login: str | None = None,
+    counted_requests: list[dict[str, Any]] | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
     # `loop_requests` is the local provenance record, supplied by the caller
     # that knows which PR this is; without it the count keeps the actor
     # filter, so it needs the same agent login the enforced count uses.
-    rereviews = rereview_requests(
+    rereviews = counted_requests if counted_requests is not None else rereview_requests(
         pr,
         agent_login,
         review_trigger_mention=review_trigger_mention,
@@ -3551,7 +3690,7 @@ def main() -> int:
     # Post-rename housekeeping: move ~/.config/gh-gemini-review-loop to
     # ~/.config/gh-review-loop once, leaving a compatibility symlink for
     # pre-rename plugin versions. No-op after the first run. Done here (the
-    # loop's single entry point) so the hook gates never pay for it.
+    # loop's fetch entry point).
     migrate_legacy_state_dir()
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -3669,8 +3808,8 @@ def main() -> int:
         "--resolve-outdated",
         dest="resolve_outdated",
         action="store_true",
-        default=True,
-        help="Resolve unresolved outdated reviewer threads before printing current feedback. Enabled by default.",
+        default=False,
+        help="Opt in to resolving outdated reviewer threads; outdated does not mean fixed.",
     )
     parser.add_argument(
         "--no-resolve-outdated",
@@ -3748,10 +3887,10 @@ def main() -> int:
         "--resolve-addressed-by-reply",
         dest="resolve_addressed_by_reply",
         action="store_true",
-        default=True,
+        default=False,
         help=(
-            "Resolve unresolved threads where a non-bot maintainer posted a substantive reply "
-            "(>=%d chars). Enabled by default." % ADDRESSED_BY_REPLY_MIN_CHARS
+            "Opt in to resolving threads explicitly deferred with /review-loop defer "
+            "by a repository owner or collaborator. Disabled by default."
         ),
     )
     parser.add_argument(
@@ -3833,9 +3972,9 @@ def main() -> int:
         action="store_true",
         help=(
             "Render the lean auto-snapshot receipt instead of the full one. For "
-            "the Stop-hook backstop: shows only GitHub-observable state (threads "
+            "a compact diagnostic: shows only GitHub-observable state (threads "
             "seen/resolved/open, cycles) and omits agent-only fields (fixed "
-            "count, verification, outcome) the hook cannot know."
+            "count, verification, outcome)."
         ),
     )
     parser.add_argument("--fixed-count", type=int, default=0, help="Agent-claimed fixes this run.")
@@ -4243,14 +4382,21 @@ def main() -> int:
                     "falling back to counting all re-review pings.",
                     file=sys.stderr,
                 )
+        comment_receipts = loop_comment_receipts(pr)
+        selected_vendor = review_vendors.vendor_for(args.author)
+        if selected_vendor and selected_vendor.trigger_kind == "review_request" and loop_state.cap_count_uncertain(f"{pr.owner}/{pr.repo}", pr.number):
+            print("warning: local native-request history is incomplete or in flight", file=sys.stderr)
+        elif (not selected_vendor or selected_vendor.trigger_kind != "review_request") and comment_receipts is None:
+            print("warning: local comment-request history is incomplete or in flight", file=sys.stderr)
         rereviews = rereview_requests(
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=loop_request_times(pr, args.author),
+            comment_receipts=comment_receipts,
         )
-        _limit_reached = len(rereviews) >= args.max_rereview_requests
+        _limit_reached = rereview_limit_reached(pull_request, args.author, len(rereviews), args.max_rereview_requests)
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
                 pull_request, args.author, dry_run=args.dry_run
@@ -4282,7 +4428,10 @@ def main() -> int:
         )
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
-        threads.extend(review_body_findings(pull_request, args.author))
+        parsed_body_findings = review_body_findings(pull_request, args.author)
+        known_thread_ids = discussion_ids_on_pr(pull_request)
+        threads.extend(finding for finding in parsed_body_findings
+                       if finding.get("reviewerDiscussionId") not in known_thread_ids)
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
         # an unparseable overview leaves every thread listed as `unknown`.
@@ -4457,6 +4606,7 @@ def main() -> int:
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=loop_request_times(pr, args.author),
+            comment_receipts=comment_receipts,
         )
         if len(rereviews) >= args.max_rereview_requests:
             print(
@@ -4519,6 +4669,7 @@ def main() -> int:
                 clean_blocked=clean_blocked_by(
                     threads, reviewer_overview, review_request_vendor=review_request_vendor,
                     known_thread_ids=discussion_ids_on_pr(pull_request),
+                    parsed_body_findings=parsed_body_findings,
                 ),
             )
             derived = derive_record_fields(
@@ -4619,7 +4770,7 @@ def main() -> int:
             else:
                 # --cycle-summary leaves the accumulator intact but stamps that a
                 # summary covering the current run state was emitted, so the
-                # Stop-hook backstop won't duplicate it.
+                # publisher can check receipt freshness.
                 try:
                     stamp_summary_emitted(pr)
                 except OSError as exc:
@@ -4842,6 +4993,7 @@ def main() -> int:
                             threads, reviewer_overview,
                             review_request_vendor=review_request_vendor,
                             known_thread_ids=discussion_ids_on_pr(pull_request),
+                            parsed_body_findings=parsed_body_findings,
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -4862,6 +5014,7 @@ def main() -> int:
                             review_request_vendor=review_request_vendor,
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
+                            comment_receipts=comment_receipts,
                             provenance_incomplete=loop_state.cap_count_uncertain(
                                 f"{pr.owner}/{pr.repo}", pr.number
                             ),
@@ -4915,6 +5068,7 @@ def main() -> int:
                 full=args.full,
                 loop_requests=loop_request_times(pr, args.author),
                 agent_login=agent_login,
+                counted_requests=rereviews,
             ),
             end="",
         )
@@ -4939,6 +5093,7 @@ def main() -> int:
         blocked = clean_blocked_by(
             threads, reviewer_overview, review_request_vendor=review_request_vendor,
             known_thread_ids=discussion_ids_on_pr(pull_request),
+            parsed_body_findings=parsed_body_findings,
         )
         if blocked:
             print(
@@ -4993,5 +5148,21 @@ def main() -> int:
     return 0
 
 
+def loop_comment_receipts(pr: PullRequest) -> list[dict[str, Any]] | None:
+    state = load_sticky_state()
+    key = state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number)
+    entry = state.get(key, {})
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        return None
+    receipts = entry.get("review_requests", [])
+    if not isinstance(receipts, list):
+        return None
+    logged = loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number)
+    if logged and any(item.get("incomplete") for item in logged):
+        return None
+    return receipts + (logged or [])
+
+
 if __name__ == "__main__":
+    configure_utf8_output()
     raise SystemExit(main())

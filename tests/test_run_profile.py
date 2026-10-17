@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import sys
+
 from run_profile import run_profile
+
+
+def test_inherited_legacy_encoding_does_not_fail_unicode_check(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    prof = _profile([{"name": "unicode", "command": [sys.executable, "-c", "print(chr(0x2713))"], "required": True}])
+    result = run_profile(prof, tmp_path)
+    assert result.verification == "passed"
+    assert result.checks[0].returncode == 0
 
 
 def _profile(checks, working_directory=".", timeout_seconds=300):
@@ -97,13 +107,13 @@ _OK = 'python3 -c "import sys; sys.exit(0)"'
 
 def test_non_dict_profile_does_not_crash(tmp_path):
     result = run_profile("not a profile", tmp_path)
-    assert result.verification == "passed"  # no checks -> vacuously passed
+    assert result.verification == "failed"  # no required checks cannot verify a change
     assert result.checks == []
 
 
 def test_non_list_checks_does_not_crash(tmp_path):
     result = run_profile({"checks": 5}, tmp_path)
-    assert result.verification == "passed"
+    assert result.verification == "failed"
     assert result.checks == []
 
 

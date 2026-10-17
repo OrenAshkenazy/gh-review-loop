@@ -134,7 +134,7 @@ def test_invalid_pr_fails(capsys):
     assert "positive integer" in captured.err
 
 
-def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
+def test_gh_failure_without_http_status_reports_unknown_and_retains_marker(capsys):
     def runner(argv, **kwargs):  # noqa: ARG001
         return subprocess.CompletedProcess(
             args=argv,
@@ -150,15 +150,16 @@ def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
 
     request_rereview.post_rereview = failing_post
     try:
-        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11"])
+        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11", "--json"])
     finally:
         request_rereview.post_rereview = original
 
     captured = capsys.readouterr()
-    assert rc != 0
-    assert captured.out == ""
-    assert "gh api failed" in captured.err
-    assert "permission denied" in captured.err
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "review_request_uncertain"
+    assert payload["posted"] is None and "permission denied" in payload["message"]
+    assert request_rereview.load_state()["OrenAshkenazy/AegisLocal#11"]["review_request_in_flight"]
 
 
 def test_default_phrase_is_used_when_omitted(monkeypatch, capsys):
@@ -207,7 +208,7 @@ def test_reviewer_mention_builds_default_phrase(monkeypatch, capsys):
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_review_trigger_mention_alias_builds_default_phrase(monkeypatch, capsys):
@@ -235,7 +236,7 @@ def test_review_trigger_mention_alias_builds_default_phrase(monkeypatch, capsys)
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_missing_safe_trigger_returns_json_stop_without_posting(monkeypatch, capsys):
@@ -333,7 +334,7 @@ def test_persisted_review_trigger_is_used_when_mention_is_omitted(
 
     capsys.readouterr()
     assert rc == 0
-    assert captured["phrase"] == "@coderabbitai please review the latest changes."
+    assert captured["phrase"] == "@coderabbitai review"
 
 
 def test_persisted_codex_reviewer_without_trigger_posts_the_exact_codex_phrase(
@@ -709,7 +710,7 @@ class TestMentionExtraction:
             return {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
 
         monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
-        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
 
         rc = request_rereview.main(
@@ -1168,6 +1169,21 @@ class TestRequestState:
         assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
 
+    def test_rerequest_ids_come_from_the_selected_completed_bot(self):
+        payload = _gql_pr("new-head")
+        payload["data"]["repository"]["pullRequest"]["id"] = "PR_target"
+        review = _rest_reviews([OLD_REVIEW])[0]
+        review["user"].update(type="Bot", node_id="BOT_copilot")
+        other = {**review, "user": {"login": "other-bot", "type": "Bot", "node_id": "BOT_other"}}
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(payload, review_pages=[[other, review]]),
+        )
+
+        assert state["state"] == "ABSENT"
+        assert state["rerequest_ids"] == ("PR_target", "BOT_copilot")
+
+
 class TestReviewRequestHelpers:
     def test_count_agent_review_requests_paginated_rest(self):
         page1 = [
@@ -1300,6 +1316,52 @@ class TestReviewRequestHelpers:
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) is None
 
 
+    def test_rerequest_uses_bot_ids_after_the_head_guard(self):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-1] == "repos/acme/widget/pulls/159":
+                return _completed(cmd, {"state": "open", "head": {"sha": "a" * 40}})
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head="a" * 40, pending=[COPILOT_REQUEST]))
+            assert "rerequestReviews" in cmd[4]
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            assert not kwargs.get("shell")
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+
+        assert result["posted"] is True
+        assert len(calls) == 4
+        assert calls[-1] == ["gh", "api", "repos/acme/widget/pulls/159"]
+        calls.clear()
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+        assert not result["posted"] and not calls
+
+    @pytest.mark.parametrize("response", [{}, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_other"}}}}, {"errors": [{"message": "denied"}]}])
+    def test_rerequest_requires_a_confirmed_mutation_result(self, response):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            return _completed(cmd, response)
+
+        with pytest.raises(request_rereview.ReviewRequestRejected) as info:
+            request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner, rerequest_ids=("PR_target", "BOT_copilot"))
+
+        assert info.value.reason == "uncertain"
+        assert info.value.requested_at
+        assert len(calls) == 1  # An ambiguous GraphQL write must never fall back to REST.
+
+
 def test_landed_check_is_unknown_without_the_agent_login():
     """Without the login, a teammate's manual request cannot be told from the
     loop's, so the answer is unknown, never "landed" (PR #116 review)."""
@@ -1426,13 +1488,16 @@ class TestReviewRequestMain:
     def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def", pending_since=None):
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: used)
-        monkeypatch.setattr(
-            request_rereview, "request_state",
-            lambda *a, **k: None if state is None else {
-                "state": state, "head": head, "pending_since": pending_since,
+        reads = []
+        def read_state(*a, **k):
+            reads.append(True)
+            return None if state is None else {
+                "state": "ABSENT" if state == "STALE_PENDING" and len(reads) > 1 else state,
+                "head": head, "pending_since": pending_since,
                 "first_completed_review_at": T_FIRST_REVIEW,
-            },
-        )
+                "rerequest_ids": ("PR_target", "BOT_copilot"),
+            }
+        monkeypatch.setattr(request_rereview, "request_state", read_state)
         monkeypatch.setattr(
             request_rereview, "post_rereview",
             lambda *a, **k: pytest.fail("a review_request vendor must never get a comment"),
@@ -1440,6 +1505,7 @@ class TestReviewRequestMain:
         # GitHub registered the request (the live run showed it can answer 201
         # and register nothing; tests about that stub this to False).
         monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: None)
 
     @staticmethod
     def _fake_request(sink):
@@ -1609,6 +1675,7 @@ class TestReviewRequestMain:
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._stub_reads(monkeypatch)
         monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_gh_json", lambda *a: {"state": "open", "head": {"sha": "abc1234def"}})
 
         def fail(*a, **k):
             raise request_rereview.ReviewRequestRejected(
@@ -1658,7 +1725,9 @@ class TestReviewRequestMain:
         )
         with request_rereview.pr_request_lock("acme/widget", 159) as held:
             assert held is True
-            assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                assert pool.submit(self._run, ["--reviewer-login", COPILOT_LOGIN, "--json"]).result() == 0
 
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "request_in_progress"
@@ -1675,7 +1744,9 @@ class TestReviewRequestMain:
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("same PR is locked"))
         with request_rereview.pr_request_lock("Acme/Widget", 159) as held:
             assert held is True
-            assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                assert pool.submit(self._run, ["--reviewer-login", COPILOT_LOGIN, "--json"]).result() == 0
 
         assert json.loads(capsys.readouterr().out)["status"] == "request_in_progress"
 
@@ -1685,8 +1756,9 @@ class TestReviewRequestMain:
         so a run that cannot establish the lock posts nothing (PR #116 review)."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         if break_lock == "no_lock_module":
-            monkeypatch.setattr(request_rereview, "fcntl", None)
-            monkeypatch.setattr(request_rereview, "msvcrt", None)
+            def unavailable(*a, **k):
+                raise OSError("locking unavailable")
+            monkeypatch.setattr(request_rereview.loop_lock, "_lock_fd", unavailable)
         else:
             monkeypatch.setattr(request_rereview, "lock_path", lambda repo, pr: tmp_path / "missing" / "x" / "\0bad")
         self._stub_reads(monkeypatch)
@@ -1835,6 +1907,22 @@ class TestReviewRequestMain:
         times = request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT)
         assert times == sorted([at, CREATED_AT])
 
+    def test_a_settled_free_request_cannot_repost_when_its_record_fails(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=600, kind="accepted", countable=False)
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a: {"state": "ABSENT", "head": "abc1234def", "first_completed_review_at": None})
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "record_rereview_posted", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("must preserve the earlier reservation"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["reason"] == "state_unwritable"
+        assert self._marker() is not None
+
     def test_a_marker_that_shows_up_pending_is_recorded_for_the_cap(self, monkeypatch, capsys, tmp_path):
         """The uncertain request became visible before this run: it was a real
         loop request, so its time joins the provenance list before the marker
@@ -1975,6 +2063,7 @@ class TestReviewRequestMain:
             request_rereview, "request_state",
             lambda *a, **k: {"state": "ABSENT", "head": "abc1234def", "pending_since": None,
                              "first_completed_review_at": T_FIRST_REVIEW,
+                "rerequest_ids": ("PR_target", "BOT_copilot"),
                              "vendor_event_times": ["2026-10-07T16:19:00Z"],
                              "vendor_review_times": ["2026-10-07T16:19:40Z"]},
         )
@@ -1990,7 +2079,7 @@ class TestReviewRequestMain:
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
         capsys.readouterr()
-        assert seen["marker"]["prior"] == {"events": ["2026-10-07T16:19:00Z"], "reviews": ["2026-10-07T16:19:40Z"]}
+        assert {key: seen["marker"]["prior"][key] for key in ("events", "reviews")} == {"events": ["2026-10-07T16:19:00Z"], "reviews": ["2026-10-07T16:19:40Z"]}
 
     def test_a_definite_refusal_releases_the_reservation(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
@@ -2192,6 +2281,7 @@ class TestReviewRequestMain:
 
         monkeypatch.setattr(request_rereview, "request_review", rejecting)
         monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_gh_json", lambda *a: {"state": "open", "head": {"sha": "abc1234def"}})
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -2288,6 +2378,30 @@ class TestReviewRequestMain:
         assert "[loop]" in out and "Copilot" in out and CREATED_AT in out
 
 
+    def test_main_forwards_rerequest_ids_and_records_one_success(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, head="a" * 40)
+        state = request_rereview.request_state()
+        state["rerequest_ids"] = ("PR_target", "BOT_copilot")
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: state)
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == ["gh", "api", "repos/acme/widget/pulls/159"]:
+                return _completed(cmd, {"state": "open", "head": {"sha": state["head"]}})
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head=state["head"], pending=[COPILOT_REQUEST]))
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        monkeypatch.setattr(request_rereview.subprocess, "run", runner)
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert len(calls) == 4 and self._stamped(tmp_path) == 1
+
+
 class TestExplicitMentionOverridesPersistedVendor:
     """An explicit mention is a per-run override; persisted state must not win.
 
@@ -2332,6 +2446,7 @@ class TestExplicitMentionOverridesPersistedVendor:
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: {
             "state": "ABSENT", "head": "abc1234def", "pending_since": None,
             "first_completed_review_at": T_FIRST_REVIEW,
+            "rerequest_ids": ("PR_target", "BOT_copilot"),
         })
         monkeypatch.setattr(
             request_rereview, "post_rereview",
@@ -2339,6 +2454,7 @@ class TestExplicitMentionOverridesPersistedVendor:
         )
         requested = {}
         monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: None)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
             requested.update(login=login)
             or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
@@ -2527,6 +2643,7 @@ class TestFreeInitialRequest:
         )
         requested = {}
         monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: None)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: (
             requested.update(login=login)
             or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
@@ -2546,6 +2663,7 @@ class TestFreeInitialRequest:
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: self._state())
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
         monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: None)
         monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
             "created_at": CREATED_AT, "repo": repo, "pr": pr, "kind": "review_request",
             "reviewer": login, "posted": True,

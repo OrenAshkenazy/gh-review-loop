@@ -14,7 +14,7 @@ To set the key permanently, recommend the OS-keystore path:
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/key_resolver.py" --set
 ```
 
-Stores in macOS Keychain, Linux Secret Service, or a chmod-600 dotfile fallback — no rc-file edits, no `ps` leakage. Diagnostics: `key_resolver.py --print-source`, `judge_doctor.py`.
+Stores in macOS Keychain, Linux Secret Service, or a dotfile fallback (chmod 600 on POSIX; Windows access depends on the user-directory ACL). No rc-file edits or `ps` leakage. Diagnostics: `key_resolver.py --print-source`, `judge_doctor.py`.
 
 ## Modes and phase
 

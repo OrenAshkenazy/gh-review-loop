@@ -4,18 +4,71 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Changed
+
+- **Copilot request tracking follows the upstream state machine.** Reconciles pending and completed reviews using append-only request provenance, with the first review free. Retains GraphQL re-review transport, head checks, legacy receipt recovery, and a shared Windows-compatible publication lock.
+
+- **Explicit review-loop lifecycle replaces hooks.** Start checks the saved profile decision; publish verifies once and emits its cycle receipt before pushing; finish emits the terminal receipt and records the run without repeating checks. Removed POSIX hook commands that failed under Windows PowerShell and added per-tool startup overhead.
+
 ### Fixed
 
-- **A review request GitHub accepts but does not register is refused, not
-  stamped.** The first live run (an account without Copilot code review) showed
-  the requested-reviewers POST returning 201 with no reviewer added, no pending
-  request and no timeline event — and the script reported `posted: true`,
-  consumed a cap slot and sent the loop into a wait nothing would end. REST
-  cannot tell that apart from a real Copilot request, so after a 201 the
-  script reads GraphQL `reviewRequests` (and the head's reviews) back, up to
-  three times a second apart, and reports `review_request_rejected` with
-  `reason: not_enabled` when the reviewer never appears. A read-back that fails
-  is `review_request_uncertain` / `registration_unknown` with nothing recorded.
+- **Accepted Copilot requests retain their settlement state.** Successful REST and GraphQL calls without confirmed registration remain reserved as accepted; settled absence reports `not_enabled` instead of posting again. Failed settlement reads preserve the reservation, and delayed registration is recorded once.
+
+- **Copilot summary parsing survives upstream integration.** Restores summary-only findings, absolute discussion links, severity-filter accounting, and their regression tests while retaining newer-request precedence and live inline-thread state.
+
+- **Accepted requests require registration before counting.** A successful
+  GitHub response alone does not establish that Copilot was added. Bounded
+  read-back checks confirm registration; missing evidence stays uncertain under
+  a durable reservation. Fresh evidence settles that reservation before another
+  request can be posted, and only settled absence reports `not_enabled`.
+
+- **Lifecycle receipts preserve existing repository spelling.** Mixed-case invocations reuse the saved collector entry, so publication and finish do not strand the active run under a differently cased key.
+
+- **Interrupted publications can resume one preserved commit.** Explicit `--resume-commit` recovery reruns verification and retains head, content, profile, remote, and cap safeguards without another commit or receipt.
+
+- **GitHub commands have bounded waits and explicit UTF-8 decoding.** Publication and request commands time out; an uncertain push or request still requires reconciliation. Collection preserves Unicode review text and fails cleanly on invalid output.
+
+- **Long review threads fetch remaining comment pages.** Deferral uses the complete conversation; unavailable or truncated pages leave findings actionable.
+
+- **Posted requests retain provenance after concurrent head changes.** A post-write head check reports uncertainty without claiming that the accepted request was never posted or inviting an automatic retry.
+
+- **Linked Copilot summary findings follow live thread state.** Existing inline threads are not duplicated or reopened by synthetic summary findings after resolution, outdated classification, or explicit deferral.
+
+- **Edited reviewer feedback invalidates stale deferrals.** Authorization must follow every reviewer's latest comment update; missing or invalid timestamps leave the finding actionable.
+
+- **Severity filtering accounts for parsed overview findings.** Intentionally filtered review-body findings allow a clean result while unparsed findings still block it.
+
+- **Explicit initial Copilot receipts remain free.** Legacy `initial_review: true` and current `countable: false` records are exempt from the re-review cap; unmarked older records remain conservatively charged.
+
+- **Publication preserves uncertain push results.** Failed push transport or confirmation retains the new and previous commit SHAs and verification details, reports `published: null`, and requests no review until the remote is checked.
+
+- **Native publication rejects explicitly incomplete history.** The publisher and shared request counter preserve unknown capacity even with no visible request events.
+
+- **Regular-file replacements do not inherit symlink modes.** With executable-bit tracking disabled, only existing regular-file modes are preserved.
+
+- **Publication preserves non-UTF-8 Git output.** Undecodable diff bytes survive snapshot comparison, verification, dry-run, and publication without lossy replacement or decoding failures.
+
+- **Native review capacity preserves explicit uncertainty.** In-flight or incomplete local history marks the count incomplete even when the request timeline is empty; JSON and Markdown warn that capacity is unknown.
+
+- **GraphQL re-requests confirm selected-reviewer registration.** A mutation returning the PR ID alone cannot record success or consume a completed request; unconfirmed registration retains an in-flight marker and blocks duplicate requests until reconciliation.
+
+- **Publication checks use the validated push URL.** Separate fetch and push destinations no longer reject fork-only branches or falsely report a successful push as unconfirmed.
+
+- **Displayed comment-review capacity includes local receipts.** Collection and publication share comment-ID union logic, including full GitHub database IDs, while incomplete history and truncated comment pages are reported as incomplete counts.
+
+- **Event-confirmed uncertain requests record GitHub's timestamp.** Immediate native-request confirmation uses the matched timeline event time in the result and saved receipt, preserving cap accounting when the local clock differs.
+
+- **Copilot re-reviews require readable PR and bot IDs.** Missing or ambiguous IDs stop before stale-request cancellation, and refreshed IDs are checked again before posting; completed reviews never silently fall back to the initial REST request endpoint.
+
+- **Public receipts keep verification commands local.** GitHub comments show check names and results without machine-specific command paths or private arguments; detailed local verification records are retained.
+
+- **Native request recovery survives later PR pushes.** A fresh matching request-event ID records the prior accepted request at GitHub's timestamp even after the head changes; legacy completion evidence keeps its head checks. The README distinguishes initial REST requests from GraphQL re-requests.
+
+- **Review writes confirm registration and recover without duplicate requests.** Initial Copilot REST success is checked against the selected reviewer, with bounded GraphQL registration reads and completed-review/request-event evidence for fast reviews. Actor lookup precedes stale cancellation, and refreshed PR state and implicit head guards protect its replacement. Definite comment failures clear in-flight markers; uncertain writes retain them and can be recorded once using `--reconcile` and new GitHub comment/event IDs without relying on the local clock. Windows state paths use the native user profile instead of MSYS `HOME`.
+
+- **Concurrent local runs cannot race publication and re-review.** A per-PR lock covers verification, push, and the publisher's automatic review request; standalone requests share it. State mutations serialize and replace the file atomically, preserve other PRs, and refuse corrupt existing state. Failed requests after push retain the confirmed publication result.
+
+- **Copilot re-requests work for PR authors through GraphQL `rerequestReviews`.** The loop reads PR and bot IDs from GitHub and preserves its head, pending-review, cap, and uncertain-result guards. Copilot findings embedded in review summaries are actionable, and publication honors per-run cap overrides and rejects non-regular files before reading them.
 
 - **The fetch propagates unknown request provenance.** The write side already
   refused to guess; the fetch still treated a missing or incomplete local
