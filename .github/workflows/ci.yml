@@ -28,7 +28,6 @@ jobs:
         shell: bash
         run: |
           python -m py_compile plugins/gh-review-loop/skills/gh-review-loop/scripts/*.py
-          python -m py_compile plugins/glg-questionnaire/skills/glg-questionnaire/scripts/*.py
       - name: Validate plugin packaging
         shell: bash
         run: |
@@ -66,23 +65,6 @@ jobs:
               "path": "./plugins/gh-review-loop",
           }
 
-          # Second plugin: glg-questionnaire. Same drift guards, no hooks.
-          glg = Path("plugins/glg-questionnaire")
-          glg_claude = json.loads((glg / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
-          glg_codex = json.loads((glg / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
-          assert glg_claude["name"] == glg_codex["name"] == "glg-questionnaire"
-          assert glg_claude["version"] == glg_codex["version"]
-          assert glg_claude["description"] == glg_codex["description"]
-          assert glg_codex["skills"] == "./skills/"
-          assert (glg / "skills/glg-questionnaire/SKILL.md").exists()
-          by_name = {p["name"]: p for p in catalog["plugins"]}
-          assert by_name["glg-questionnaire"]["source"] == "./plugins/glg-questionnaire"
-          assert by_name["glg-questionnaire"]["description"] == glg_claude["description"]
-          mirror = {p["name"]: p for p in marketplace["plugins"]}
-          assert mirror["glg-questionnaire"]["source"] == {
-              "source": "local",
-              "path": "./plugins/glg-questionnaire",
-          }
           PY
       - name: Pytest
         run: pytest tests/ -v

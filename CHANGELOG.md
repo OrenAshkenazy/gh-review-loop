@@ -4,22 +4,6 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-### Added
-
-- **New plugin `glg-questionnaire` (0.1.0).** A second skill in this
-  marketplace for GLG expert-network members. Triages GLG project invitations
-  and follow-up questions from Gmail (`parse_glg_email.py` turns one email into
-  JSON: kind, project, cpid, rate, client type, flags, link expiry from the
-  `_session` JWT, and the Q/A pairs GLG records on acceptance), keeps a local
-  append-only answer bank of the member's own answers (`answer_bank.py`, seeded
-  from "Accept Confirmation" emails, fuzzy lookup by normalized question), and
-  drives the member's signed-in browser to fill and submit the questionnaire
-  only after the member confirms a per-row-sourced answer sheet. Hard rules:
-  no invented answers, no submit or decline without an explicit go, employer
-  and conflict questions always go to the member, paid surveys out of scope.
-  Stdlib only, nothing transmitted. Registered in both marketplace files; CI
-  compiles its scripts and checks manifest drift.
-
 ### Changed
 
 - **Copilot request tracking follows the upstream state machine.** Reconciles pending and completed reviews using append-only request provenance, with the first review free. Retains GraphQL re-review transport, head checks, legacy receipt recovery, and a shared Windows-compatible publication lock.
@@ -29,8 +13,6 @@ All notable changes to this project will be documented in this file. The format 
 ### Fixed
 
 - **Accepted Copilot requests retain their settlement state.** Successful REST and GraphQL calls without confirmed registration remain reserved as accepted; settled absence reports `not_enabled` instead of posting again. Failed settlement reads preserve the reservation, and delayed registration is recorded once.
-
-- **Fresh GLG follow-ups remain actionable.** Prior acceptance or submission of the original project no longer marks new follow-up questions done or groups them into the original invitation.
 
 - **Copilot summary parsing survives upstream integration.** Restores summary-only findings, absolute discussion links, severity-filter accounting, and their regression tests while retaining newer-request precedence and live inline-thread state.
 
@@ -88,44 +70,6 @@ All notable changes to this project will be documented in this file. The format 
 
 - **Copilot re-requests work for PR authors through GraphQL `rerequestReviews`.** The loop reads PR and bot IDs from GitHub and preserves its head, pending-review, cap, and uncertain-result guards. Copilot findings embedded in review summaries are actionable, and publication honors per-run cap overrides and rejects non-regular files before reading them.
 
-- **The scratch directory is no longer a predictable path in `/tmp`.** The
-  per-user path introduced for cross-call stability could be pre-created — or
-  symlinked — by another local account before the first run, after which
-  `mkdir -p` succeeded and email bodies carrying `_session` tokens were written
-  there. It now lives under `$XDG_RUNTIME_DIR` (else `$HOME/.cache`), which
-  only this account can write, and the prelude refuses a symlink or a directory
-  it does not own before using it.
-
-- **`handled()` keys by consultation id.** Two consultations can share a
-  project title; keying on the title let the newer row hide the older, and
-  triage — told to match by title — could mark a never-handled consultation as
-  done. The id identifies the work, with the title as the fallback for records
-  that have none.
-
-- **One bad line no longer hides the whole answer bank.** `load_entries()`
-  called `json.loads()` unconditionally, so an interrupted append or a hand
-  edit of the documented file made every earlier answer unreachable. Malformed
-  and non-object lines are counted, reported on stderr, and skipped.
-
-- **Project titles and detail text travel by file.** `log --project
-  "<title>"` was the last shell-interpolation sink: titles come from email
-  subjects, so recording an outcome could execute `$(...)` from one.
-  `--project-file` and `--detail-file` take them from a file (`-` for stdin);
-  the inline flags remain for text the member typed.
-
-- **Triage reads the submission history.** Outcomes were written to
-  `submissions.jsonl` for reuse but never read back, so a project finished in
-  an earlier session was offered again — and an accept confirmation usually has
-  no `cpid` to tie it to the invitation. `answer_bank.py handled` returns one
-  row per project (newest outcome, with its `cpid`) and triage matches on both
-  keys before suggesting anything.
-
-- **A follow-up reports its own deadline.** The top-level
-  `accept_link_expires_at` always preferred the accept link, so a follow-up
-  quoting the earlier accept URL showed that token's expiry — often already
-  passed — for work that was still open. The link matching the detected kind
-  owns the deadline.
-
 - **The fetch propagates unknown request provenance.** The write side already
   refused to guess; the fetch still treated a missing or incomplete local
   record as an authoritative empty list, so the loop could display zero cap
@@ -133,26 +77,6 @@ All notable changes to this project will be documented in this file. The format 
   provenance now falls back to the actor filter and sets
   `reReviewCountComplete: false` — unless there is nothing to attribute, where
   zero is exact.
-
-- **The GLG docs no longer rely on shell state between tool calls.** Each
-  agent shell call is its own process, so the "resolve it once" plugin-root
-  block left `GLGQ_PLUGIN_ROOT` unset for every later command, and the scratch
-  directory's `EXIT` trap deleted it the moment the setup call returned. Both
-  are now a two-line prelude at the top of every command block, with a derived
-  per-user scratch path (`$TMPDIR/glgq-$(id -u)`, `chmod 700`) and an explicit
-  `rm -rf` at the end of the session.
-
-- **Attestations are excluded from `PROFILE` sourcing too.** "Everything in
-  the profile is a `PROFILE` source" let the stored employer answer a
-  current-employer screen that hard rule 3 sends to the member every time; if
-  employment changed since bootstrap that is a false compliance answer. Those
-  profile fields are for triage only, and such rows are `NEEDS MEMBER`.
-
-- **A fuzzy bank match must agree on the subject.** Boilerplate dominates the
-  similarity score — "current paying customer of Datadog" against "... of
-  Splunk" scores about 0.79, well over the 0.55 threshold — so `lookup()`
-  offered one vendor's answer for another. Decisive (non-boilerplate) tokens
-  must now overlap.
 
 - **Reviewer discovery paginates review authors.** A clean Copilot pass leaves
   no thread, so its review is the only evidence it reviewed; on a PR with more
@@ -169,28 +93,6 @@ All notable changes to this project will be documented in this file. The format 
   (`--no-cap-check` is the deliberate override). A state write that fails after
   a successful POST marks the history unusable rather than silently short.
 
-- **The seeding example passes its subject by file too.** The earlier shell
-  fix covered SKILL.md but left `references/answer-bank.md` instructing the
-  agent to substitute `<subject>` inside a double-quoted argument.
-
-- **Prior-project questions are refused in either word order.** The filter
-  matched "other GLG" and "GLG project(s)" only, so "Which previous projects
-  have you completed through GLG?" was stored and could come back as a `BANK`
-  suggestion for a question GLG's confidentiality section sends to the member
-  every time.
-
-- **A survey or payment subject outranks a quoted link.** A paid-survey email
-  that quotes an earlier GLG thread carries that thread's follow-up URL, and
-  routing on the link sent a survey into questionnaire automation instead of
-  the mandatory `survey (manual)` row.
-
-- **GLG scratch files are owner-only, outside any checkout, and removed.**
-  SKILL.md had the agent write `subject.txt`, `question.txt`, `body.txt` and
-  parsed JSON into the working directory — mode `0644` under the usual umask,
-  committable by accident, and able to clobber same-named project files. They
-  now live in a per-session `mktemp -d` directory created under `umask 077` and
-  removed on exit.
-
 - **The fetch-side cap count admits when it is a lower bound.**
   `review_request_count_complete()` checked only the timeline page, while the
   free-cycle boundary comes from the reviews page: a full page can hide the
@@ -206,59 +108,12 @@ All notable changes to this project will be documented in this file. The format 
   unreadable head (`uncountable_state`), and workflow step 8 passes
   `$(git rev-parse HEAD)`.
 
-- **Every compliance class in the reference is refused by the bank.** The
-  attestation predicate covered employer, conflict, recording and blinded-client
-  questions but not government or public-sector roles, pending trials and
-  litigation, public-company employment within six months, or "which other GLG
-  projects have you done" — all four listed in `references/compliance.md` as
-  questions that always go to the member. A reused answer there is a false
-  compliance attestation, so the predicate now mirrors that list class for
-  class, with a test that ordinary project questions are not swept up.
-
-- **An invalid JWT expiry no longer aborts parsing.** An out-of-range `exp`
-  made `datetime.fromtimestamp()` raise `OverflowError` (`OSError` on some
-  platforms) after URL validation, taking down an email that may also carry a
-  valid invitation. The link is kept with an unknown expiry.
-
-- **Actionable signals outrank quoted Q/A text.** A reply that quotes an
-  earlier confirmation carries `Q:`/`A:` lines, and `detect_kind()` returned
-  `accept_confirmation` on sight of them — seeding stale answers and hiding an
-  open follow-up or a `survey (manual)` row. A follow-up link, an explicit
-  survey/payment/confirmation subject and a live accept link are all checked
-  first.
-
 - **The free initial Copilot request is not gated on the cap.** With
   `max_rereview_requests: 0`, or with `gh api user` unresolvable, a PR Copilot
   had never reviewed could not get its first request: the count was correct
   (zero) but `used >= cap` still reported `capped`, and the cap's reads ran for
   a request that needs no accounting. The branch is skipped while the vendor has
   no completed review.
-
-- **Untrusted text never reaches a shell word.** The GLG skill's documented
-  commands interpolated an email subject and a questionnaire question into
-  `--subject "<subject>"` / `--question "<question text>"`; double quotes do
-  not suppress `$(...)` or backticks, so following the template with a crafted
-  subject ran it locally. `parse_glg_email.py` takes `--subject-file` and
-  `answer_bank.py` takes `--question-file` (`-` for stdin), and the docs write
-  the value to a file first.
-
-- **Per-project attestations are refused by the store, not by memory.** An
-  Accept Confirmation carrying a current-employer, conflict, recording-consent
-  or blinded-client answer was seeded into the bank, where `lookup()` could
-  offer it as reusable — against SKILL.md hard rule 3 and against PRIVACY.md's
-  statement that these are never stored. `add` now raises `NotReusable` (CLI
-  exit 3) and `seed` reports them under `skipped` instead of storing them.
-
-- **Only `https` GLG links are actionable.** An `http://members.glgresearch.com`
-  accept or follow-up URL carries the `_session` bearer token in its query
-  string, so opening one would put the member's session on the wire in the
-  clear. Plaintext links classify as `other`.
-
-- **Triage no longer collapses messages without a consultation ID.** Surveys,
-  payments, call reminders and digests all parse with `cpid: null`; grouping on
-  it alone merged them into one row and could hide a paid survey the hard rules
-  require reporting. Only non-empty IDs group; the rest key by Gmail thread,
-  falling back to the project ID.
 
 - **A pending review never covers the head.** `_reviews_oldest_first()` fed
   `PENDING` reviews into the overview and severity helpers, which
@@ -288,13 +143,6 @@ All notable changes to this project will be documented in this file. The format 
   repost; a withdrawal that fails posts nothing and reports
   `stale_request_not_replaced`. A dry run withdraws nothing.
 
-- **`glg-questionnaire` resolves its plugin root on both runtimes.** The skill
-  addressed its scripts through `${CLAUDE_PLUGIN_ROOT}`, which is unset under
-  Codex, where the plugin is also published — the command expanded to
-  `/skills/glg-questionnaire/...` and failed before triage. It now resolves
-  `GLGQ_PLUGIN_ROOT` from the Codex and Claude install locations, like the
-  other dual-runtime plugin.
-
 - **The loop's workflow routes `review_request_uncertain`.** Step 8 said every
   status means nothing was posted and then captured `created_at`, which the
   uncertain payload deliberately lacks — an agent following it would build a
@@ -302,39 +150,11 @@ All notable changes to this project will be documented in this file. The format 
   status now routes to the delayed state re-read, and `created_at` is captured
   only from a posted result.
 
-- **A malformed URL no longer aborts GLG triage.** `urlsplit()` raises
-  `ValueError` on input like `https://[foo` or an out-of-range port, so one
-  broken link in a forwarded email took down parsing of a message that also
-  carried a valid invitation. Such URLs classify as `other`.
-
 - **The clean gate blocks when the overview count exceeds the parsed links.**
   `open_findings` is authoritative and `finding_ids` is only what the parser
   recognized; two reported findings with one parsed link read as clean once
   that link was known. Fewer links than findings now keeps
   `overview_reports_open_findings`.
-
-- **Questionnaire answers are stored owner-only.** `answers.jsonl` and
-  `submissions.jsonl` were created `0644` in a `0755` directory under the usual
-  `022` umask, readable by every local account on a shared machine, and they
-  hold employment, customer and conflict answers. The directory is now `0700`
-  and the files `0600`, a looser existing mode is repaired, and the reference
-  tells the agent to create `profile.md` the same way.
-
-- **The marketplace privacy policy covers `glg-questionnaire`.** The Codex
-  manifest linked a policy describing only `gh-review-loop`, GitHub data and
-  `~/.config/gh-review-loop`. PRIVACY.md now discloses what the GLG plugin
-  reads (Gmail messages from GLG, the questionnaire page in the member's own
-  browser) and what it stores under `~/.config/glg-questionnaire`, with its own
-  removal controls. Existing text was added to, not rewritten.
-
-- **GLG action links are trusted by host, not by substring.** `classify_link()`
-  matched `members.glgresearch.com` anywhere in the URL, so a crafted or
-  forwarded email could present
-  `https://members.glgresearch.com.attacker.example/accept/accept` as a
-  legitimate accept link that the skill then opens in the member's browser. The
-  URL is now parsed and the normalized hostname must equal the GLG host, with an
-  http(s) scheme; `consultationIds` is read from the query string rather than
-  the raw URL.
 
 - **Copilot aliases canonicalize before any filtering.** `--reviewer copilot`,
   `@copilot`, `Copilot` or `copilot-pull-request-reviewer[bot]` kept that
