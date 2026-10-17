@@ -108,7 +108,7 @@ Known files:
 
 `provenance/*.jsonl` stores one append-only line per review request the loop posted for a review-request reviewer (GitHub Copilot): the reviewer bot's login, the request timestamp, and whether it counted toward the re-review cap. It lets the cap tell the loop's own requests from ones you click in GitHub. Deleting it makes the cap fall back to counting every request made under your login. The empty `.incomplete` file beside it appears only if a request could not be written to that log, and has the same effect. The `.stamps.jsonl` file beside them holds one append-only line per re-review the loop posted (a timestamp and a random request id, no identity); it only numbers the loop's cycles in its narration.
 
-`locks/` holds an empty per-PR lock file that keeps two loop runs from requesting a review at the same time, and, briefly, a record of a request whose outcome GitHub had not confirmed yet (reviewer login, timestamp, and the kind of uncertainty). That record is deleted once the request is confirmed or ruled out.
+`locks/` holds an empty per-PR lock file that keeps two loop runs from requesting a review at the same time, and, briefly, a record of a request whose outcome GitHub had not confirmed yet (reviewer login, timestamp, the kind of uncertainty, and the GitHub login of the account that made the request, so a later run under another account can still tell the request is yours). That record is deleted once the request is confirmed or ruled out; if no later run settles it, it stays until you delete the file.
 
 The directory location is overridable with the `GGRL_STATE_DIR` environment variable.
 
