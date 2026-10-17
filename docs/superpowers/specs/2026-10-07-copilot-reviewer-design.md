@@ -135,6 +135,9 @@ first request on a never-reviewed PR fails rule 3.
   an upper bound toward the cap; `capped` then carries `count_is_upper_bound: true`
   and the member raises the cap. (Post-#116: refusing this as unknown stopped every
   first run on a second machine in the live Copilot test.)
+  Before its first post the request side adopts that history into the log as
+  `baseline` lines at the events' own times, so later record-matched counts keep
+  it (PR #120 review: a log holding only the new post would otherwise drop it).
 - Codex/Gemini: the mention-counting path is byte-for-byte unchanged, including the
   fact that today a Codex initial `@codex review` ping counts (a separate issue; out
   of scope here).

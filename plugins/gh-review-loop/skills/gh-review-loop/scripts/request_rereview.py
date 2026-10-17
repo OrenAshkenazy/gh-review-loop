@@ -973,6 +973,68 @@ def provenance_incomplete(repo: str, pr: int) -> bool:
     return loop_state.provenance_incomplete(repo, pr)
 
 
+def baseline_adopted(repo: str, pr: int) -> bool:
+    """Does the PR's provenance log hold adopted history (``baseline`` lines)?
+
+    Those lines are every request found under the login, manual clicks
+    included, so a count that rests on them is an upper bound and a
+    ``capped`` built from it says so.
+    """
+    return any(
+        isinstance(item, dict) and item.get("baseline") is True
+        for item in loop_state.read_request_log(repo, pr) or []
+    )
+
+
+def adopt_unlogged_requests(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    agent_login: str | None,
+    first_completed_review_at: str | None,
+    runner: Any = None,
+) -> bool:
+    """Write the login's historical requests into the provenance log, once.
+
+    With no local record the cap counts every request under the login, an
+    upper bound. The first post from this machine would then start a log
+    holding only that post, and the next count, which matches events to
+    recorded times, would drop the history it had just counted and let the
+    PR run past the cap (PR #120 review). So before the first post the
+    history is adopted: one ``baseline`` line per counted event, at the
+    event's own time, where the matcher finds it on every later run and on
+    the fetch side too. True when nothing needed writing or every line is
+    on disk; False when the timeline could not be read or a write failed,
+    and the caller posts nothing. Without a login there is no history to
+    attribute, so nothing is written and the count stays unknown.
+    """
+    if runner is None:
+        runner = subprocess.run
+    if agent_login is None or loop_request_times(repo, pr, vendor) is not None:
+        return True
+    events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return False
+    counted = reviewer_resolver.counted_review_requests(
+        events,
+        agent_login=agent_login,
+        vendor=vendor,
+        first_completed_review_at=first_completed_review_at,
+        loop_request_times=None,
+        match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
+    )
+    for event in counted:
+        if not loop_state.append_request_log(repo, pr, {
+            "reviewer": vendor.request_login,
+            "at": event["created_at"],
+            "countable": True,
+            "baseline": True,
+            "request_id": f"baseline:{event['created_at']}",
+        }):
+            return False
+    return True
+
+
 def count_agent_review_requests(
     repo: str,
     pr: int,
@@ -1023,6 +1085,8 @@ def count_agent_review_requests(
         # member answers by raising the cap; refusing as unknown (the earlier
         # rule) stopped every first run on a second machine, which the live
         # Copilot test hit, and the fetch already reports this same bound.
+        # The writer adopts these into the log before its first post
+        # (``adopt_unlogged_requests``) so later counts keep them.
         return len(counted)
     if recorded is not None and len(recorded) > len(counted):
         # A countable request is durably logged but its event has not
@@ -1591,6 +1655,26 @@ def unconfirmed_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[st
     }
 
 
+def baseline_unwritable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    """The login's earlier requests could not be adopted into the provenance
+    log (timeline unreadable or the log unwritable), so nothing was posted:
+    the first post would otherwise hide that history from the next count."""
+    return {
+        "status": "state_unwritable",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"Could not record the earlier review requests found on {repo}#{pr} "
+            "under this login into the local provenance log, so nothing was "
+            "posted: a first post without that record would hide them from "
+            "the next cap count. Check `gh auth status` and the state directory "
+            "(GGRL_STATE_DIR), then run this again."
+        ),
+    }
+
+
 def state_unwritable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
     return {
         "status": "state_unwritable",
@@ -1814,9 +1898,15 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # unresolvable `gh api user` would block the very first request.
     if not args.no_cap_check and state["first_completed_review_at"]:
         cap = effective_cap(args.max_rereview_requests)
-        used = count_agent_review_requests(
-            args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]
-        )
+        login = gh_login()
+        first = state["first_completed_review_at"]
+        # History under this login with no local record is adopted into the
+        # log before anything is counted or posted, so the first post from
+        # this machine cannot hide it from the next count (PR #120 review).
+        if not adopt_unlogged_requests(args.repo, args.pr, vendor, login, first):
+            _emit(baseline_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
+            return 0
+        used = count_agent_review_requests(args.repo, args.pr, vendor, login, first)
         if used is None:
             _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
             return 0
@@ -1824,7 +1914,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             _emit(
                 capped_payload(
                     args.repo, args.pr, used, cap,
-                    upper_bound=loop_request_times(args.repo, args.pr, vendor) is None,
+                    upper_bound=baseline_adopted(args.repo, args.pr),
                 ),
                 json_output=json_output,
             )
