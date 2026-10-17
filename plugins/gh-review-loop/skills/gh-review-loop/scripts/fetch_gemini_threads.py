@@ -4339,10 +4339,15 @@ def main() -> int:
         # One decision for the stderr warning, the JSON flag and the
         # `capped` outcome: cycle 0 is free; an actor-fallback count is an
         # upper bound and counts (post-#116 live test), but only when it
-        # can be attributed to this agent (a record or a login).
+        # can be attributed to this agent (a record or a login), or when
+        # `--no-agent-filter` asked for every actor's requests to count.
         _limit_reached = rereview_limit_reached(
             pull_request, args.author, len(rereviews), args.max_rereview_requests,
-            attributable=recorded_request_times is not None or agent_login is not None,
+            attributable=(
+                recorded_request_times is not None
+                or agent_login is not None
+                or bool(args.no_agent_filter)
+            ),
         )
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
