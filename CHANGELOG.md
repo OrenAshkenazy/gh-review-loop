@@ -26,6 +26,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Lifecycle receipts preserve existing repository spelling.** Mixed-case invocations reuse the saved collector entry, so publication and finish do not strand the active run under a differently cased key.
+
 - **Interrupted publications can resume one preserved commit.** Explicit `--resume-commit` recovery reruns verification and retains head, content, profile, remote, and cap safeguards without another commit or receipt.
 
 - **GitHub commands have bounded waits and explicit UTF-8 decoding.** Publication and request commands time out; an uncertain push or request still requires reconciliation. Collection preserves Unicode review text and fails cleanly on invalid output.

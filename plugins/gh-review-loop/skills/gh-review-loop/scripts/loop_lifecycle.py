@@ -54,6 +54,7 @@ def receipt_arguments(args: argparse.Namespace) -> list[str]:
 
 def emit_receipt(repo: str, pr: int, root: Path, *, terminal: bool = False, verification: dict | None = None, options: list[str] | None = None, agent_login: str | None = None) -> dict:
     rr.parse_repo(repo)
+    repo = rr.state_key_for(loop_state.load_sticky_state(strict=True), repo, pr).rsplit("#", 1)[0]
     argv = [sys.executable, str(Path(__file__).with_name("fetch_gemini_threads.py")), "--pr", f"https://github.com/{repo}/pull/{pr}",
             "--record-run" if terminal else "--cycle-summary", "--no-color", *(options or [])]
     if verification is not None:

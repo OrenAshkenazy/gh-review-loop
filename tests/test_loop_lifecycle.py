@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import finish_loop
+import fetch_gemini_threads as collector
 import judge
 import loop_lifecycle
 import loop_state
@@ -117,3 +118,27 @@ def test_receipt_uses_current_python_literal_argv_and_preserves_fallback(tmp_pat
     assert argv[argv.index("--agent-login") + 1] == "agent"
     assert kwargs["cwd"] == tmp_path and kwargs["timeout"] == 120 and not kwargs.get("shell")
     assert result == {"output": "[loop] full fallback receipt", "warnings": "comment failed"}
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_mixed_case_receipts_use_the_existing_collectors_run(tmp_path, monkeypatch, terminal):
+    save_run()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        pr = collector.parse_pr_url(argv[argv.index("--pr") + 1])
+        assert pr.owner == "owner" and pr.repo == "repo"
+        assert collector.read_run_tracking(pr)["update_seq"] == 2
+        if terminal:
+            collector.clear_run_tracking(pr)
+        return subprocess.CompletedProcess(argv, 0, "[loop] receipt", "")
+
+    monkeypatch.setattr(loop_lifecycle.subprocess, "run", run)
+    if terminal:
+        assert finish_loop.finish("OWNER/REPO", 1, tmp_path)["recorded"] is True
+    else:
+        assert loop_lifecycle.emit_receipt("OWNER/REPO", 1, tmp_path)["output"] == "[loop] receipt"
+    assert len(calls) == 1
+    assert list(loop_state.load_sticky_state()) == ["owner/repo#1"]
+    assert (loop_lifecycle.active_run("owner/repo", 1) is None) is terminal
