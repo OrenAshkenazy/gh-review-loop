@@ -2732,6 +2732,27 @@ class TestRequestProvenance:
         assert len(records) == 4  # two baseline lines, the closing line, the post
         assert records[2] == {"baseline_complete": True, "adopted": 2}
 
+    def test_an_empty_log_file_is_no_record_and_still_adopts(self, monkeypatch, tmp_path):
+        """A zero-byte log (an append that opened the file and died) must not
+        read as an authoritative empty history, or adoption is skipped and the
+        timeline's requests count as zero (PR #120 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        path = loop_state.request_log_path("acme/widget", 159)
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        assert loop_state.read_request_log("acme/widget", 159) is None
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+        events = _rest_request_events([("agent", "2026-10-07T16:00:00Z")])
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: _completed(cmd, events),
+        ) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [
+            "2026-10-07T16:00:00Z"
+        ]
+
     def test_a_torn_adoption_is_marked_incomplete_not_trusted(self, monkeypatch, tmp_path):
         """Baseline lines without the closing line are a partial copy. Trusting
         them would count a subset as the whole history (PR #120 review)."""
