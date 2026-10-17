@@ -974,16 +974,8 @@ def provenance_incomplete(repo: str, pr: int) -> bool:
 
 
 def baseline_adopted(repo: str, pr: int) -> bool:
-    """Does the PR's provenance log hold adopted history (``baseline`` lines)?
-
-    Those lines are every request found under the login, manual clicks
-    included, so a count that rests on them is an upper bound and a
-    ``capped`` built from it says so.
-    """
-    return any(
-        isinstance(item, dict) and item.get("baseline") is True
-        for item in loop_state.read_request_log(repo, pr) or []
-    )
+    """See ``loop_state.baseline_adopted``: shared so the fetch agrees."""
+    return loop_state.baseline_adopted(repo, pr)
 
 
 def adopt_unlogged_requests(
@@ -1939,7 +1931,12 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             _emit(
                 capped_payload(
                     args.repo, args.pr, used, cap,
-                    upper_bound=baseline_adopted(args.repo, args.pr),
+                    # Adopted history, or (a dry run adopts nothing) a count
+                    # taken straight from the timeline with no record at all.
+                    upper_bound=(
+                        baseline_adopted(args.repo, args.pr)
+                        or loop_request_times(args.repo, args.pr, vendor) is None
+                    ),
                 ),
                 json_output=json_output,
             )

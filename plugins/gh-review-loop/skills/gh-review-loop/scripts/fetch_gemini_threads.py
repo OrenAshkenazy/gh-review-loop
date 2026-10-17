@@ -1257,6 +1257,7 @@ def review_request_count_complete(
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
     provenance_incomplete: bool = False,
+    baseline_adopted: bool = False,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1281,6 +1282,11 @@ def review_request_count_complete(
     # A posted request that could not be logged: its event may not have
     # reached the timeline yet, so even zero matched events is a bound.
     if provenance_incomplete:
+        return False
+    # Adopted history (the login's timeline events copied into the log by the
+    # request side) may include the member's own clicks, so a count that
+    # includes any of it is an upper bound, not an exact number.
+    if baseline_adopted and counted_requests:
         return False
     # A request the loop durably recorded but whose event the timeline does
     # not show yet still consumed the cap: fewer matched events than records
@@ -1542,6 +1548,29 @@ def clean_blocked_by(
         if any(fid not in known_thread_ids for fid in linked):
             return "overview_reports_open_findings"
     return None
+
+
+def cap_count_attributable(
+    loop_request_times: list[str] | None,
+    agent_login: str | None,
+    *,
+    no_agent_filter: bool = False,
+    provenance_incomplete: bool = False,
+) -> bool:
+    """Can the re-review count be charged to this agent, so it may prove the cap?
+
+    Yes with a local record, a resolved login (the actor fallback is then an
+    upper bound on this agent) or an explicit ``--no-agent-filter`` (every
+    actor's requests count, as its help says). No when the record is
+    explicitly incomplete: a posted request could not be logged, the request
+    side then answers ``uncountable_count`` regardless of the cap, and a
+    ``limitReached`` here would send the member to raise a cap that cannot
+    continue the loop (PR #120 review). With neither record nor login the
+    count is every actor's requests and proves nothing.
+    """
+    if provenance_incomplete:
+        return False
+    return loop_request_times is not None or agent_login is not None or no_agent_filter
 
 
 def rereview_limit_reached(
@@ -4339,14 +4368,15 @@ def main() -> int:
         # One decision for the stderr warning, the JSON flag and the
         # `capped` outcome: cycle 0 is free; an actor-fallback count is an
         # upper bound and counts (post-#116 live test), but only when it
-        # can be attributed to this agent (a record or a login), or when
-        # `--no-agent-filter` asked for every actor's requests to count.
+        # can be attributed to this agent — see cap_count_attributable.
         _limit_reached = rereview_limit_reached(
             pull_request, args.author, len(rereviews), args.max_rereview_requests,
-            attributable=(
-                recorded_request_times is not None
-                or agent_login is not None
-                or bool(args.no_agent_filter)
+            attributable=cap_count_attributable(
+                recorded_request_times, agent_login,
+                no_agent_filter=bool(args.no_agent_filter),
+                provenance_incomplete=loop_state.provenance_incomplete(
+                    f"{pr.owner}/{pr.repo}", pr.number
+                ),
             ),
         )
         if args.resolve_outdated:
@@ -4957,6 +4987,9 @@ def main() -> int:
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
                             provenance_incomplete=loop_state.cap_count_uncertain(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
+                            baseline_adopted=loop_state.baseline_adopted(
                                 f"{pr.owner}/{pr.repo}", pr.number
                             ),
                         ),
