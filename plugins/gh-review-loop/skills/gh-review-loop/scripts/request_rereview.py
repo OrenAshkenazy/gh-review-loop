@@ -485,18 +485,24 @@ def unconfirmed_path(repo: str, pr: int) -> Path:
 def record_unconfirmed_request(
     repo: str, pr: int, *, reviewer: str, at: str | None, kind: str, countable: bool = True,
     request_id: str | None = None, prior: dict[str, Any] | None = None,
+    login: str | None = None,
 ) -> bool:
     """Remember a request whose outcome this run could not confirm; True if saved.
 
     ``kind`` is ``accepted`` (GitHub answered 201, the read-back did not see
     it yet) or ``maybe`` (5xx or no HTTP status: it may or may not have
-    landed). ``countable`` says whether it was a re-review. The next run
-    settles it instead of posting a possible duplicate.
+    landed). ``countable`` says whether it was a re-review. ``login`` is the
+    account that made the POST: settlement attributes timeline events by
+    actor, and a later run under another account (``gh auth switch``, a
+    different GH_TOKEN) would otherwise call the request somebody else's and
+    report it uncertain forever (PR #116 review). The next run settles it
+    instead of posting a possible duplicate.
     """
     path = unconfirmed_path(repo, pr)
     record = {
         "reviewer": reviewer, "at": at or utc_now_iso(), "kind": kind, "countable": countable,
         "id": request_id or uuid.uuid4().hex,
+        "login": login,
         # Vendor activity already on the PR at reservation time; settling
         # excludes it (see request_landed_since).
         "prior": prior or {"events": [], "reviews": []},
@@ -1675,7 +1681,9 @@ def _settle_unconfirmed_request(
             args.repo, args.pr, reviewer,
             ReviewRequestRejected("earlier request not settled", reason="settling", requested_at=at),
         )
-    landed = request_landed_since(args.repo, args.pr, vendor, gh_login(), at, prior=marker.get("prior"))
+    landed = request_landed_since(
+        args.repo, args.pr, vendor, marker.get("login") or gh_login(), at, prior=marker.get("prior")
+    )
     if landed is None:
         return uncertain_payload(
             args.repo, args.pr, reviewer,
@@ -1742,7 +1750,8 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # before the timeline shows it, and a not-yet-visible request is not
         # an absent one. Otherwise it waits for the settle logic.
         landed = request_landed_since(
-            args.repo, args.pr, vendor, gh_login(), marker["at"], prior=marker.get("prior")
+            args.repo, args.pr, vendor, marker.get("login") or gh_login(), marker["at"],
+            prior=marker.get("prior"),
         )
         if landed is None:
             # Unknown (no login to attribute by, or an unreadable read) is not
@@ -1811,9 +1820,12 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         "events": list(state.get("vendor_event_times") or []),
         "reviews": list(state.get("vendor_review_times") or []),
     }
+    # The account making the POST, kept with the reservation so a later run
+    # under another account can still attribute the request.
+    posting_login = gh_login()
     if not args.dry_run and not record_unconfirmed_request(
         args.repo, args.pr, reviewer=reviewer, at=utc_now_iso(), kind="maybe", countable=countable,
-        request_id=request_id, prior=prior,
+        request_id=request_id, prior=prior, login=posting_login,
     ):
         _emit(state_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
         return 0
@@ -1835,7 +1847,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # reconcile it like a missing status (PR #116 review).
         maybe_landed = exc.reason in ("uncertain", "transient")
         if maybe_landed and confirm_posted_after_uncertain(
-            args.repo, args.pr, vendor, gh_login(), exc.requested_at, prior=prior
+            args.repo, args.pr, vendor, posting_login, exc.requested_at, prior=prior
         ):
             payload = {
                 "created_at": exc.requested_at,
@@ -1853,6 +1865,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
                 saved = record_unconfirmed_request(
                     args.repo, args.pr, reviewer=reviewer, at=exc.requested_at,
                     kind="maybe", countable=countable, request_id=request_id, prior=prior,
+                    login=posting_login,
                 )
                 refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:
@@ -1879,6 +1892,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             saved = record_unconfirmed_request(
                 args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
                 kind="accepted", countable=countable, request_id=request_id, prior=prior,
+                login=posting_login,
             )
             unseen = uncertain_payload(
                 args.repo, args.pr, reviewer,
@@ -1894,6 +1908,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             saved = record_unconfirmed_request(
                 args.repo, args.pr, reviewer=reviewer, at=payload.get("created_at"),
                 kind="accepted", countable=countable, request_id=request_id, prior=prior,
+                login=posting_login,
             )
             # The read-back failed: unknown, not posted and not rejected. It is
             # not recorded as posted; the next run settles it.

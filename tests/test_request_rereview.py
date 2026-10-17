@@ -1546,12 +1546,48 @@ class TestReviewRequestMain:
         return request_rereview.read_unconfirmed_request("acme/widget", 159)
 
     @staticmethod
-    def _seed_marker(*, seconds_ago, kind, countable=True):
+    def _seed_marker(*, seconds_ago, kind, countable=True, login=None):
         import datetime as dt
         at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
         assert request_rereview.record_unconfirmed_request(
-            "acme/widget", 159, reviewer=COPILOT_REQUEST, at=at, kind=kind, countable=countable)
+            "acme/widget", 159, reviewer=COPILOT_REQUEST, at=at, kind=kind, countable=countable,
+            login=login)
         return at
+
+    def test_a_reservation_is_settled_under_the_account_that_posted_it(self, monkeypatch, capsys, tmp_path):
+        """The POST was made as one account; this run authenticates as
+        another. Settlement must attribute the request to the posting
+        account, or it is "somebody else's" and stays uncertain forever
+        (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=30, kind="accepted", login="poster")
+        self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "someone-else")
+        seen = {}
+
+        def landed(repo, pr, vendor, agent_login, at, **kwargs):
+            seen["login"] = agent_login
+            return True
+
+        monkeypatch.setattr(request_rereview, "request_landed_since", landed)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert seen["login"] == "poster"
+        assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+        assert self._marker() is None
+
+    def test_a_posted_reservation_records_the_posting_account(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "poster")
+        monkeypatch.setattr(request_rereview, "request_review", self._fake_request({}))
+        monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: False)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        capsys.readouterr()
+        assert self._marker()["login"] == "poster"
 
     def test_copilot_login_requests_a_review_instead_of_commenting(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch)
@@ -1679,7 +1715,7 @@ class TestReviewRequestMain:
         assert payload["status"] == "review_request_uncertain"
         assert payload["posted"] is None
         assert payload["withdrew_stale_request"] is True
-        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior", "login")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "maybe", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_a_5xx_the_timeline_shows_landed_counts_as_posted(self, monkeypatch, capsys, tmp_path):
@@ -1845,7 +1881,7 @@ class TestReviewRequestMain:
         assert payload["reason"] == "registration_pending"
         assert payload["http_status"] == 201
         assert payload["posted"] is None
-        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
+        assert {k: v for k, v in self._marker().items() if k not in ("id", "prior", "login")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
         assert self._stamped(tmp_path) == 0
 
     def test_an_unattributable_reservation_stops_instead_of_withdrawing(self, monkeypatch, capsys, tmp_path):
