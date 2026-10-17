@@ -52,12 +52,14 @@ def receipt_arguments(args: argparse.Namespace) -> list[str]:
     return result
 
 
-def emit_receipt(repo: str, pr: int, root: Path, *, terminal: bool = False, verification: dict | None = None, options: list[str] | None = None) -> dict:
+def emit_receipt(repo: str, pr: int, root: Path, *, terminal: bool = False, verification: dict | None = None, options: list[str] | None = None, agent_login: str | None = None) -> dict:
     rr.parse_repo(repo)
     argv = [sys.executable, str(Path(__file__).with_name("fetch_gemini_threads.py")), "--pr", f"https://github.com/{repo}/pull/{pr}",
             "--record-run" if terminal else "--cycle-summary", "--no-color", *(options or [])]
     if verification is not None:
         argv.extend(["--verification", verification["verification"], "--verification-details", json.dumps(verification)])
+    if agent_login:
+        argv.extend(["--agent-login", agent_login])
     proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     if proc.returncode or not proc.stdout.strip():

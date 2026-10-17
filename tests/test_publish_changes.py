@@ -281,6 +281,8 @@ def test_profile_runs_exactly_once_per_publication(checkout, tmp_path, dry_run):
 
 def test_publisher_emits_verified_summary_and_forwards_metadata(checkout, monkeypatch):
     original = pc.loop_lifecycle.emit_receipt
+    logins = iter(["initial-agent", "receipt-agent", "after-agent", "push-agent"])
+    monkeypatch.setattr(rr, "gh_login", lambda: next(logins))
     calls = []
     def receipt(repo, pr, root, **kwargs):
         assert pc.git(root, "rev-parse", "HEAD").strip() == checkout[2]
@@ -292,6 +294,7 @@ def test_publisher_emits_verified_summary_and_forwards_metadata(checkout, monkey
     assert len(calls) == 1
     assert calls[0][:2] == ("owner/repo", 1)
     assert calls[0][2]["verification"] == result["verification"]
+    assert calls[0][2]["agent_login"] == "receipt-agent"
     assert calls[0][2]["options"] == ["--fixed-count", "2", "--semantic-risk", "changed return shape", "--max-rereview-requests", "6"]
     assert result["cycle_summary"]["output"] == "[loop] receipt"
 

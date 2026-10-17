@@ -146,7 +146,7 @@ def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozen
         raise PublishError("staged bytes differ from verified changes; staged changes preserved, no commit")
 
 
-def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, require_summary: bool = True) -> None:
+def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, require_summary: bool = True) -> str:
     state = rr.load_state()
     entry = state.get(rr.state_key_for(state, repo, pr))
     if isinstance(entry, dict) and entry.get("review_request_in_flight"):
@@ -174,6 +174,7 @@ def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, r
         raise PublishError("re-review cap cannot be established; publishing blocked")
     if used >= rr.effective_cap(max_rereview_requests):
         raise PublishError("re-review cap reached; publishing blocked")
+    return login
 
 
 def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: str | None = None) -> tuple[str, str]:
@@ -222,7 +223,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during verification; verify again")
     checkout_gate(root, repo, pr, remote, expected_head=head)
-    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
+    agent_login = loop_gate(repo, pr, max_rereview_requests, require_summary=False)
     if snapshot(root, paths) != before:
         raise PublishError("files changed before staging; verify again")
     payload = {"status": "verified", "published": False, "dry_run": dry_run, "head": head, "verification": result.to_details()}
@@ -231,7 +232,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     options = list(receipt_options or [])
     if max_rereview_requests is not None:
         options.extend(["--max-rereview-requests", str(max_rereview_requests)])
-    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options)
+    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options, agent_login=agent_login)
     checkout_gate(root, repo, pr, remote, expected_head=head)
     loop_gate(repo, pr, max_rereview_requests)
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
