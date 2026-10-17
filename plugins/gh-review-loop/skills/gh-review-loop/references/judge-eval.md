@@ -22,8 +22,6 @@ Stores in macOS Keychain, Linux Secret Service, or a dotfile fallback (chmod 600
 
 **Phase is auto-inferred** — no `--judge-phase` needed: a terminal `--record-run` is phase `complete`; every other fetch is phase `cycle`. So `on_cycle` runs on every cycle fetch and `on_complete` runs only at the terminal record-run. An explicit `--judge-phase` overrides.
 
-Within an active run, identical successful evaluations are reused across fetches and receipts. Reuse requires the same PR, commit, reviewer, exact prompts, model, endpoint, and temperature. Changed input or failed/skipped evaluation requires a new call. Mode/phase rules still apply; receipt generation does not itself enable the judge. Reused and newly evaluated counts are reported separately.
-
 When `judge_mode=on_cycle`, show the deterministic judge block every cycle. If the judge was requested but skipped, relay the script-owned line exactly (`[loop] judge eval skipped: <reason>`). Never hand-write a replacement judge table.
 
 ## Discoverability

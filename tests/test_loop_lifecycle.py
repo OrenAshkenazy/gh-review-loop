@@ -109,11 +109,10 @@ def test_receipt_uses_current_python_literal_argv_and_preserves_fallback(tmp_pat
         return subprocess.CompletedProcess(argv, 0, "[loop] full fallback receipt\n", "comment failed")
     monkeypatch.setattr(loop_lifecycle.subprocess, "run", run)
     details = {"verification": "passed", "checks": [{"command": [r"C:\path with spaces\python.exe", "-V"]}]}
-    result = loop_lifecycle.emit_receipt("owner/repo", 1, tmp_path, verification=details, options=["--fixed-count", "2"], agent_login="agent")
+    result = loop_lifecycle.emit_receipt("owner/repo", 1, tmp_path, verification=details, options=["--fixed-count", "2"])
     argv, kwargs = calls[0]
     assert argv[:2] == [sys.executable, str(Path(loop_lifecycle.__file__).with_name("fetch_gemini_threads.py"))]
     assert "--cycle-summary" in argv and "--auto-snapshot" not in argv and "--reviewer" not in argv
     assert json.loads(argv[argv.index("--verification-details") + 1]) == details
-    assert argv[argv.index("--agent-login") + 1] == "agent"
     assert kwargs["cwd"] == tmp_path and kwargs["timeout"] == 120 and not kwargs.get("shell")
     assert result == {"output": "[loop] full fallback receipt", "warnings": "comment failed"}

@@ -27,9 +27,3 @@ Publisher and finish accept `--fixed-count`, repeatable `--fixed-finding`, `--fi
 ## One full verification per publication
 
 Let the real publisher invocation own the full profile. Do not precede it with `run_profile.py`, a full-suite run in another review gate, or a publisher `--dry-run` as routine preflight. Publisher dry runs are diagnostics: they run checks, and a later real publication must verify again. Use focused checks for development or reproducing a finding. Any additional review gate should inspect the change and existing check evidence; repeat checks only when new edits or unresolved concerns justify them.
-
-## Receipt freshness and publication checks
-
-Receipts fetch current GitHub feedback and classify it again, so new comments on the same commit are included. They reuse successful judge verdicts only for identical PR, commit, reviewer, finding input, prompts, model, and endpoint. Changed inputs and unsuccessful evaluations are evaluated again when the selected judge mode permits it; finishing clears the run's cache.
-
-The publisher refreshes cap and account evidence at entry, before the receipt, and before push. It checks local state at every stage and after network reads. Account, reviewer, or unexpected run changes block publication. The receipt uses the account just verified by the publisher, avoiding another account lookup in the collector.

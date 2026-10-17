@@ -146,7 +146,7 @@ def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozen
         raise PublishError("staged bytes differ from verified changes; staged changes preserved, no commit")
 
 
-def local_loop_gate(repo: str, pr: int, *, require_summary: bool, expected: dict | None = None) -> dict:
+def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, require_summary: bool = True) -> None:
     state = rr.load_state()
     entry = state.get(rr.state_key_for(state, repo, pr))
     if isinstance(entry, dict) and entry.get("review_request_in_flight"):
@@ -161,38 +161,19 @@ def local_loop_gate(repo: str, pr: int, *, require_summary: bool, expected: dict
     reviewer = rr.read_persisted_reviewer(repo, pr)
     if not reviewer:
         raise PublishError("confirm a reviewer for this PR before publishing")
-    run = {name: tracking.get(name) for name in ("started_at", "update_seq", "rereviews_posted")}
-    if expected is not None and (reviewer != expected["reviewer"] or run != expected["run"]):
-        raise PublishError("reviewer or active run changed during publication; fetch and verify again")
-    return {"reviewer": reviewer, "run": run}
-
-
-def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, require_summary: bool = True, expected: dict | None = None, refresh_capacity: bool = True) -> dict:
-    gate = local_loop_gate(repo, pr, require_summary=require_summary, expected=expected)
-    reviewer = gate["reviewer"]
-    if refresh_capacity:
-        login = rr.gh_login()
-        if expected is not None and login != expected["agent_login"]:
-            raise PublishError("authenticated GitHub account changed during publication")
-        vendor = review_vendors.vendor_for(reviewer.get("login"))
-        if vendor is not None and vendor.trigger_kind == "review_request":
-            request = rr.request_state(repo, pr, vendor)
-            first_review = request.get("first_completed_review_at") if request else None
-            used = rr.count_agent_review_requests(repo, pr, vendor, login, first_review) if first_review and login else None
-        else:
-            trigger, _ = rr.resolve_review_trigger(repo=repo, pr=pr, reviewer_login=None, reviewer_mention=None)
-            used = rr.count_agent_pings(repo, pr, trigger, login) if trigger and login else None
+    login = rr.gh_login()
+    vendor = review_vendors.vendor_for(reviewer.get("login"))
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        request = rr.request_state(repo, pr, vendor)
+        first_review = request.get("first_completed_review_at") if request else None
+        used = rr.count_agent_review_requests(repo, pr, vendor, login, first_review) if first_review and login else None
     else:
-        if expected is None:
-            raise PublishError("local capacity check requires earlier network evidence")
-        login, used = expected["agent_login"], expected["used"]
+        trigger, _ = rr.resolve_review_trigger(repo=repo, pr=pr, reviewer_login=None, reviewer_mention=None)
+        used = rr.count_agent_pings(repo, pr, trigger, login) if trigger and login else None
     if used is None:
         raise PublishError("re-review cap cannot be established; publishing blocked")
     if used >= rr.effective_cap(max_rereview_requests):
         raise PublishError("re-review cap reached; publishing blocked")
-    if refresh_capacity:
-        local_loop_gate(repo, pr, require_summary=require_summary, expected=gate)
-    return {**gate, "agent_login": login, "used": used}
 
 
 def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: str | None = None) -> tuple[str, str]:
@@ -229,7 +210,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
         raise PublishError("repo-root must be the checkout root")
     branch, head = checkout_gate(root, repo, pr, remote)
-    gate = loop_gate(repo, pr, max_rereview_requests, require_summary=False)
+    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
     before = snapshot(root, paths)
     blobs = verified_blobs(root, paths)
     if snapshot(root, paths) != before:
@@ -241,7 +222,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during verification; verify again")
     checkout_gate(root, repo, pr, remote, expected_head=head)
-    gate = loop_gate(repo, pr, max_rereview_requests, require_summary=False, expected=gate)
+    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
     if snapshot(root, paths) != before:
         raise PublishError("files changed before staging; verify again")
     payload = {"status": "verified", "published": False, "dry_run": dry_run, "head": head, "verification": result.to_details()}
@@ -250,11 +231,9 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     options = list(receipt_options or [])
     if max_rereview_requests is not None:
         options.extend(["--max-rereview-requests", str(max_rereview_requests)])
-    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options, agent_login=gate["agent_login"])
-    # The receipt's collector advances this exact run once, without a new cycle.
-    gate = {**gate, "run": {**gate["run"], "update_seq": loop_state.safe_int(gate["run"]["update_seq"]) + 1}}
+    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options)
     checkout_gate(root, repo, pr, remote, expected_head=head)
-    loop_gate(repo, pr, max_rereview_requests, expected=gate, refresh_capacity=False)
+    loop_gate(repo, pr, max_rereview_requests)
     if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during summary delivery; verify again")
     git(root, "--literal-pathspecs", "add", "--", *paths)
@@ -270,7 +249,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
     urls = git(root, "remote", "get-url", "--push", "--all", remote).splitlines()
     if len(urls) != 1 or remote_identity(urls[0]) != remote_identity((info.get("head", {}).get("repo") or {}).get("html_url", "")):
         raise PublishError("push remote changed; local commit preserved, no push")
-    loop_gate(repo, pr, max_rereview_requests, expected=gate)
+    loop_gate(repo, pr, max_rereview_requests)
     try:
         git(root, "push", remote, f"HEAD:refs/heads/{branch}")
         tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
