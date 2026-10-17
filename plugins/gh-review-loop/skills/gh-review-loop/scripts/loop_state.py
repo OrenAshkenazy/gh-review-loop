@@ -156,15 +156,14 @@ def request_log_path(repo: str, pr: int) -> Path:
     return pr_scoped_path(repo, pr, "provenance", ".jsonl")
 
 
-def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
-    """Append one review-request record; True once it is on disk.
+def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
+    """Append one record to an append-only log; True once it is on disk.
 
-    The cap's provenance lives here, not in state.json: state.json is
-    rewritten whole by many writers that do not lock each other, and a writer
-    holding an older snapshot would erase a record appended meanwhile. An
-    appended line is never rewritten by anyone.
+    These logs live apart from state.json on purpose: state.json is rewritten
+    whole by many writers that do not lock each other, and a writer holding
+    an older snapshot erases whatever was written meanwhile. An appended line
+    is never rewritten by anyone.
     """
-    path = request_log_path(repo, pr)
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(path, "a", encoding="utf-8") as handle:
@@ -174,6 +173,51 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
+    """Append one review-request record (the cap's provenance); True once on disk."""
+    return _append_jsonl(request_log_path(repo, pr), record)
+
+
+def cycle_stamp_log_path(repo: str, pr: int) -> Path:
+    return pr_scoped_path(repo, pr, "provenance", ".stamps.jsonl")
+
+
+def append_cycle_stamp(repo: str, pr: int, record: dict[str, Any]) -> bool:
+    """Append one cycle-transition stamp (a posted re-review); True once on disk.
+
+    The stamp drives the session-cycle ordinal. It used to be a counter in
+    state.json, which a fetch or hook holding an older snapshot would erase
+    right after the request script wrote it, leaving the ordinal one behind
+    for the rest of the run (PR #116 review).
+    """
+    return _append_jsonl(cycle_stamp_log_path(repo, pr), record)
+
+
+def read_cycle_stamps(repo: str, pr: int) -> list[dict[str, Any]]:
+    """The PR's cycle stamps, oldest first; a torn line is skipped.
+
+    Only the narration ordinal depends on these, so a torn last line costs
+    at most one cycle label; it never touches the cap.
+    """
+    try:
+        text = cycle_stamp_log_path(repo, pr).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    stamps = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            stamps.append(item)
+    return stamps
+
+
+def count_cycle_stamps(repo: str, pr: int) -> int:
+    return len(read_cycle_stamps(repo, pr))
 
 
 # Returned inside the record list when the log cannot be trusted as complete.

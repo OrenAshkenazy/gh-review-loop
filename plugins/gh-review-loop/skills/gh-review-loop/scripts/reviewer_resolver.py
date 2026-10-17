@@ -161,6 +161,26 @@ def first_completed_review_at(
     return earliest
 
 
+def unanswered_request_times(request_times: list[str], review_times: list[str]) -> list[str]:
+    """Review-request times no submitted review has answered, oldest first.
+
+    Each submitted review answers the earliest request made at or before it;
+    GitHub stamps both to the second, so a same-second answer counts. What
+    is left is still waiting. Comparing only the newest request time with
+    the newest review time cannot tell two requests in one second from one,
+    and took the old review for the new request's answer (PR #116 review).
+    Both the request-side state machine and the fetch-side head check pair
+    this way so they never disagree about which review is current.
+    """
+    unanswered = sorted(time for time in request_times if time)
+    for submitted in sorted(time for time in review_times if time):
+        for index, requested in enumerate(unanswered):
+            if requested <= submitted:
+                unanswered.pop(index)
+                break
+    return unanswered
+
+
 # ``posted_at`` is the local clock just before the POST; the event time is
 # GitHub's. A local clock running ahead would put every event "before" its
 # record, so matching tolerates that much skew in the other direction.

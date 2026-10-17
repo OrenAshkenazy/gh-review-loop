@@ -439,45 +439,34 @@ def record_rereview_posted(
 
 
 def stamp_cycle(repo: str, pr: int, request_id: str | None, *, count: bool = True) -> None:
-    """Advance the run's cycle ordinal for a posted re-review, once per request.
+    """Record the cycle transition a posted re-review completes, once per request.
 
-    The request id is kept with the stamp so a replay (a crash between the
-    log append and this write) can restore a missing stamp without doubling
-    one that landed. ``count=False`` touches the entry without advancing.
-    Fails open: the ordinal holds rather than drifting.
+    Appended to the PR's stamp log beside the provenance log, never to
+    state.json: that file is rewritten whole by unlocked writers (a fetch, a
+    hook), and one holding a snapshot from before the POST erased the stamp
+    right after it was written, so the ordinal never advanced and no replay
+    could tell (PR #116 review). The request id rides with the stamp so a
+    replay after a crash restores a missing stamp without doubling one that
+    landed. ``count=False`` records nothing. Fails open: the ordinal holds
+    rather than drifting.
     """
-    path = state_path()
-    state = load_state()
-    key = state_key_for(state, repo, pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    if count:
-        stamped = run.get("stamped_request_ids")
-        stamped = list(stamped) if isinstance(stamped, list) else []
-        if request_id and request_id in stamped:
-            return
-        posted = run.get("rereviews_posted")
-        posted = posted if isinstance(posted, int) and not isinstance(posted, bool) else 0
-        run["rereviews_posted"] = posted + 1
-        if request_id:
-            run["stamped_request_ids"] = stamped + [request_id]
-        entry["run"] = run
-    state[key] = entry
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except OSError as exc:
-        print(f"warning: could not record the re-review stamp: {exc}", file=sys.stderr)
+    if not count:
+        return
+    if request_id and cycle_stamped(repo, pr, request_id):
+        return
+    record: dict[str, Any] = {"at": utc_now_iso()}
+    if request_id:
+        record["request_id"] = request_id
+    if not loop_state.append_cycle_stamp(repo, pr, record):
+        print("warning: could not record the re-review stamp", file=sys.stderr)
+
+
+def read_cycle_stamps(repo: str, pr: int) -> list[dict[str, Any]]:
+    return loop_state.read_cycle_stamps(repo, pr)
 
 
 def cycle_stamped(repo: str, pr: int, request_id: str) -> bool:
-    state = load_state()
-    entry = state.get(state_key_for(state, repo, pr))
-    run = entry.get("run") if isinstance(entry, dict) else None
-    stamped = run.get("stamped_request_ids") if isinstance(run, dict) else None
-    return isinstance(stamped, list) and request_id in stamped
+    return any(item.get("request_id") == request_id for item in read_cycle_stamps(repo, pr))
 
 
 # How long an unconfirmed review request may take to show up on the PR before
@@ -903,12 +892,9 @@ def request_state(
     # what is left unpaired is still waiting. Overlapping requests keep their
     # own ages, and a listed request whose event the timeline does not show
     # yet has an unknown age instead of borrowing an old, answered event's.
-    unanswered = [event["created_at"] for event in vendor_events]
-    for submitted in completed_times:
-        for index, requested in enumerate(unanswered):
-            if requested <= submitted:
-                unanswered.pop(index)
-                break
+    unanswered = reviewer_resolver.unanswered_request_times(
+        [event["created_at"] for event in vendor_events], completed_times
+    )
     pending_since = unanswered[-1] if unanswered else None
     now = now or _dt.datetime.now(_dt.timezone.utc)
     since_dt = _parse_iso(pending_since) if pending_since else None

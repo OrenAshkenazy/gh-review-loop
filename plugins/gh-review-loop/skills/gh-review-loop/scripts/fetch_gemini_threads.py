@@ -1427,15 +1427,16 @@ def latest_reviewer_overview(
     readable overview is reported with ``covers_head: false``.
     """
     head = pull_request.get("headRefOid") or ""
-    newest_request = newest_request_at(pull_request, author)
+    waiting = newest_unanswered_request_at(pull_request, author)
     listed = vendor_request_listed(pull_request, author)
     newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
 
     def current(review: dict[str, Any]) -> bool:
-        # Of the head, and not superseded by a later request on that head,
-        # whether that request shows on the timeline yet or is only listed.
-        return bool(head) and not listed and (review.get("commit") or {}).get("oid") == head and (
-            (review.get("submittedAt") or "") >= newest_request
+        # Of the head, and not superseded by a later, still unanswered request
+        # on that head, whether that request shows on the timeline yet or is
+        # only listed. Same pairing as head_review() and the request side.
+        return bool(head) and not listed and (review.get("commit") or {}).get("oid") == head and not (
+            waiting and (review.get("submittedAt") or "") <= waiting
         )
 
     for review in newest_first:
@@ -1947,18 +1948,25 @@ def update_run_tracking(
     # review). Summary staleness is deliberately NOT part of this test: a
     # recovery fetch advances update_seq past last_summary_seq, which would
     # then block the legitimate bump for the rest of the run.
-    # Transition evidence is LOCAL: `request_rereview.py` bumps
-    # `rereviews_posted` exactly once per request it actually posts. Deriving
-    # it from the PR's comments failed three different ways (#111 review) —
-    # `comments(last:100)` makes the count non-monotonic on busy PRs, the
-    # all-user fallback count leaks other people's pings when the agent login
-    # cannot be resolved, and PR history outlives `clear_run_tracking()`.
+    # Transition evidence is LOCAL: `request_rereview.py` appends one cycle
+    # stamp per request it actually posts. Deriving it from the PR's comments
+    # failed three different ways (#111 review) — `comments(last:100)` makes
+    # the count non-monotonic on busy PRs, the all-user fallback count leaks
+    # other people's pings when the agent login cannot be resolved, and PR
+    # history outlives `clear_run_tracking()`. The stamps live in an
+    # append-only log beside the provenance log, not in this file: a fetch
+    # or hook that loaded state.json before the POST and saved afterwards
+    # erased an in-file counter, and the baseline below then never saw the
+    # transition (PR #116 review). The in-file `rereviews_posted` counter is
+    # still read for runs that were mid-cycle before the stamps moved.
     #
     # The summary is CONSUMED when it advances a cycle. `last_summary_seq > 0`
     # was a permanently-true flag once any summary had been emitted, so a
     # second re-review arriving before the new cycle wrote its own summary
     # advanced the ordinal twice off one stale summary (#111 review).
-    posted = _safe_int(run.get("rereviews_posted", 0))
+    posted = _safe_int(run.get("rereviews_posted", 0)) + loop_state.count_cycle_stamps(
+        f"{pr.owner}/{pr.repo}", pr.number
+    )
     posted_baseline = _safe_int(run.get("rereviews_posted_at_cycle_start", 0))
     summary_seq = _safe_int(run.get("last_summary_seq", 0))
     summary_consumed = _safe_int(run.get("summary_consumed_seq", 0))
@@ -3103,21 +3111,32 @@ def review_activity_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def newest_request_at(pull_request: dict[str, Any], author: str) -> str:
-    """GitHub's time of the newest review request for ``author``'s vendor, or "".
+def newest_unanswered_request_at(pull_request: dict[str, Any], author: str) -> str:
+    """GitHub's time of the newest review request for ``author``'s vendor that
+    no submitted review has answered, or "".
 
-    Only review-request vendors have one. A head review submitted before it
-    is history: a re-request on an unchanged head asked for a new review.
+    Only review-request vendors have one. A head review submitted at or
+    before it is history: a re-request on an unchanged head asked for a new
+    review. Requests are paired with submitted reviews exactly as the request
+    side's state machine pairs them (``reviewer_resolver.unanswered_request_times``):
+    two requests in one second with one review leave one request waiting,
+    which the newest-request timestamp alone cannot show (PR #116 review).
     """
     vendor = review_vendors.vendor_for(author)
     if vendor is None or vendor.trigger_kind != "review_request":
         return ""
-    newest = ""
+    requested = []
     for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
         event = reviewer_resolver.normalize_request_event(node)
         if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
-            newest = max(newest, event["created_at"])
-    return newest
+            requested.append(event["created_at"])
+    submitted = [
+        review.get("submittedAt") or ""
+        for review in filter_reviews(pull_request, author)
+        if review.get("state") != "PENDING"
+    ]
+    unanswered = reviewer_resolver.unanswered_request_times(requested, submitted)
+    return unanswered[-1] if unanswered else ""
 
 
 def vendor_request_listed(pull_request: dict[str, Any], author: str) -> bool:
@@ -3140,23 +3159,25 @@ def vendor_request_listed(pull_request: dict[str, Any], author: str) -> bool:
 def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
     """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
 
-    For a review-request vendor it must also answer the newest request: a
+    For a review-request vendor no request newer than it may be waiting: a
     re-request on an unchanged head makes the earlier head review history,
     or the waiter and the clean gate would take the old review for the new
-    one. Both times are GitHub's, and a same-second answer counts.
+    one. Requests are paired with reviews first, so a same-second answer
+    counts and a same-second second request does not (PR #116 review).
     """
     head = pull_request.get("headRefOid") or ""
     if not head or vendor_request_listed(pull_request, author):
         return None
-    newest_request = newest_request_at(pull_request, author)
+    waiting = newest_unanswered_request_at(pull_request, author)
     for review in filter_reviews(pull_request, author):
         # A draft is not a review yet; a dismissed one was withdrawn.
         if review.get("state") in ("PENDING", "DISMISSED"):
             continue
         if ((review.get("commit") or {}).get("oid") or "") != head:
             continue
-        if (review.get("submittedAt") or "") >= newest_request:
-            return review
+        if waiting and (review.get("submittedAt") or "") <= waiting:
+            continue
+        return review
     return None
 
 

@@ -124,7 +124,8 @@ first request on a never-reviewed PR fails rule 3.
   entry, and `limitReached` is computed from the lower bound (it can only
   under-report, and the request side — the only writer — has the complete count).
 - **I8** The cap is a function of PR history and `agent_login` only. The local
-  `rereviews_posted` stamp drives the session-cycle *ordinal* (narration), never the
+  cycle stamp (`provenance/<pr>.stamps.jsonl`, append-only; formerly the
+  `rereviews_posted` counter in `state.json`) drives the session-cycle *ordinal* (narration), never the
   cap, exactly as today. Session restarts therefore cannot change what the cap sees.
 - `agent_login` unresolvable → request side refuses (`uncountable_count`, existing);
   fetch side falls back to counting all actors with the existing warning.

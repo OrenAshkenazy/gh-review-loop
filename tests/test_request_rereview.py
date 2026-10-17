@@ -766,11 +766,8 @@ class TestCycleTransitionStamp:
         assert request_rereview.main(argv) == 0
 
     def _posted(self, tmp_path):
-        path = tmp_path / "state.json"
-        if not path.exists():
-            return 0
-        state = json.loads(path.read_text())
-        return state.get("o/r#7", {}).get("run", {}).get("rereviews_posted", 0)
+        import loop_state
+        return loop_state.count_cycle_stamps("o/r", 7)
 
     def test_a_posted_request_stamps_exactly_once(
         self, tmp_path, monkeypatch, capsys
@@ -796,7 +793,21 @@ class TestCycleTransitionStamp:
         state = json.loads((tmp_path / "state.json").read_text())
         assert state["o/r#7"]["commentId"] == 42
         assert state["o/r#7"]["run"]["session_cycle"] == 3
-        assert state["o/r#7"]["run"]["rereviews_posted"] == 1
+        assert self._posted(tmp_path) == 1
+
+    def test_the_stamp_outlives_a_stale_state_rewrite(self, tmp_path, monkeypatch, capsys):
+        """state.json is rewritten whole by unlocked writers; a snapshot taken
+        before the request and saved after it must not lose the stamp
+        (PR #116 review)."""
+        self._run(monkeypatch, tmp_path)
+        capsys.readouterr()
+        (tmp_path / "state.json").write_text(json.dumps({"o/r#7": {"run": {}}}))
+        assert self._posted(tmp_path) == 1
+        request_rereview.stamp_cycle("o/r", 7, "req-x")
+        (tmp_path / "state.json").write_text(json.dumps({}))
+        assert request_rereview.cycle_stamped("o/r", 7, "req-x") is True
+        request_rereview.stamp_cycle("o/r", 7, "req-x")
+        assert self._posted(tmp_path) == 2
 
 
 class TestStateKeyCasing:
@@ -833,9 +844,12 @@ class TestStateKeyCasing:
             "--reviewer-mention", "@codex", "--json",
         ]) == 0
         capsys.readouterr()
+        import loop_state
         state = json.loads((tmp_path / "state.json").read_text())
         assert list(state) == ["OrenAshkenazy/gh-review-loop#7"]
-        assert state["OrenAshkenazy/gh-review-loop#7"]["run"]["rereviews_posted"] == 1
+        # The stamp is keyed by the case-folded PR, so either spelling finds it.
+        assert loop_state.count_cycle_stamps("orenashkenazy/GH-Review-Loop", 7) == 1
+        assert loop_state.count_cycle_stamps("OrenAshkenazy/gh-review-loop", 7) == 1
 
 
 import datetime as _dt  # noqa: E402
@@ -1459,10 +1473,8 @@ class TestReviewRequestMain:
 
     @staticmethod
     def _stamped(tmp_path):
-        path = request_rereview.state_path()
-        if not path.exists():
-            return 0
-        return json.loads(path.read_text(encoding="utf-8")).get("acme/widget#159", {}).get("run", {}).get("rereviews_posted", 0)
+        import loop_state
+        return loop_state.count_cycle_stamps("acme/widget", 159)
 
     @staticmethod
     def _marker():

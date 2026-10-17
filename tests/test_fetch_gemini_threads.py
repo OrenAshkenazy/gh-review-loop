@@ -1799,12 +1799,44 @@ class TestRunTracking:
         assert read_run_tracking(pr)["session_cycle"] == 1
 
     def _post_rereview(self, pr):
-        """Mimic request_rereview.py's local cycle-transition stamp."""
+        """request_rereview.py's cycle-transition stamp, as it really lands:
+        one stamp per posted request, each under its own request id."""
+        import request_rereview
+        import uuid
+        request_rereview.stamp_cycle(f"{pr.owner}/{pr.repo}", pr.number, uuid.uuid4().hex)
+
+    def test_a_stale_state_writer_cannot_erase_the_rereview_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """A fetch or hook that loaded state.json before the request was
+        posted and saved its snapshot afterwards used to wipe the stamp, so
+        the next cycle never advanced. The stamp now lives beside the
+        provenance log, where no state.json writer can reach it
+        (PR #116 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        from fetch_gemini_threads import load_sticky_state, save_sticky_state
+        pr = self._pr()
+        update_run_tracking(pr, [("t1", "a.py")])
+        stamp_summary_emitted(pr)
+        stale = load_sticky_state()
+        self._post_rereview(pr)
+        save_sticky_state(stale)
+        update_run_tracking(pr, [("t2", "b.py")])
+        assert read_run_tracking(pr)["session_cycle"] == 2
+
+    def test_a_legacy_in_state_stamp_still_advances_the_cycle(self, tmp_path, monkeypatch):
+        """Runs that were mid-cycle on the previous release keep their count."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         from fetch_gemini_threads import load_sticky_state, save_sticky_state, _state_key
+        pr = self._pr()
+        update_run_tracking(pr, [("t1", "a.py")])
+        stamp_summary_emitted(pr)
         state = load_sticky_state()
-        run = state.setdefault(_state_key(pr), {}).setdefault("run", {})
+        run = state[_state_key(pr)]["run"]
         run["rereviews_posted"] = run.get("rereviews_posted", 0) + 1
         save_sticky_state(state)
+        update_run_tracking(pr, [("t2", "b.py")])
+        assert read_run_tracking(pr)["session_cycle"] == 2
 
     def test_fetch_after_summary_and_rereview_starts_next_cycle(
         self, tmp_path, monkeypatch
@@ -4419,6 +4451,36 @@ class TestHeadAnchoredWait:
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
 
         assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+
+    def test_a_same_second_re_request_is_not_answered_by_the_review_it_followed(self):
+        """A head review and a later re-request on the same head share one
+        GitHub second. Once that request is no longer listed (withdrawn, or
+        the list and the reviews disagree for a moment) a timestamp
+        comparison takes the old review for its answer. Pairing requests with
+        reviews, as the request side does, leaves one request unanswered, so
+        the waiter keeps waiting and the overview does not cover the head
+        (PR #116 review)."""
+        at = "2026-10-07T16:30:00Z"
+        pr = self._pr("d7efa49", ("COMMENTED", at, "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event(at), self._request_event(at)]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, at) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    def test_an_older_withdrawn_request_does_not_unseat_a_later_head_review(self):
+        """Two request events before one review: the first was withdrawn and
+        the review answered the second. The leftover, older event is history
+        and the head review stands (mirrors request_state)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:00:00Z"),
+            self._request_event("2026-10-07T16:00:00Z"),
+        ]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is True
 
     def test_copilot_wait_is_not_ready_for_a_review_of_the_previous_head(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))

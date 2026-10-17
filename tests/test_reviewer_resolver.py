@@ -476,3 +476,26 @@ def test_a_logged_re_review_in_the_first_review_second_counts():
     )
 
     assert len(counted) == 1
+
+
+def test_each_review_answers_the_earliest_request_at_or_before_it():
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z"], ["2026-10-07T16:30:00Z"]
+    ) == []
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:20:00Z", "2026-10-07T16:30:00Z"], ["2026-10-07T16:21:40Z"]
+    ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_a_second_same_second_request_stays_unanswered():
+    """Two requests and one review in one second: one request is still
+    waiting, which a plain timestamp comparison cannot see (PR #116 review)."""
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z", "2026-10-07T16:30:00Z"], ["2026-10-07T16:30:00Z"]
+    ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_unordered_and_blank_times_are_tolerated():
+    assert reviewer_resolver.unanswered_request_times(
+        ["2026-10-07T16:30:00Z", "", "2026-10-07T16:10:00Z"], ["", "2026-10-07T16:20:00Z"]
+    ) == ["2026-10-07T16:30:00Z"]
