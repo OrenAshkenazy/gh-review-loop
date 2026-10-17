@@ -4446,6 +4446,18 @@ class TestHeadAnchoredWait:
         assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 0, 0) is True
         assert _fgt.rereview_limit_reached(pr, "chatgpt-codex-connector", 0, 0) is True
 
+    def test_an_actor_fallback_count_never_proves_the_cap_reached(self):
+        """Without local provenance the Copilot count is every request made
+        under the member's login after the first review: an upper bound that
+        includes manual clicks. It must not set limitReached or derive a
+        `capped` outcome; the request side reports that count as unknown
+        (PR #116 review). A page-limited count is a lower bound and still
+        proves the cap."""
+        reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=False) is False
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=True) is True
+        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, provenance_known=False) is True
+
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
         pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]

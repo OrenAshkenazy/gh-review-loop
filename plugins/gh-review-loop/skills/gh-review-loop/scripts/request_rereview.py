@@ -1737,7 +1737,23 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # visible (then recorded for the cap): GraphQL can list the request
         # before the timeline shows it, and a not-yet-visible request is not
         # an absent one. Otherwise it waits for the settle logic.
-        if request_landed_since(args.repo, args.pr, vendor, gh_login(), marker["at"], prior=marker.get("prior")):
+        landed = request_landed_since(
+            args.repo, args.pr, vendor, gh_login(), marker["at"], prior=marker.get("prior")
+        )
+        if landed is None:
+            # Unknown (no login to attribute by, or an unreadable read) is not
+            # "did not land": going on would withdraw a stale request that may
+            # be this reservation's own, replace the marker and never count
+            # the accepted re-review (PR #116 review). Keep the marker; stop.
+            _emit(uncertain_payload(
+                args.repo, args.pr, reviewer,
+                ReviewRequestRejected(
+                    "could not tell whether the earlier request is the pending one",
+                    reason="unattributable", requested_at=marker["at"],
+                ),
+            ), json_output=json_output)
+            return 0
+        if landed:
             _record_settled_request(args.repo, args.pr, reviewer, marker)
     elif marker is not None and not args.dry_run:
         settled = _settle_unconfirmed_request(args, vendor, marker)

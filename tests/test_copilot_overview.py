@@ -465,6 +465,10 @@ def test_the_legacy_open_header_still_gives_the_count():
         "**Review effort:** Lite  \n**Findings:** None\n"
     )
     assert legacy_clean["open_findings"] == 0 and legacy_clean["complete"] is True
+    # The overview title is not the status: the heading after it is.
+    assert parsed["assessment"] == "Needs a closer look"
+    assert legacy_clean["assessment"] == "Approval recommended"
+    assert legacy_clean["approving"] is True
 
 
 def test_previously_missed_items_are_not_open_findings():

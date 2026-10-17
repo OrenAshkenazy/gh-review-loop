@@ -1830,6 +1830,31 @@ class TestReviewRequestMain:
         assert {k: v for k, v in self._marker().items() if k not in ("id", "prior")} == {"reviewer": COPILOT_REQUEST, "at": CREATED_AT, "kind": "accepted", "countable": True}
         assert self._stamped(tmp_path) == 0
 
+    def test_an_unattributable_reservation_stops_instead_of_withdrawing(self, monkeypatch, capsys, tmp_path):
+        """A saved countable request is STALE_PENDING and `gh api user` cannot
+        resolve the login, so whether it landed is unknown (None). Treating
+        that as "did not land" withdrew the request, replaced the reservation
+        and never counted the accepted re-review (PR #116 review). Stop,
+        keep the marker, post nothing."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._seed_marker(seconds_ago=1500, kind="accepted")
+        self._stub_reads(monkeypatch, state="STALE_PENDING", pending_since="2026-10-07T16:00:00Z")
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "request_landed_since", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "cancel_review_request",
+                            lambda *a, **k: pytest.fail("must not withdraw on an unknown settlement"))
+        monkeypatch.setattr(request_rereview, "request_review",
+                            lambda *a, **k: pytest.fail("must not post on an unknown settlement"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["reason"] == "unattributable"
+        assert payload["posted"] is None
+        assert self._marker()["kind"] == "accepted"
+        assert self._stamped(tmp_path) == 0
+
     def test_a_settling_request_blocks_a_new_post(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._seed_marker(seconds_ago=10, kind="accepted")
@@ -1910,6 +1935,9 @@ class TestReviewRequestMain:
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [at]
 
     def test_an_unreadable_timeline_keeps_the_marker(self, monkeypatch, capsys, tmp_path):
+        """Unknown settlement stops the run instead of reading as "did not
+        land": the state machine must not go on to a withdrawal or a POST
+        on that basis (PR #116 review)."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         self._seed_marker(seconds_ago=30, kind="maybe")
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
@@ -1917,7 +1945,9 @@ class TestReviewRequestMain:
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
-        assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_request_uncertain"
+        assert payload["reason"] == "unattributable"
         assert self._marker() is not None
 
     @pytest.mark.parametrize("countable", [True, False])

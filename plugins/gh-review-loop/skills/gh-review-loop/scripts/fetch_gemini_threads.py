@@ -1304,11 +1304,16 @@ def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
     """
     if not isinstance(body, str) or COPILOT_OVERVIEW_MARKER not in body:
         return None
-    heading = COPILOT_ASSESSMENT_RE.search(body)
     assessment = ""
-    if heading:
-        # The heading opens with a status emoji ("🟡 Changes recommended").
-        assessment = re.sub(r"^\W+", "", heading.group("assessment")).strip()
+    for heading in COPILOT_ASSESSMENT_RE.finditer(body):
+        # The status heading opens with an emoji ("🟡 Changes recommended").
+        # Early-October overviews put a "## Copilot review overview" title
+        # above it; that title is not the status (PR #116 review).
+        text = re.sub(r"^\W+", "", heading.group("assessment")).strip()
+        if text.casefold() == "copilot review overview":
+            continue
+        assessment = text
+        break
     open_match = COPILOT_OPEN_FINDINGS_RE.search(body) or COPILOT_OPEN_LEGACY_RE.search(body)
     open_findings: int | None = None
     if open_match:
@@ -1540,20 +1545,30 @@ def clean_blocked_by(
 
 
 def rereview_limit_reached(
-    pull_request: dict[str, Any], author: str | None, used: int, limit: int
+    pull_request: dict[str, Any],
+    author: str | None,
+    used: int,
+    limit: int,
+    *,
+    provenance_known: bool = True,
 ) -> bool:
     """Has the loop used its re-review cap?
 
     For a review-request vendor (Copilot) with no completed review yet, the
     next request is the free cycle 0, which request_rereview.py allows even
     at a cap of 0, so the limit cannot be reached before that first review.
+    Without local provenance (``provenance_known=False``) ``used`` is the
+    actor fallback: every request under the member's login, manual clicks
+    included, an upper bound that proves nothing; the request side reports
+    that count as unknown rather than capped, and so does this. A
+    page-limited count is a lower bound and still proves the cap.
     """
     vendor = review_vendors.vendor_for(author) if author else None
     if vendor is not None and vendor.trigger_kind == "review_request":
         first = reviewer_resolver.first_completed_review_at(
             (pull_request.get("reviews") or {}).get("nodes") or [], vendor
         )
-        if not first:
+        if not first or not provenance_known:
             return False
     return used >= limit
 
@@ -4304,14 +4319,21 @@ def main() -> int:
                     "falling back to counting all re-review pings.",
                     file=sys.stderr,
                 )
+        recorded_request_times = loop_request_times(pr, args.author)
         rereviews = rereview_requests(
             pull_request,
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
-            loop_request_times=loop_request_times(pr, args.author),
+            loop_request_times=recorded_request_times,
         )
-        _limit_reached = len(rereviews) >= args.max_rereview_requests
+        # One decision for the stderr warning, the JSON flag and the
+        # `capped` outcome: cycle 0 is free and an actor-fallback count is
+        # not proof (PR #116 review).
+        _limit_reached = rereview_limit_reached(
+            pull_request, args.author, len(rereviews), args.max_rereview_requests,
+            provenance_known=recorded_request_times is not None,
+        )
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
                 pull_request, args.author, dry_run=args.dry_run
@@ -4517,9 +4539,9 @@ def main() -> int:
             agent_login,
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
-            loop_request_times=loop_request_times(pr, args.author),
+            loop_request_times=recorded_request_times,
         )
-        if len(rereviews) >= args.max_rereview_requests:
+        if _limit_reached:
             print(
                 f"warning: {len(rereviews)} reviewer re-review request(s) already exist; "
                 f"the configured loop cap is {args.max_rereview_requests}.",
@@ -4556,9 +4578,7 @@ def main() -> int:
                 accumulated_results = {}
             merged_judge_results = merge_judge_results(accumulated_results, judge_results)
             judge_ran = bool(run.get("judge_ran")) or bool(judge_status.get("ran"))
-            cap_reached = rereview_limit_reached(
-                pull_request, args.author, len(rereviews), args.max_rereview_requests
-            )
+            cap_reached = _limit_reached
             fixed_markers = read_fixed_markers(pr)
             changed_paths = changed_files_in_range(args.changed_base, args.changed_head)
             remaining_states = classify_remaining_finding_states(
@@ -4911,9 +4931,7 @@ def main() -> int:
                         ) or None,
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
-                        "limitReached": rereview_limit_reached(
-                            pull_request, args.author, len(rereviews), args.max_rereview_requests
-                        ),
+                        "limitReached": _limit_reached,
                         # False when a page the count rests on was full, or
                         # when the loop has no local record of its own
                         # requests: the count above is then a bound, not a

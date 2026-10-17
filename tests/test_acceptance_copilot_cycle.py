@@ -85,6 +85,24 @@ def list_reviewers(monkeypatch, capsys):
     return json.loads(capsys.readouterr().out)["reviewers"]
 
 
+def test_the_free_first_request_prints_no_cap_warning(loop, monkeypatch, capsys):
+    """Before Copilot's first completed review the next request is the free
+    cycle 0. `limitReached` already said so; the stderr warning still used a
+    raw `used >= cap` and told a cap-0 user the cap was reached before the
+    initial review (PR #116 review)."""
+    loop["payload"] = FIXTURE["requested_only"]
+    monkeypatch.setattr(
+        sys, "argv",
+        ["fetch_gemini_threads.py", "--pr", "https://github.com/acme/widget/pull/159",
+         "--format", "json", "--no-resolve-outdated", "--no-resolve-addressed-by-reply",
+         "--reviewer", COPILOT, "--max-rereview-requests", "0"],
+    )
+    assert fgt.main() == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out)["loopStatus"]["limitReached"] is False
+    assert "configured loop cap" not in err
+
+
 def test_a_requested_but_silent_copilot_is_discovered(loop, monkeypatch, capsys):
     loop["payload"] = FIXTURE["requested_only"]
 
