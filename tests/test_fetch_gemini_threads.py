@@ -242,6 +242,24 @@ class TestSeverity:
         t = make_thread(comments=[{"author": {"login": CODEX}, "body": body}])
         assert thread_severity(t) == expected
 
+    @pytest.mark.parametrize("marker,expected", [
+        ("P0", "critical"), ("P1", "high"),
+        ("P2", "medium"), ("P3", "low"),
+    ])
+    def test_leading_plain_priority(self, marker, expected):
+        for body in (f"[{marker}] Fix runtime verification", f" \n[{marker.lower()}] Fix runtime verification"):
+            thread = make_thread(comments=[bot_comment(body)])
+            assert thread_severity(thread) == expected
+
+    @pytest.mark.parametrize("body", [
+        "This prose mentions [P2] but does not set priority",
+        "```python\n[P2] do_not_treat_as_priority\n```",
+        "[P4] Invalid level", "[P2]Not separated",
+        "Quoted `[P2]` in ordinary prose",
+    ])
+    def test_plain_priority_requires_leading_marker(self, body):
+        assert thread_severity(make_thread(comments=[bot_comment(body)])) == "unknown"
+
     def test_handles_post_filter_flat_shape(self):
         # filter_threads flattens comments to a plain list; severity must still work
         flat = {"comments": [{"author": {"login": BOT}, "body": "![low](x)"}]}
@@ -2764,6 +2782,9 @@ class TestDeriveOutcome:
 
     def test_clean_when_no_remaining_and_passed(self):
         assert _derive_outcome(0, "passed", cap_reached=False) == "clean"
+        # A Copilot clean gate that blocks (unparseable or stale overview)
+        # means zero threads is not clean, in the record too (PR #116 review).
+        assert _derive_outcome(0, "passed", cap_reached=False, clean_blocked="overview_unparseable") == "human"
 
     def test_human_fallback_when_remaining(self):
         assert _derive_outcome(2, "passed", cap_reached=False) == "human"
@@ -4333,6 +4354,86 @@ class TestHeadAnchoredWait:
         assert _fgt.head_review(self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3")), self.COPILOT) is None
         assert _fgt.head_review(self._pr("d7efa49", ("PENDING", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT) is None
 
+    @staticmethod
+    def _request_event(at, actor="agent"):
+        return {"__typename": "ReviewRequestedEvent", "createdAt": at, "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+
+    def test_the_rendered_count_keeps_the_actor_filter(self):
+        """Without provenance, the Markdown count must filter by the agent's
+        login like the enforced count, or a teammate's manual requests show
+        as loop usage (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        pr.update(number=5, url="u")
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:20:00Z", actor="agent"),
+            self._request_event("2026-10-07T16:25:00Z", actor="a-human"),
+        ]
+
+        out = _fgt.render_markdown(pr, [], self.COPILOT, agent_login="agent")
+
+        assert "Re-review requests: 1" in out
+
+    def test_a_re_request_on_the_same_head_waits_for_the_newer_review(self):
+        """Copilot reviewed the head, then was asked again on the unchanged
+        head. The old review must not end the wait or stand in for the new
+        one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, "2026-10-07T16:30:00Z") is None
+
+    def test_a_dismissed_head_review_is_not_the_head_review(self):
+        pr = self._pr("d7efa49", ("DISMISSED", "2026-10-07T16:21:40Z", "d7efa49"))
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT) is None or \
+            _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is False
+
+    def test_a_listed_request_whose_event_lags_keeps_the_old_review_out(self):
+        """GraphQL lists the new same-head request before its timeline event
+        appears. GitHub drops a reviewer from the list once it submits, so the
+        old head review cannot answer it: wait, and do not call it clean
+        (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"))
+        pr["reviewRequests"] = {"nodes": [{"requestedReviewer": {"__typename": "Bot", "login": self.COPILOT}}]}
+
+        assert _fgt.head_review(pr, self.COPILOT) is None
+        assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, self.AFTER) is None
+        overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
+        assert overview is None or overview["covers_head"] is False
+
+    def test_the_fetch_query_reads_listed_review_requests(self):
+        assert "reviewRequests(first:" in _fgt.QUERY
+
+    def test_comment_reviewers_get_no_copilot_overview(self):
+        """Only Copilot writes an overview. A Codex head review must not be
+        turned into a fabricated one (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49"),
+                      author="chatgpt-codex-connector")
+
+        assert _fgt.reviewer_overview_for(pr, "chatgpt-codex-connector") is None
+        assert _fgt.reviewer_overview_for(
+            self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:21:40Z", "d7efa49")), self.COPILOT
+        ) is not None
+
+    def test_the_free_first_request_never_makes_the_limit_reached(self):
+        """With no completed Copilot review the next request is the free
+        cycle 0, which the request side allows even at a cap of 0 (PR #116 review)."""
+        pr = self._pr("d7efa49")
+
+        assert _fgt.rereview_limit_reached(pr, self.COPILOT, 0, 0) is False
+        reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 0, 0) is True
+        assert _fgt.rereview_limit_reached(pr, "chatgpt-codex-connector", 0, 0) is True
+
+    def test_a_same_second_answer_to_the_newest_request_counts(self):
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [self._request_event("2026-10-07T16:30:00Z")]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+
     def test_copilot_wait_is_not_ready_for_a_review_of_the_previous_head(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "f4a55e3"))
 
@@ -4613,6 +4714,76 @@ class TestFetchProvenanceUnknown:
 
         assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
 
+    def test_a_stale_state_writer_cannot_erase_recorded_requests(self, monkeypatch, tmp_path):
+        """state.json is rewritten whole by many writers that do not lock each
+        other. A writer holding a snapshot from before a request was recorded
+        must not erase it, or the cap undercounts (PR #116 review)."""
+        import request_rereview
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _fgt.save_sticky_state({"acme/widget#159": {"run": {}}})
+        stale = _fgt.load_sticky_state()
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer="copilot-pull-request-reviewer[bot]",
+            requested_at="2026-10-07T16:20:05Z",
+        )
+        _fgt.save_sticky_state(stale)  # the concurrent writer lands last
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") == ["2026-10-07T16:20:05Z"]
+
+    def test_recorded_requests_the_timeline_does_not_show_yet_make_the_count_incomplete(self):
+        """A durably recorded request whose event GraphQL has not exposed yet
+        is still a consumed request: zero matched events is a lower bound,
+        not an exact zero (PR #116 review)."""
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=0
+        ) is False
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=["2026-10-07T16:20:05Z"], counted_requests=1
+        ) is True
+
+    def test_explicitly_incomplete_history_makes_a_zero_count_incomplete(self, monkeypatch, tmp_path):
+        """No local history and an explicitly incomplete one both read as
+        None; only the latter must make even a zero event count a lower
+        bound (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        pr = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}}
+
+        assert _fgt.review_request_count_complete(pr, loop_request_times=None, counted_requests=0) is True
+        assert loop_state.mark_provenance_incomplete("acme/widget", 159) is True
+        assert _fgt.review_request_count_complete(
+            pr, loop_request_times=None, counted_requests=0,
+            provenance_incomplete=loop_state.provenance_incomplete("acme/widget", 159),
+        ) is False
+
+    def test_an_open_reservation_makes_the_count_incomplete(self, monkeypatch, tmp_path):
+        """A reserved request that has not been logged yet is neither a record
+        nor an incomplete marker, but it may already be on GitHub; the count
+        is a bound until it is settled (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is False
+        path = loop_state.unconfirmed_request_path("acme/widget", 159)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"at": "2026-10-07T16:20:05Z", "kind": "maybe", "countable": true}', encoding="utf-8")
+
+        assert loop_state.cap_count_uncertain("acme/widget", 159) is True
+
+    def test_a_torn_log_line_makes_the_history_unknown(self, monkeypatch, tmp_path):
+        """A crash mid-append can tear the last record. Skipping it would make
+        the rest look complete and undercount the cap (PR #116 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T16:20:05Z", "countable": True})
+        with open(loop_state.request_log_path("acme/widget", 159), "a", encoding="utf-8") as handle:
+            handle.write('{"reviewer": "copilot-pull-req')
+
+        assert _fgt.loop_request_times(self.PR, "copilot-pull-request-reviewer") is None
+
     def test_unknown_provenance_marks_the_count_incomplete(self):
         pr = self._pr_with_requests()
 
@@ -4638,3 +4809,81 @@ class TestFetchProvenanceUnknown:
         )
 
         assert len(counted) == 1
+
+
+class TestFullReviewHistory:
+    """A full `reviews(last:100)` page can hide the head review and the
+    free-cycle boundary. fetch_threads backfills the whole history so the
+    waiter, the clean gate and the cap all read complete data (PR #116 review)."""
+
+    PR = PullRequest(owner="o", repo="r", number=5)
+    HEAD = "head000"
+
+    def _review(self, i, author="someone", commit="old000"):
+        return {"id": f"R{i}", "author": {"login": author, "__typename": "User"},
+                "body": "", "state": "COMMENTED",
+                "submittedAt": f"2026-10-01T00:{i // 60:02d}:{i % 60:02d}Z",
+                "url": f"u{i}", "commit": {"oid": commit}}
+
+    def test_full_page_is_backfilled_with_every_review(self, monkeypatch):
+        bot = "copilot-pull-request-reviewer"
+        history = [self._review(0, bot, self.HEAD)] + [self._review(i) for i in range(1, 101)]
+        main_page = {"data": {"repository": {"pullRequest": {
+            "headRefOid": self.HEAD, "reviews": {"nodes": history[-100:]},
+            "timelineItems": {"nodes": []},
+        }}}}
+
+        def run_gh(args, cwd=None):
+            query = args[3]
+            if "reviewsAfter" in query:
+                after = next((a.split("=", 1)[1] for a in args if a.startswith("reviewsAfter=")), None)
+                start = 0 if after is None else int(after)
+                chunk = history[start:start + 100]
+                more = start + 100 < len(history)
+                return {"data": {"repository": {"pullRequest": {"reviews": {
+                    "pageInfo": {"hasNextPage": more, "endCursor": str(start + 100) if more else None},
+                    "nodes": chunk,
+                }}}}}
+            return main_page
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 101
+        assert fgt.head_review(pull_request, bot)["id"] == "R0"
+        assert not any("reviews hit page limit" in w for w in fgt.pagination_warnings(pull_request))
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_short_page_makes_no_extra_call(self, monkeypatch):
+        calls = []
+
+        def run_gh(args, cwd=None):
+            calls.append(args)
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": [self._review(1)]},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(calls) == 1
+        assert fgt.reviews_page_truncated(pull_request) is False
+
+    def test_failed_backfill_keeps_the_page_and_stays_truncated(self, monkeypatch):
+        page = [self._review(i) for i in range(100)]
+
+        def run_gh(args, cwd=None):
+            if "reviewsAfter" in args[3]:
+                raise RuntimeError("gh exploded")
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": self.HEAD, "reviews": {"nodes": page},
+            }}}}
+
+        monkeypatch.setattr(fgt, "run_gh", run_gh)
+
+        pull_request = fgt.fetch_threads(self.PR)
+
+        assert len(pull_request["reviews"]["nodes"]) == 100
+        assert fgt.reviews_page_truncated(pull_request) is True

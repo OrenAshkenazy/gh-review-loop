@@ -86,7 +86,7 @@ for _ in range(8):
     state = loop_state.load_sticky_state(strict=True)
     for pr in (1, 2):
         assert state[f"owner/repo#{pr}"]["run"]["rereviews_posted"] == 8
-        assert len(state[f"owner/repo#{pr}"]["review_requests"]) == 8
+        assert len(loop_state.read_request_log("owner/repo", pr)) == 8
 
 
 @pytest.mark.parametrize("vendor", ["coderabbitai", "copilot-pull-request-reviewer"])
@@ -110,7 +110,7 @@ def post(*a, **kw):
     time.sleep(.2)
     with log.open('a') as stream:
         stream.write('posted\\n')
-    return {'created_at': '2026-10-12T20:00:00Z', 'posted': True}
+    return {'created_at': '2026-10-12T20:00:00Z', 'posted': True, 'registered': True}
 rr.post_rereview = post
 rr.request_review = post
 ready.touch()
@@ -129,7 +129,7 @@ raise SystemExit(rr.main(['--repo', 'owner/repo', '--pr', '1', '--max-rereview-r
     results = [json.loads(finish(process)) for process in processes]
     assert log.read_text().splitlines() == ["posted"]
     assert sum(result["posted"] is True for result in results) == 1
-    assert next(result for result in results if result["posted"] is False)["status"] in {"busy", "capped"}
+    assert next(result for result in results if result["posted"] is False)["status"] in {"busy", "request_in_progress", "capped"}
     assert loop_state.load_sticky_state()["owner/repo#1"]["run"]["rereviews_posted"] == 1
 
 
@@ -197,7 +197,7 @@ def test_posted_request_with_stamp_failure_remains_known_and_blocks_retry(tmp_pa
 
     def post(*args, **kwargs):
         calls.append(True)
-        return {"posted": True, "created_at": "2026-10-12T20:00:00Z"}
+        return {"posted": True, "created_at": "2026-10-12T20:00:00Z", "registered": True}
 
     def fail_stamp(*args, **kwargs):
         raise TimeoutError("state transaction unavailable after POST")
@@ -210,9 +210,9 @@ def test_posted_request_with_stamp_failure_remains_known_and_blocks_retry(tmp_pa
     payload = json.loads(capsys.readouterr().out)
     assert payload["posted"] is True
     assert payload["status"] == "state_record_failed"
-    assert loop_state.load_sticky_state()["owner/repo#1"]["review_request_in_flight"]
+    assert (rr.read_unconfirmed_request("owner/repo", 1) if vendor == "copilot-pull-request-reviewer" else loop_state.load_sticky_state()["owner/repo#1"]["review_request_in_flight"])
     assert rr.main(args) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "request_in_flight"
+    assert json.loads(capsys.readouterr().out)["status"] == ("review_request_uncertain" if vendor == "copilot-pull-request-reviewer" else "request_in_flight")
     assert calls == [True]
 
 

@@ -161,6 +161,12 @@ def first_completed_review_at(
     return earliest
 
 
+# ``posted_at`` is the local clock just before the POST; the event time is
+# GitHub's. A local clock running ahead would put every event "before" its
+# record, so matching tolerates that much skew in the other direction.
+PROVENANCE_SKEW_SECONDS = 120
+
+
 def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     """True when a timeline event is the request posted at ``posted_at``."""
     start = _parse_instant(posted_at)
@@ -168,7 +174,57 @@ def _within(event_at: str, posted_at: str, window_seconds: int) -> bool:
     if start is None or seen is None:
         return False
     delta = (seen - start).total_seconds()
-    return -1 <= delta <= window_seconds
+    return -PROVENANCE_SKEW_SECONDS <= delta <= window_seconds
+
+
+def same_login(a: str | None, b: str | None) -> bool:
+    """GitHub logins are case-insensitive."""
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+def shift_iso(value: str, seconds: int) -> str:
+    """``value`` moved by ``seconds``, in GitHub's second-precision format."""
+    instant = _parse_instant(value)
+    if instant is None:
+        return value
+    return (instant + _dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def loop_request_times_from_entry(
+    entry: Any,
+    vendor: review_vendors.ReviewVendor,
+    logged: list[dict[str, Any]] | None = None,
+) -> list[str] | None:
+    """The countable request times this loop recorded for ``vendor``, sorted.
+
+    None means unknown, not empty: no record for the PR, or a POST whose
+    record could not be written (``review_requests_incomplete``). An empty
+    list is authoritative to the counter. Records stored with
+    ``countable: False`` are the free first request; whether a request is a
+    re-review is known when it is posted, so it is never re-derived by
+    comparing the local clock with GitHub's. ``logged`` is the PR's
+    append-only request log (``loop_state.read_request_log``); records in
+    ``entry`` are the older state.json form, still honored.
+    """
+    if isinstance(entry, dict) and (entry.get("review_requests_incomplete") or entry.get("review_request_in_flight")):
+        return None
+    if logged and any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return None
+    stored = entry.get("review_requests") if isinstance(entry, dict) else None
+    if not isinstance(stored, list) and logged is None:
+        return None
+    requests = (stored if isinstance(stored, list) else []) + (logged or [])
+    out = []
+    for item in requests:
+        if not isinstance(item, dict) or item.get("countable") is False or item.get("initial_review") is True:
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        at = item.get("at")
+        if _parse_instant(at) is None:
+            return None
+        out.append(at)
+    return sorted(out)
 
 
 def _parse_instant(value: str) -> _dt.datetime | None:
@@ -180,60 +236,6 @@ def _parse_instant(value: str) -> _dt.datetime | None:
         return None
 
 
-def recorded_review_request_times(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
-    """Read loop-owned re-review timestamps; None means unknown, not empty."""
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
-        # Unknown provenance must not look like zero cap usage after a POST.
-        return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
-        return None
-    out = []
-    for item in requests:
-        if not isinstance(item, dict):
-            continue
-        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
-            continue
-        if item.get("initial_review") is True:
-            continue
-        at = item.get("at")
-        if _parse_instant(at) is None:
-            return None
-        out.append(at)
-    return sorted(out)
-
-
-def merge_comment_receipts(comments: list[dict[str, Any]], trigger: str, receipts: Any) -> list[dict[str, Any]]:
-    """Union filtered GitHub comments with successful local posts by database ID."""
-    out = []
-    observed_ids = set()
-    for comment in comments:
-        comment_id = comment.get("fullDatabaseId")
-        if isinstance(comment_id, str) and comment_id.isascii() and comment_id.isdecimal():
-            comment_id = int(comment_id)
-        if type(comment_id) is not int or comment_id <= 0:
-            comment_id = comment.get("id")
-        known_id = type(comment_id) is int and comment_id > 0
-        if known_id and comment_id in observed_ids:
-            continue
-        out.append(comment)
-        if known_id:
-            observed_ids.add(comment_id)
-    vendor = review_vendors.vendor_for(trigger)
-    for receipt in receipts if isinstance(receipts, list) else []:
-        if not isinstance(receipt, dict) or not isinstance(receipt.get("reviewer"), str):
-            continue
-        reviewer = receipt["reviewer"]
-        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
-        comment_id = receipt.get("comment_id")
-        known_id = type(comment_id) is int and comment_id > 0
-        if matches and (not known_id or comment_id not in observed_ids):
-            out.append({"createdAt": receipt.get("at"), "localReceipt": True})
-            if known_id:
-                observed_ids.add(comment_id)
-    return out
-
-
 def counted_review_requests(
     events: Any,
     *,
@@ -241,7 +243,6 @@ def counted_review_requests(
     vendor: review_vendors.ReviewVendor,
     first_completed_review_at: str | None,
     loop_request_times: list[str] | None = None,
-    known_rereview_times: list[str] | None = None,
     match_window_seconds: int = 180,
 ) -> list[dict[str, Any]]:
     """The review requests that consume the loop cap, in timeline order.
@@ -258,9 +259,6 @@ def counted_review_requests(
     claims at most one event. ``loop_request_times=None`` means "no local
     record available" and falls back to the actor filter, which bounds the
     loop from above rather than exactly.
-    Explicit non-initial receipts stay charged despite clock skew. A legacy
-    initial match is free only when its entire window precedes the boundary;
-    ambiguous legacy receipts carry ``provenance_unknown`` instead.
     """
     if not first_completed_review_at:
         return []
@@ -271,51 +269,32 @@ def counted_review_requests(
             continue
         if review_vendors.vendor_for(event["reviewer_login"]) is not vendor:
             continue
+        # The actor fallback cannot tell the free first request from a
+        # re-review in the first review's second, so it excludes that second.
+        # Recorded times already exclude the free request (``countable``), so
+        # with them only events strictly before the first review are cycle 0.
+        if loop_request_times is None:
+            if event["created_at"] <= first_completed_review_at:
+                continue
+        elif event["created_at"] < first_completed_review_at:
+            continue
         candidates.append(event)
     candidates.sort(key=lambda event: event["created_at"])
 
     if loop_request_times is None:
-        candidates = [event for event in candidates if event["created_at"] > first_completed_review_at]
         if agent_login is None:
             return candidates
-        return [event for event in candidates if event["actor_login"] == agent_login]
+        return [event for event in candidates if same_login(event["actor_login"], agent_login)]
 
     out: list[dict[str, Any]] = []
     unmatched = list(candidates)
     for posted_at in sorted(loop_request_times):
-        known_rereview = posted_at in (known_rereview_times or [])
-        posted_time = _parse_instant(posted_at)
-        boundary = _parse_instant(first_completed_review_at)
-        initial_window = bool(not known_rereview and posted_time and boundary and posted_time + _dt.timedelta(seconds=match_window_seconds) < boundary)
-        matches = [index for index, event in enumerate(unmatched)
-                   if (agent_login is None or event["actor_login"].casefold() == agent_login.casefold())
-                   and _within(event["created_at"], posted_at, match_window_seconds)]
-        if not initial_window:
-            if not known_rereview and posted_at <= first_completed_review_at and any(unmatched[index]["created_at"] <= first_completed_review_at for index in matches):
-                matches = []
-            else:
-                matches = [index for index in matches if unmatched[index]["created_at"] > first_completed_review_at]
-        sides = {unmatched[index]["created_at"] > first_completed_review_at for index in matches}
-        if matches and len(sides) == 1:
-            event = unmatched.pop(matches[0])
-            if event["created_at"] > first_completed_review_at:
-                out.append(event)
-        else:
-            # A successful local POST consumes its slot even before GitHub's
-            # timeline reflects it. A legacy initial receipt needs GitHub
-            # evidence to be free; an ambiguous boundary match stays unknown.
-            receipt = {"created_at": posted_at, "reviewer_login": vendor.login, "actor_login": agent_login}
-            if not known_rereview and (posted_at <= first_completed_review_at or posted_time is None):
-                receipt["provenance_unknown"] = True
-            out.append(receipt)
+        for index, event in enumerate(unmatched):
+            if _within(event["created_at"], posted_at, match_window_seconds):
+                out.append(unmatched.pop(index))
+                break
     out.sort(key=lambda event: event["created_at"])
     return out
-
-
-def known_rereview_times(receipts: Any, vendor: review_vendors.ReviewVendor) -> list[str]:
-    return [receipt["at"] for receipt in receipts if isinstance(receipt, dict)
-            and review_vendors.vendor_for(receipt.get("reviewer")) is vendor
-            and receipt.get("initial_review") is False and _parse_instant(receipt.get("at")) is not None] if isinstance(receipts, list) else []
 
 
 def canonical_login(login: str) -> str:
@@ -430,3 +409,63 @@ def discover_candidates(
             seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
         )
     ]
+
+
+def recorded_review_request_times(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
+    """Read loop-owned re-review timestamps; None means unknown, not empty."""
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        # Unknown provenance must not look like zero cap usage after a POST.
+        return None
+    requests = entry.get("review_requests")
+    if not isinstance(requests, list):
+        return None
+    out = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        if item.get("initial_review") is True:
+            continue
+        at = item.get("at")
+        if _parse_instant(at) is None:
+            return None
+        out.append(at)
+    return sorted(out)
+
+
+def merge_comment_receipts(comments: list[dict[str, Any]], trigger: str, receipts: Any) -> list[dict[str, Any]]:
+    """Union filtered GitHub comments with successful local posts by database ID."""
+    out = []
+    observed_ids = set()
+    for comment in comments:
+        comment_id = comment.get("fullDatabaseId")
+        if isinstance(comment_id, str) and comment_id.isascii() and comment_id.isdecimal():
+            comment_id = int(comment_id)
+        if type(comment_id) is not int or comment_id <= 0:
+            comment_id = comment.get("id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if known_id and comment_id in observed_ids:
+            continue
+        out.append(comment)
+        if known_id:
+            observed_ids.add(comment_id)
+    vendor = review_vendors.vendor_for(trigger)
+    for receipt in receipts if isinstance(receipts, list) else []:
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("reviewer"), str):
+            continue
+        reviewer = receipt["reviewer"]
+        matches = review_vendors.vendor_for(reviewer) is vendor if vendor else reviewer.lstrip("@").casefold() == trigger.lstrip("@").casefold()
+        comment_id = receipt.get("comment_id")
+        known_id = type(comment_id) is int and comment_id > 0
+        if matches and (not known_id or comment_id not in observed_ids):
+            out.append({"createdAt": receipt.get("at"), "localReceipt": True})
+            if known_id:
+                observed_ids.add(comment_id)
+    return out
+
+
+def known_rereview_times(receipts: Any, vendor: review_vendors.ReviewVendor) -> list[str]:
+    return [receipt["at"] for receipt in receipts if isinstance(receipt, dict)
+            and review_vendors.vendor_for(receipt.get("reviewer")) is vendor
+            and receipt.get("initial_review") is False and _parse_instant(receipt.get("at")) is not None] if isinstance(receipts, list) else []

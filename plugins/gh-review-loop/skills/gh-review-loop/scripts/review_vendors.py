@@ -65,9 +65,8 @@ CODEX = ReviewVendor(
 )
 
 # Copilot does not react to an @copilot comment. It reviews when it is added
-# as a requested reviewer — the same REST call for the first request and every
-# re-request (GitHub changelog 2026-10-02; behaviour confirmed on public PRs,
-# see docs/superpowers/specs/evidence/2026-10-10-copilot-live-scan.txt). Its
+# as a requested reviewer. The first request uses REST; subsequent requests
+# use GraphQL rerequestReviews with the PR and reviewer node IDs. Its
 # login differs by API: GraphQL ``copilot-pull-request-reviewer``, REST reviews
 # ``copilot-pull-request-reviewer[bot]``, REST timeline ``Copilot``. GitHub
 # does not dedupe requests server-side (two requests on one head produce two
@@ -90,7 +89,7 @@ CODERABBIT = ReviewVendor(
     auto_reviews=True,
 )
 
-KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX, COPILOT, CODERABBIT)}
+KNOWN_VENDORS = {vendor.login: vendor for vendor in (GEMINI, CODEX, CODERABBIT, COPILOT)}
 
 # The loop has no default reviewer: with nothing configured it asks rather than
 # assumes. This is the reviewer it may *offer*. It is a ping-first vendor so

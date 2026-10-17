@@ -315,32 +315,6 @@ def test_counted_requests_is_empty_before_any_completed_review():
     ) == []
 
 
-def test_initial_event_cannot_free_a_later_receipt_near_boundary():
-    counted = reviewer_resolver.counted_review_requests(
-        [_gql_event("agent", "2026-10-07T15:59:59Z")], agent_login="agent", vendor=review_vendors.COPILOT,
-        first_completed_review_at="2026-10-07T16:00:00Z", loop_request_times=["2026-10-07T16:00:01Z"],
-    )
-    assert len(counted) == 1
-    assert counted[0]["created_at"] == "2026-10-07T16:00:01Z"
-
-
-def test_receipt_matching_events_on_both_sides_of_boundary_stays_unknown():
-    counted = reviewer_resolver.counted_review_requests(
-        [_gql_event("agent", "2026-10-07T15:59:58Z"), _gql_event("agent", "2026-10-07T16:00:01Z")],
-        agent_login="agent", vendor=review_vendors.COPILOT, first_completed_review_at="2026-10-07T16:00:00Z",
-        loop_request_times=["2026-10-07T15:59:59Z"],
-    )
-    assert len(counted) == 1 and counted[0]["provenance_unknown"] is True
-
-
-def test_lone_initial_event_cannot_free_a_near_boundary_legacy_receipt():
-    counted = reviewer_resolver.counted_review_requests(
-        [_gql_event("agent", "2026-10-07T15:59:58Z")], agent_login="agent", vendor=review_vendors.COPILOT,
-        first_completed_review_at="2026-10-07T16:00:00Z", loop_request_times=["2026-10-07T15:59:59Z"],
-    )
-    assert len(counted) == 1 and counted[0]["provenance_unknown"] is True
-
-
 def test_review_authors_and_pending_requests_are_candidates_too():
     """A Copilot review with zero findings has no thread comments, and a
     just-requested Copilot has nothing at all yet; both must be discoverable."""
@@ -430,3 +404,75 @@ def test_an_unknown_reviewer_login_is_left_exactly_as_given():
     record = reviewer_resolver.make_reviewer_record("some-new-bot[bot]", source="explicit")
 
     assert record["login"] == "some-new-bot[bot]"
+
+
+def test_a_cycle_zero_record_never_claims_a_later_manual_request():
+    """The initial loop request is free. Its record is stored as not
+    countable, so even inside the match window it cannot claim a manual
+    re-request made right after the first review (PR #116 review)."""
+    entry = {"review_requests": [
+        {"reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T15:42:26Z", "countable": False},
+    ]}
+    times = reviewer_resolver.loop_request_times_from_entry(entry, review_vendors.COPILOT)
+    events = [
+        _gql_event("agent", "2026-10-07T15:42:27Z"),  # initial loop request
+        _gql_event("agent", "2026-10-07T15:44:00Z"),  # member clicks re-request in the UI
+    ]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:43:10Z",
+        loop_request_times=times,
+    )
+
+    assert times == []
+    assert counted == []
+
+
+def test_entry_reader_treats_missing_or_incomplete_history_as_unknown():
+    assert reviewer_resolver.loop_request_times_from_entry(None, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry({}, review_vendors.COPILOT) is None
+    assert reviewer_resolver.loop_request_times_from_entry(
+        {"review_requests": [], "review_requests_incomplete": True}, review_vendors.COPILOT) is None
+
+
+def test_a_fast_local_clock_still_matches_its_event():
+    """The record is the local pre-POST time; the event is GitHub's. A local
+    clock a few seconds ahead must not orphan every record (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T16:20:00Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T16:20:45Z"],
+    )
+
+    assert [e["created_at"] for e in counted] == ["2026-10-07T16:20:00Z"]
+
+
+def test_the_fallback_actor_filter_ignores_login_case():
+    """GitHub logins are case-insensitive; `--agent-login orenashkenazy` must
+    still count `OrenAshkenazy`'s requests when provenance is unknown (PR #116 review)."""
+    events = [_gql_event("OrenAshkenazy", "2026-10-07T16:20:05Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="orenashkenazy", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z", loop_request_times=None,
+    )
+
+    assert len(counted) == 1
+
+
+def test_a_logged_re_review_in_the_first_review_second_counts():
+    """GitHub stamps to the second. A re-review recorded as countable whose
+    event shares the first review's second is still a re-review; the
+    cycle-zero cutoff belongs to the actor fallback only (PR #116 review)."""
+    events = [_gql_event("agent", "2026-10-07T15:46:14Z")]
+
+    counted = reviewer_resolver.counted_review_requests(
+        events, agent_login="agent", vendor=review_vendors.COPILOT,
+        first_completed_review_at="2026-10-07T15:46:14Z",
+        loop_request_times=["2026-10-07T15:46:13Z"],
+    )
+
+    assert len(counted) == 1

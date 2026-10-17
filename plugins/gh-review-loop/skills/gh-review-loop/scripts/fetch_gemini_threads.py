@@ -41,6 +41,7 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     summary_is_stale,  # noqa: F401 — re-exported; state consumers import via this module
 )
 from loop_state import safe_int as _safe_int  # noqa: E402
+import loop_state  # noqa: E402
 
 
 # There is no default reviewer. An unconfigured PR resolves to "none configured"
@@ -80,6 +81,8 @@ SEVERITY_RE = re.compile(r"!\[(critical|high|medium|low)\]", re.IGNORECASE)
 # Codex marks findings with a shields.io priority badge whose alt text is the
 # priority. Example: ![P2 Badge](https://img.shields.io/badge/P2-yellow...)
 CODEX_PRIORITY_RE = re.compile(r"!\[(P[0-3])(?:\s+Badge)?\]", re.IGNORECASE)
+# Some reviewers prefix findings with a plain [P0]–[P3] text marker.
+PLAIN_PRIORITY_RE = re.compile(r"\A(?:[ \t]*\r?\n)* {0,3}\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
 CODEX_PRIORITY_TO_SEVERITY = {
     "p0": "critical",
     "p1": "high",
@@ -96,16 +99,13 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
-    r"\[(?P<title>[^\]\n]*)\]\((?:https?://[^\s()]+)?#discussion_r(?P<id>\d+)\)",
+    # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
+    # is matched lazily up to the `](#discussion_r` that ends it.
+    r"\[(?P<title>[^\n]*?)\]\(#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
-)
-COPILOT_BODY_FINDING_RE = re.compile(
-    r'<details[^>]*>\s*<summary>\s*<picture>.*?'
-    r'</picture>\s*(?P<title>[^<]+)</summary>(?P<body>.*?)</details>',
-    re.IGNORECASE | re.DOTALL,
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
 # "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
@@ -260,6 +260,9 @@ query($owner:String!, $repo:String!, $number:Int!) {
       headRefOid
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
+      reviewRequests(first:50) {
+        nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
+      }
       comments(last:100) {
         nodes {
           id
@@ -307,6 +310,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
           originalStartLine
           diffSide
           comments(first:50) {
+            pageInfo { hasNextPage endCursor }
             pageInfo { hasNextPage endCursor }
             nodes {
               id
@@ -486,7 +490,82 @@ def fetch_threads(pr: PullRequest) -> dict[str, Any]:
                 break
             comments.setdefault("nodes", []).extend(nodes)
             comments["pageInfo"] = info
+    backfill_reviews(pr, pull_request)
     return pull_request
+
+
+FULL_REVIEWS_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $reviewsAfter:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviews(first:100, after:$reviewsAfter) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          body
+          state
+          submittedAt
+          url
+          commit { oid }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def reviews_page_truncated(pull_request: dict[str, Any]) -> bool:
+    """True when the reviews list may be missing older reviews.
+
+    The main query reads ``reviews(last:100)``. A full page can hide the head
+    review or the vendor's first completed review (the free-cycle boundary),
+    unless ``backfill_reviews`` replaced it with the complete history.
+    """
+    reviews = pull_request.get("reviews") or {}
+    if reviews.get("complete"):
+        return False
+    return len(reviews.get("nodes") or []) >= PAGE_LIMIT_REVIEWS
+
+
+def backfill_reviews(pr: PullRequest, pull_request: dict[str, Any], *, max_pages: int = 20) -> None:
+    """Replace a full reviews page with the PR's whole review history, in place.
+
+    The waiter, the clean gate and the cap all read ``reviews``; on a PR with
+    more than 100 reviews the single page hides exactly the reviews they
+    need. Any failure leaves the original page untouched, so
+    ``reviews_page_truncated`` keeps reporting it as a bound.
+    """
+    if not reviews_page_truncated(pull_request):
+        return
+    nodes: list[dict[str, Any]] = []
+    after: str | None = None
+    try:
+        for _ in range(max_pages):
+            gh_args = [
+                "api", "graphql",
+                "-f", f"query={FULL_REVIEWS_QUERY}",
+                "-F", f"owner={pr.owner}",
+                "-F", f"repo={pr.repo}",
+                "-F", f"number={pr.number}",
+            ]
+            if after:
+                gh_args.extend(["-F", f"reviewsAfter={after}"])
+            result = run_gh(gh_args)
+            reviews = result["data"]["repository"]["pullRequest"]["reviews"]
+            nodes.extend(node for node in (reviews.get("nodes") or []) if isinstance(node, dict))
+            page_info = reviews.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+            if not after:
+                return
+        else:
+            return
+    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        return
+    pull_request["reviews"] = {"nodes": nodes, "complete": True}
 
 
 def fetch_remaining_discovery_comments(
@@ -833,13 +912,15 @@ def thread_severity(thread: dict[str, Any]) -> str:
     see ``annotate_reviewer_severity``) wins. Otherwise Gemini's priority image
     or Codex's P0-P3 badge in a comment body decides; both are unambiguous, so
     both are read regardless of selected reviewer.
-    CodeRabbit's Potential issue header maps Critical/Major/Minor to severity.
     """
     annotated = thread.get("reviewerSeverity")
     if isinstance(annotated, str) and annotated in SEVERITY_ORDER and annotated != "unknown":
         return annotated
     for comment in _iter_comments(thread):
         body = comment.get("body") or ""
+        plain_match = PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
         match = SEVERITY_RE.search(body)
         if match:
             return match.group(1).lower()
@@ -939,6 +1020,7 @@ def _derive_outcome(
     *,
     gemini_confirmed: bool = True,
     likely_fixed_remaining: int = 0,
+    clean_blocked: str | None = None,
 ) -> str:
     """Best-effort outcome when the agent does not pass --outcome explicitly.
 
@@ -969,8 +1051,12 @@ def _derive_outcome(
     likely_all_fixed = (
         remaining_actionable > 0 and likely_fixed_remaining >= remaining_actionable
     )
-    # No open threads and the suite passed — it *looks* resolved.
-    looks_resolved = remaining_actionable == 0 and verification == "passed"
+    # No open threads and the suite passed — it *looks* resolved. A blocking
+    # Copilot clean gate (``clean_blocked_by``) says zero threads is not
+    # clean yet, so the record must not say clean either.
+    looks_resolved = (
+        remaining_actionable == 0 and verification == "passed" and not clean_blocked
+    )
 
     # Final wait timed out (Gemini never re-confirmed) but state otherwise looks
     # fixed: never guess clean or capped — report pending confirmation.
@@ -996,7 +1082,6 @@ def pagination_warnings(
     """
     warnings: list[str] = []
     pr_comments = (pull_request.get("comments") or {}).get("nodes") or []
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
     if review_request_vendor and not review_request_count_complete(
         pull_request, review_request_vendor=review_request_vendor
@@ -1009,7 +1094,7 @@ def pagination_warnings(
         warnings.append(
             f"PR comments hit page limit ({PAGE_LIMIT_PR_COMMENTS}); older comments may be missing."
         )
-    if len(reviews) >= PAGE_LIMIT_REVIEWS:
+    if reviews_page_truncated(pull_request):
         warnings.append(
             f"PR reviews hit page limit ({PAGE_LIMIT_REVIEWS}); older reviews may be missing."
         )
@@ -1168,23 +1253,16 @@ def review_body_findings(
     """Surface priority-badged findings that live in the review body.
 
     Codex usually publishes inline review comments, but it can put a finding
-    directly in the review body, where no thread exists to fetch. Copilot can
-    also embed findings in its overview. Its current-head review takes
-    precedence; otherwise the newest review supersedes older body findings.
+    directly in the review body, where no thread exists to fetch. Only the
+    newest review counts: a later re-review supersedes older body findings, so
+    these synthetic entries go stale the same way threads do.
     """
     reviews = filter_reviews(pull_request, author)
     if not reviews:
         return []
-    latest = (
-        _latest_overview_review(pull_request, author)
-        if review_vendors.vendor_for(author) is review_vendors.COPILOT
-        else max(reviews, key=lambda review: review.get("submittedAt") or "")
-    )
-    if latest is None:
-        return []
+    latest = max(reviews, key=lambda review: review.get("submittedAt") or "")
     body = latest.get("body") or ""
-    copilot = COPILOT_OVERVIEW_MARKER in body
-    badges = list((COPILOT_BODY_FINDING_RE if copilot else CODEX_PRIORITY_RE).finditer(body))
+    badges = list(CODEX_PRIORITY_RE.finditer(body))
     if not badges:
         return []
 
@@ -1198,16 +1276,6 @@ def review_body_findings(
         anchor = anchors[-1] if anchors else None
         path = anchor.group(1) if anchor else "(review body)"
         line = int(anchor.group(2)) if anchor else None
-        finding_body = body[badge.start():end].strip()
-        severity = None
-        if copilot:
-            severity = COPILOT_SEVERITY_ICON_RE.search(badge.group())
-            if not severity:
-                continue
-            finding_body = badge.group("title").strip() + "\n\n" + badge.group("body").strip()
-            location = re.search(r"`([^`\n]+):(\d+)`", badge.group("body"))
-            path = location.group(1).replace("\u200b", "") if location else "(review body)"
-            line = int(location.group(2)) if location else None
         findings.append({
             "id": f"review-body:{review_id}:{index + 1}",
             "isResolved": False,
@@ -1221,7 +1289,7 @@ def review_body_findings(
             "comments": [{
                 "id": f"{review_id}:{index + 1}",
                 "author": {"login": author},
-                "body": finding_body,
+                "body": body[badge.start():end].strip(),
                 "createdAt": latest.get("submittedAt"),
                 "updatedAt": latest.get("submittedAt"),
                 "url": latest.get("url"),
@@ -1233,11 +1301,6 @@ def review_body_findings(
                 "diffHunk": "",
             }],
         })
-        if severity:
-            findings[-1]["reviewerSeverity"] = severity.group(1).lower()
-            linked = COPILOT_FINDING_RE.search(badge.group())
-            if linked:
-                findings[-1]["reviewerDiscussionId"] = linked.group("id")
     return findings
 
 
@@ -1250,6 +1313,7 @@ def review_request_count_complete(
     review_request_vendor: bool = True,
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
+    provenance_incomplete: bool = False,
     comment_receipts: list[dict[str, Any]] | None | object = _PROVENANCE_UNSET,
     ambiguous_receipts: bool = False,
 ) -> bool:
@@ -1261,18 +1325,17 @@ def review_request_count_complete(
     look free and lets the loop run another fix/push cycle before
     request_rereview.py (which paginates) refuses the write.
 
-    Explicitly incomplete local history makes either vendor's count uncertain.
-    Comment vendors also need a complete PR-comment page.
+    Only review-request vendors count timeline events; a comment vendor's
+    count comes from PR comments, so for it this is always True.
     """
     if comment_receipts is None or ambiguous_receipts:
         return False
     if not review_request_vendor:
-        comments = (pull_request.get("comments") or {}).get("nodes") or []
-        return len(comments) < PAGE_LIMIT_PR_COMMENTS
+        return len((pull_request.get("comments") or {}).get("nodes") or []) < PAGE_LIMIT_PR_COMMENTS
     if loop_request_times is None and isinstance(comment_receipts, list):
         for receipt in comment_receipts:
             vendor = review_vendors.vendor_for(receipt.get("reviewer")) if isinstance(receipt, dict) else None
-            if vendor and vendor.trigger_kind == "review_request" and receipt.get("initial_review") is not True and _parse_iso_utc(receipt.get("at")) is None:
+            if vendor and vendor.trigger_kind == "review_request" and receipt.get("initial_review") is not True and receipt.get("countable") is not False and _parse_iso_utc(receipt.get("at")) is None:
                 return False
     # Provenance is the third thing the count rests on: without a local record
     # the loop cannot tell its own requests from the member's clicks. That only
@@ -1281,9 +1344,21 @@ def review_request_count_complete(
     # the page-limit answer alone (back-compat).
     if loop_request_times is None and counted_requests:
         return False
+    # A posted request that could not be logged: its event may not have
+    # reached the timeline yet, so even zero matched events is a bound.
+    if provenance_incomplete:
+        return False
+    # A request the loop durably recorded but whose event the timeline does
+    # not show yet still consumed the cap: fewer matched events than records
+    # makes the count a lower bound, not an exact number.
+    if (
+        isinstance(loop_request_times, list)
+        and counted_requests is not None
+        and counted_requests < len(loop_request_times)
+    ):
+        return False
     nodes = (pull_request.get("timelineItems") or {}).get("nodes") or []
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
-    return len(nodes) < PAGE_LIMIT_TIMELINE and len(reviews) < PAGE_LIMIT_REVIEWS
+    return len(nodes) < PAGE_LIMIT_TIMELINE and not reviews_page_truncated(pull_request)
 
 
 def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
@@ -1333,7 +1408,7 @@ def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dic
     return sorted(
         (
             review for review in filter_reviews(pull_request, author)
-            if review.get("state") != "PENDING"
+            if review.get("state") not in ("PENDING", "DISMISSED")
         ),
         key=lambda review: review.get("submittedAt") or "",
     )
@@ -1366,8 +1441,8 @@ def copilot_overview_severities(
         if parsed["unlinked_findings"]:
             warnings.append(
                 f"{parsed['unlinked_findings']} finding(s) in the {author} review "
-                f"overview at {review.get('url')} have no linked inline thread; "
-                "check the review-body findings and overview."
+                f"overview at {review.get('url')} have no inline thread and are not "
+                "listed below."
             )
     return severities, warnings
 
@@ -1411,18 +1486,15 @@ def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head
     }
 
 
-def _latest_overview_review(
-    pull_request: dict[str, Any], author: str
-) -> dict[str, Any] | None:
-    head = pull_request.get("headRefOid") or ""
-    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
-    for review in newest_first:
-        if head and (review.get("commit") or {}).get("oid") == head:
-            return review
-    for review in newest_first:
-        if parse_copilot_overview(review.get("body")) is not None:
-            return review
-    return None
+def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The reviewer overview, for a review-request vendor (Copilot) only.
+
+    Only Copilot writes an overview; for comment reviewers (Codex, Gemini)
+    a head review would otherwise come back as a fabricated, unparseable one.
+    """
+    if reviewer_resolver.trigger_kind_for(author) != "review_request":
+        return None
+    return latest_reviewer_overview(pull_request, author)
 
 
 def latest_reviewer_overview(
@@ -1438,8 +1510,28 @@ def latest_reviewer_overview(
     readable overview is reported with ``covers_head: false``.
     """
     head = pull_request.get("headRefOid") or ""
-    review = _latest_overview_review(pull_request, author)
-    return _overview_record(review, parse_copilot_overview(review.get("body")), head) if review else None
+    newest_request = newest_request_at(pull_request, author)
+    listed = vendor_request_listed(pull_request, author)
+    newest_first = list(reversed(_reviews_oldest_first(pull_request, author)))
+
+    def current(review: dict[str, Any]) -> bool:
+        # Of the head, and not superseded by a later request on that head,
+        # whether that request shows on the timeline yet or is only listed.
+        return bool(head) and not listed and (review.get("commit") or {}).get("oid") == head and (
+            (review.get("submittedAt") or "") >= newest_request
+        )
+
+    for review in newest_first:
+        if current(review):
+            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+    for review in newest_first:
+        parsed = parse_copilot_overview(review.get("body"))
+        if parsed is not None:
+            record = _overview_record(review, parsed, head)
+            if record["covers_head"] and not current(review):
+                record["covers_head"] = False
+            return record
+    return None
 
 
 def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
@@ -1461,7 +1553,6 @@ def clean_blocked_by(
     *,
     review_request_vendor: bool,
     known_thread_ids: set[str] | None = None,
-    parsed_body_findings: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Why zero actionable threads is *not yet* clean for a review-request vendor.
 
@@ -1473,9 +1564,7 @@ def clean_blocked_by(
     review time, thread state is live, and the normal classification already
     decided those threads (spec §5.3). A reported finding the fetch never saw
     — no thread link, or a link to a thread that is not on the PR — still
-    blocks. Successfully parsed body findings are accounted for before
-    severity filtering; genuinely unparsed findings still block.
-    Comment vendors have no overview gate.
+    blocks. Comment vendors have no overview gate.
     """
     if threads or not review_request_vendor:
         return None
@@ -1483,24 +1572,39 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
-    body_links = {finding["reviewerDiscussionId"] for finding in parsed_body_findings or [] if finding.get("reviewerDiscussionId")}
-    unlinked_body = sum(not finding.get("reviewerDiscussionId") for finding in parsed_body_findings or [])
-    if (overview.get("unlinked_findings") or 0) > unlinked_body:
-        return "overview_reports_open_findings"
     open_findings = overview.get("open_findings") or 0
     if open_findings > 0:
-        if known_thread_ids is None:
+        if known_thread_ids is None or overview.get("unlinked_findings"):
             return "overview_reports_open_findings"
         linked = overview.get("finding_ids") or []
         # `open_findings` is the authoritative count; `finding_ids` is only what
         # the parser could recognize. Fewer links than findings means one is
         # unaccounted for — a markup change that drops a severity icon must not
         # read as clean just because the links that did parse are known.
-        if len(set(linked)) + unlinked_body < open_findings:
+        if len(linked) < open_findings:
             return "overview_reports_open_findings"
-        if any(fid not in known_thread_ids and fid not in body_links for fid in linked):
+        if any(fid not in known_thread_ids for fid in linked):
             return "overview_reports_open_findings"
     return None
+
+
+def rereview_limit_reached(
+    pull_request: dict[str, Any], author: str | None, used: int, limit: int
+) -> bool:
+    """Has the loop used its re-review cap?
+
+    For a review-request vendor (Copilot) with no completed review yet, the
+    next request is the free cycle 0, which request_rereview.py allows even
+    at a cap of 0, so the limit cannot be reached before that first review.
+    """
+    vendor = review_vendors.vendor_for(author) if author else None
+    if vendor is not None and vendor.trigger_kind == "review_request":
+        first = reviewer_resolver.first_completed_review_at(
+            (pull_request.get("reviews") or {}).get("nodes") or [], vendor
+        )
+        if not first:
+            return False
+    return used >= limit
 
 
 def rereview_requests(
@@ -1534,7 +1638,6 @@ def rereview_requests(
             # with, so the displayed count and the enforced count agree. A
             # request the member clicked themselves is not the loop's.
             loop_request_times=loop_request_times,
-            known_rereview_times=reviewer_resolver.known_rereview_times(comment_receipts, vendor),
         )
     if not review_trigger_mention:
         return []
@@ -1701,7 +1804,7 @@ STICKY_RECEIPT_MARKER = "<!-- gh-review-loop:sticky-receipt -->"
 
 
 def _state_key(pr: PullRequest) -> str:
-    return f"{pr.owner}/{pr.repo}#{pr.number}"
+    return state_key_for(load_sticky_state(), f"{pr.owner}/{pr.repo}", pr.number)
 
 
 def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str] | None:
@@ -1716,19 +1819,11 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
-    state = load_sticky_state()
-    entry = state.get(state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number))
-    return reviewer_resolver.recorded_review_request_times(entry, vendor)
-
-
-def loop_comment_receipts(pr: PullRequest) -> list[dict[str, Any]] | None:
-    state = load_sticky_state()
-    key = state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number)
-    entry = state.get(key, {})
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
-        return None
-    receipts = entry.get("review_requests", [])
-    return receipts if isinstance(receipts, list) else None
+    return reviewer_resolver.loop_request_times_from_entry(
+        load_sticky_state().get(_state_key(pr), {}),
+        vendor,
+        loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number),
+    )
 
 
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
@@ -3048,6 +3143,7 @@ def finding_fingerprint(thread: dict[str, Any]) -> str:
     comments = _iter_comments(thread)
     first_comment = comments[0].get("body") if comments and isinstance(comments[0], dict) else None
     body = first_comment if isinstance(first_comment, str) else ""
+    body = PLAIN_PRIORITY_RE.sub("", body, count=1)  # drop leading text priority
     body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)  # drop severity image
     body = re.sub(r"\s+", " ", body).strip().lower()
     return hashlib.sha1(f"{path}\n{body[:1000]}".encode()).hexdigest()[:16]
@@ -3100,15 +3196,59 @@ def review_activity_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def newest_request_at(pull_request: dict[str, Any], author: str) -> str:
+    """GitHub's time of the newest review request for ``author``'s vendor, or "".
+
+    Only review-request vendors have one. A head review submitted before it
+    is history: a re-request on an unchanged head asked for a new review.
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return ""
+    newest = ""
+    for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
+        event = reviewer_resolver.normalize_request_event(node)
+        if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
+            newest = max(newest, event["created_at"])
+    return newest
+
+
+def vendor_request_listed(pull_request: dict[str, Any], author: str) -> bool:
+    """Is ``author``'s review-request vendor currently a requested reviewer?
+
+    GitHub drops a reviewer from this list when it submits, so a listed
+    request has not been answered by any existing review, even when its
+    timeline event has not surfaced yet.
+    """
+    vendor = review_vendors.vendor_for(author)
+    if vendor is None or vendor.trigger_kind != "review_request":
+        return False
+    return any(
+        isinstance(node, dict)
+        and review_vendors.vendor_for((node.get("requestedReviewer") or {}).get("login")) is vendor
+        for node in (pull_request.get("reviewRequests") or {}).get("nodes") or []
+    )
+
+
 def head_review(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
-    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None."""
+    """The submitted (non-PENDING) review by ``author`` that covers the PR head, or None.
+
+    For a review-request vendor it must also answer the newest request: a
+    re-request on an unchanged head makes the earlier head review history,
+    or the waiter and the clean gate would take the old review for the new
+    one. Both times are GitHub's, and a same-second answer counts.
+    """
     head = pull_request.get("headRefOid") or ""
-    if not head:
+    if not head or vendor_request_listed(pull_request, author):
         return None
+    newest_request = newest_request_at(pull_request, author)
     for review in filter_reviews(pull_request, author):
-        if review.get("state") == "PENDING":
+        # A draft is not a review yet; a dismissed one was withdrawn.
+        if review.get("state") in ("PENDING", "DISMISSED"):
             continue
-        if ((review.get("commit") or {}).get("oid") or "") == head:
+        if ((review.get("commit") or {}).get("oid") or "") != head:
+            continue
+        if (review.get("submittedAt") or "") >= newest_request:
             return review
     return None
 
@@ -3442,13 +3582,16 @@ def render_markdown(
     baseline: dict[str, str] | None = None,
     full: bool = False,
     loop_requests: list[str] | None = None,
+    agent_login: str | None = None,
     counted_requests: list[dict[str, Any]] | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
     # `loop_requests` is the local provenance record, supplied by the caller
-    # that knows which PR this is; without it the count keeps the actor filter.
+    # that knows which PR this is; without it the count keeps the actor
+    # filter, so it needs the same agent login the enforced count uses.
     rereviews = counted_requests if counted_requests is not None else rereview_requests(
         pr,
+        agent_login,
         review_trigger_mention=review_trigger_mention,
         reviewer_login=author,
         loop_request_times=loop_requests,
@@ -4197,6 +4340,11 @@ def main() -> int:
                     file=sys.stderr,
                 )
         comment_receipts = loop_comment_receipts(pr)
+        selected_vendor = review_vendors.vendor_for(args.author)
+        if selected_vendor and selected_vendor.trigger_kind == "review_request" and loop_state.cap_count_uncertain(f"{pr.owner}/{pr.repo}", pr.number):
+            print("warning: local native-request history is incomplete or in flight", file=sys.stderr)
+        elif (not selected_vendor or selected_vendor.trigger_kind != "review_request") and comment_receipts is None:
+            print("warning: local comment-request history is incomplete or in flight", file=sys.stderr)
         rereviews = rereview_requests(
             pull_request,
             agent_login,
@@ -4205,7 +4353,7 @@ def main() -> int:
             loop_request_times=loop_request_times(pr, args.author),
             comment_receipts=comment_receipts,
         )
-        _limit_reached = len(rereviews) >= args.max_rereview_requests
+        _limit_reached = rereview_limit_reached(pull_request, args.author, len(rereviews), args.max_rereview_requests)
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
                 pull_request, args.author, dry_run=args.dry_run
@@ -4237,9 +4385,7 @@ def main() -> int:
         )
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
-        live_discussions = discussion_ids_on_pr(pull_request)
-        body_findings = [finding for finding in review_body_findings(pull_request, args.author) if finding.get("reviewerDiscussionId") not in live_discussions]
-        threads.extend(body_findings)
+        threads.extend(review_body_findings(pull_request, args.author))
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
         # an unparseable overview leaves every thread listed as `unknown`.
@@ -4247,7 +4393,7 @@ def main() -> int:
             pull_request, args.author
         )
         annotate_reviewer_severity(threads, overview_severities)
-        reviewer_overview = latest_reviewer_overview(pull_request, args.author)
+        reviewer_overview = reviewer_overview_for(pull_request, args.author)
         if reviewer_overview is not None:
             reviewer_overview["warnings"] = overview_warnings
         for warning in overview_warnings:
@@ -4255,9 +4401,6 @@ def main() -> int:
         review_request_vendor = (
             reviewer_resolver.trigger_kind_for(args.author) == "review_request"
         )
-        if comment_receipts is None or (review_request_vendor and any(item.get("provenance_unknown") for item in rereviews)):
-            history_kind = "native" if review_request_vendor else "comment"
-            print(f"warning: local {history_kind}-request history is incomplete or in flight; re-review capacity is unknown.", file=sys.stderr)
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:
@@ -4456,7 +4599,9 @@ def main() -> int:
                 accumulated_results = {}
             merged_judge_results = merge_judge_results(accumulated_results, judge_results)
             judge_ran = bool(run.get("judge_ran")) or bool(judge_status.get("ran"))
-            cap_reached = len(rereviews) >= args.max_rereview_requests
+            cap_reached = rereview_limit_reached(
+                pull_request, args.author, len(rereviews), args.max_rereview_requests
+            )
             fixed_markers = read_fixed_markers(pr)
             changed_paths = changed_files_in_range(args.changed_base, args.changed_head)
             remaining_states = classify_remaining_finding_states(
@@ -4475,6 +4620,10 @@ def main() -> int:
                 cap_reached,
                 gemini_confirmed=args.gemini_confirmed,
                 likely_fixed_remaining=likely_fixed_remaining,
+                clean_blocked=clean_blocked_by(
+                    threads, reviewer_overview, review_request_vendor=review_request_vendor,
+                    known_thread_ids=discussion_ids_on_pr(pull_request),
+                ),
             )
             derived = derive_record_fields(
                 baseline_ids=baseline_ids,
@@ -4797,7 +4946,6 @@ def main() -> int:
                             threads, reviewer_overview,
                             review_request_vendor=review_request_vendor,
                             known_thread_ids=discussion_ids_on_pr(pull_request),
-                            parsed_body_findings=body_findings,
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -4806,7 +4954,9 @@ def main() -> int:
                         ) or None,
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
-                        "limitReached": len(rereviews) >= args.max_rereview_requests,
+                        "limitReached": rereview_limit_reached(
+                            pull_request, args.author, len(rereviews), args.max_rereview_requests
+                        ),
                         # False when a page the count rests on was full, or
                         # when the loop has no local record of its own
                         # requests: the count above is then a bound, not a
@@ -4817,7 +4967,9 @@ def main() -> int:
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
                             comment_receipts=comment_receipts,
-                            ambiguous_receipts=review_request_vendor and any(item.get("provenance_unknown") for item in rereviews),
+                            provenance_incomplete=loop_state.cap_count_uncertain(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
                         ),
                         "agentLogin": agent_login,
                         "unresolvedOutdatedThreads": len(outdated_unresolved_threads(pull_request, args.author)),
@@ -4867,6 +5019,7 @@ def main() -> int:
                 baseline=render_baseline,
                 full=args.full,
                 loop_requests=loop_request_times(pr, args.author),
+                agent_login=agent_login,
                 counted_requests=rereviews,
             ),
             end="",
@@ -4892,7 +5045,6 @@ def main() -> int:
         blocked = clean_blocked_by(
             threads, reviewer_overview, review_request_vendor=review_request_vendor,
             known_thread_ids=discussion_ids_on_pr(pull_request),
-            parsed_body_findings=body_findings,
         )
         if blocked:
             print(
@@ -4945,6 +5097,21 @@ def main() -> int:
         except OSError as exc:
             print(f"warning: could not save render baseline: {exc}", file=sys.stderr)
     return 0
+
+
+def loop_comment_receipts(pr: PullRequest) -> list[dict[str, Any]] | None:
+    state = load_sticky_state()
+    key = state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number)
+    entry = state.get(key, {})
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        return None
+    receipts = entry.get("review_requests", [])
+    if not isinstance(receipts, list):
+        return None
+    logged = loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number)
+    if logged and any(item.get("incomplete") for item in logged):
+        return None
+    return receipts + (logged or [])
 
 
 if __name__ == "__main__":

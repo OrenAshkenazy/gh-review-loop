@@ -14,7 +14,6 @@ from fetch_gemini_threads import (
     finding_fingerprint,
     latest_reviewer_overview,
     parse_copilot_overview,
-    review_body_findings,
     thread_render_fingerprint,
     thread_severity,
 )
@@ -115,60 +114,6 @@ def test_clean_overview_is_approving_with_zero_findings():
     assert parsed["open_findings"] == 0
     assert parsed["complete"] is True
     assert parsed["findings"] == []
-
-
-def test_absolute_discussion_links_are_graded():
-    body = OVERVIEW.replace("](#discussion_r", f"]({PR_URL}#discussion_r")
-
-    parsed = parse_copilot_overview(body)
-
-    assert parsed["findings"] == parse_copilot_overview(OVERVIEW)["findings"]
-    assert parsed["unlinked_findings"] == 0
-
-
-def test_overview_only_findings_block_clean_with_zero_open_threads():
-    # Copilot's live re-review markup can report new findings under
-    # "Previously missed" while its inline-thread count is zero (PR #117).
-    body = CLEAN_OVERVIEW + f'''
-<details>
-<summary><strong>1 resolved since last review</strong></summary>
-- <picture><img alt="Medium severity"></picture> [Fixed]({PR_URL}#discussion_r11)
-</details>
-<details>
-<summary><strong>Previously missed (2)</strong></summary>
-<details><summary><picture><img alt="Medium severity"></picture> Honor per-run cap</summary>
-`scripts/\u200bpublish_changes.py:165`
-The publication gate ignores the current cap.
-</details>
-<details><summary><picture><img alt="Low severity"></picture> Rename test</summary>
-`tests/test_reviewer_resolver.py:155`
-The test name describes the previous behavior.
-</details>
-</details>
-'''
-    overview = latest_reviewer_overview(_pr(_review(body, "2026-10-12T18:17:37Z")), COPILOT)
-
-    assert overview["open_findings"] == 0
-    assert overview["finding_ids"] == ["11"]
-    assert overview["unlinked_findings"] == 2
-    assert clean_blocked_by([], overview, review_request_vendor=True, known_thread_ids={"11"}) == "overview_reports_open_findings"
-
-    findings = review_body_findings(_pr(_review(body, "2026-10-12T18:17:37Z")), COPILOT)
-    assert [(f["path"], f["line"], thread_severity(f)) for f in findings] == [
-        ("scripts/publish_changes.py", 165, "medium"),
-        ("tests/test_reviewer_resolver.py", 155, "low"),
-    ]
-    assert all(f["isReviewBodyFinding"] and f["comments"][0]["url"] == PR_URL + "#pullrequestreview-1" for f in findings)
-    assert "Honor per-run cap" in findings[0]["comments"][0]["body"]
-    assert "Rename test" not in findings[0]["comments"][0]["body"]
-    assert findings == review_body_findings(_pr(_review(body, "2026-10-12T18:17:37Z")), COPILOT)
-    clean = _review(CLEAN_OVERVIEW, "2026-10-12T19:00:00Z")
-    pending = {**clean, "state": "PENDING", "submittedAt": None}
-    assert len(review_body_findings(_pr(_review(body, "2026-10-12T18:17:37Z"), pending), COPILOT)) == 2
-    assert review_body_findings(_pr(_review(body, "2026-10-12T18:17:37Z"), clean), COPILOT) == []
-    delayed_old_head = _review(body, "2026-10-12T20:00:00Z", commit="old-head")
-    assert review_body_findings(_pr(clean, delayed_old_head), COPILOT) == []
-    assert latest_reviewer_overview(_pr(clean, delayed_old_head), COPILOT)["open_findings"] == 0
 
 
 def test_non_copilot_bodies_are_not_overviews():
@@ -442,3 +387,39 @@ def test_a_pending_review_never_covers_the_head_or_grades_a_finding():
 
     overview = fgt.latest_reviewer_overview(pr, "copilot-pull-request-reviewer")
     assert overview is None or overview.get("covers_head") is not True
+
+
+def test_finding_titles_may_contain_brackets():
+    """A title like `arr[i]` must not stop the discussion link from matching;
+    otherwise the finding counts as unlinked and the clean gate never clears
+    (PR #116 review)."""
+    body = (
+        "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\n"
+        "<summary><strong>2 open findings</strong></summary>\n\n"
+        '- <picture><img alt="High severity" width="62"></picture> [Guard arr[i] access](#discussion_r111) · New\n'
+        '- <picture><img alt="Low severity" width="62"></picture> [Add [Authorize] to route](#discussion_r222) · New\n'
+    )
+    parsed = parse_copilot_overview(body)
+
+    assert parsed["unlinked_findings"] == 0
+    assert parsed["findings"] == [
+        {"severity": "high", "discussion_id": "111", "title": "Guard arr[i] access"},
+        {"severity": "low", "discussion_id": "222", "title": "Add [Authorize] to route"},
+    ]
+
+
+def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head():
+    """Copilot reviewed the head clean, then was asked again without a push.
+    The old overview must not clear the gate while the new review is
+    pending (PR #116 review)."""
+    pr = _pr(_review(CLEAN_OVERVIEW, "2026-10-07T16:00:00Z"))
+    pr["timelineItems"] = {"nodes": [{
+        "__typename": "ReviewRequestedEvent", "createdAt": "2026-10-07T16:30:00Z",
+        "actor": {"login": "agent"},
+        "requestedReviewer": {"__typename": "Bot", "login": COPILOT},
+    }]}
+
+    overview = latest_reviewer_overview(pr, COPILOT)
+
+    assert overview["covers_head"] is False
+    assert clean_blocked_by([], overview, review_request_vendor=True) == "no_review_for_head"

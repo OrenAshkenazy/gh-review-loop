@@ -118,7 +118,7 @@ def test_head_change_after_comment_keeps_posted_result(monkeypatch, after):
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-mention", "@coderabbitai", "--expect-head", HEAD])
     result = rr._locked_request(args)
     assert result["posted"] is True and result["status"] == "review_head_unconfirmed"
-    assert len(rr.load_state()["owner/repo#1"]["review_requests"]) == 1
+    assert len(rr.loop_state.read_request_log("owner/repo", 1)) == 1
 
 
 def test_request_read_timeout_fails_closed(monkeypatch):

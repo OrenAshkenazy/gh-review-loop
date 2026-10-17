@@ -15,7 +15,7 @@ OTHER_HEAD = "b" * 40
 
 
 @pytest.mark.parametrize("initial_event", [True, False])
-def test_legacy_initial_receipt_is_free_only_with_github_evidence(monkeypatch, initial_event):
+def test_unflagged_legacy_receipts_remain_conservatively_charged(monkeypatch, initial_event):
     initial = "2026-10-07T15:30:00Z"
     later = "2026-10-07T16:20:00Z"
     boundary = "2026-10-07T16:00:00Z"
@@ -23,7 +23,7 @@ def test_legacy_initial_receipt_is_free_only_with_github_evidence(monkeypatch, i
     monkeypatch.setattr(rr, "load_state", lambda: {"acme/widget#159": entry})
     events = [{"event": "review_requested", "actor": {"login": "agent"}, "requested_reviewer": {"login": "copilot-pull-request-reviewer[bot]"}, "created_at": at} for at in ((initial, later) if initial_event else (later,))]
     monkeypatch.setattr(rr, "_timeline_events", lambda *args: events)
-    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", boundary) == (1 if initial_event else None)
+    assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", boundary) == 2
 
 
 def test_clock_skew_across_first_review_boundary_still_counts_rerequest(monkeypatch):
@@ -44,7 +44,9 @@ def test_explicit_rereview_receipt_cannot_match_an_initial_event(monkeypatch):
     assert rr.count_agent_review_requests("acme/widget", 159, review_vendors.COPILOT, "agent", "2026-10-07T16:00:00Z") == 1
     pr = {"timelineItems": {"nodes": [event]}, "reviews": {"nodes": [{"user": {"login": "copilot"}, "submitted_at": "2026-10-07T16:00:00Z", "state": "COMMENTED"}]}}
     counted = fgt.rereview_requests(pr, "agent", reviewer_login="copilot", loop_request_times=[entry["review_requests"][0]["at"]], comment_receipts=entry["review_requests"])
-    assert len(counted) == 1 and not counted[0].get("provenance_unknown")
+    assert counted == []
+    assert not fgt.review_request_count_complete(pr, loop_request_times=[entry["review_requests"][0]["at"]], counted_requests=0)
+    # The counter above still charges the durable record while the collector reports a bound.
 
 
 @pytest.mark.parametrize("at", [None, "invalid", ""])
@@ -117,24 +119,24 @@ def test_implicit_head_guard_blocks_a_push_between_marker_and_post(monkeypatch, 
     stub_request_state(monkeypatch)
     monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
     remote = {"state": "open", "head": {"sha": HEAD}}
-    real_mark = rr._mark_request_in_flight
+    real_mark = rr.record_unconfirmed_request
     calls = []
 
-    def mark(*args):
-        real_mark(*args)
-        if args[-1] is not None:
-            remote["head"]["sha"] = OTHER_HEAD
+    def mark(*args, **kwargs):
+        saved = real_mark(*args, **kwargs)
+        remote["head"]["sha"] = OTHER_HEAD
+        return saved
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
         assert "--method" not in cmd
         return subprocess.CompletedProcess(cmd, 0, json.dumps(remote), "")
 
-    monkeypatch.setattr(rr, "_mark_request_in_flight", mark)
+    monkeypatch.setattr(rr, "record_unconfirmed_request", mark)
     monkeypatch.setattr(rr.subprocess, "run", runner)
     assert rr.main(["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "copilot", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["posted"] is False and len(calls) == 1
-    assert not rr.load_state()["acme/widget#159"].get("review_request_in_flight")
+    assert rr.read_unconfirmed_request("acme/widget", 159) is None
 
 
 def test_copilot_rechecks_head_after_cancelling_stale_request(monkeypatch, capsys):

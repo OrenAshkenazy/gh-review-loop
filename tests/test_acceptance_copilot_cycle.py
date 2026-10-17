@@ -1,7 +1,7 @@
 """Acceptance test: one full Copilot review cycle over recorded PR payloads.
 
 Copilot differs from Codex in three ways this test pins: it is re-reviewed by
-a review request (REST), not a comment; the cap counts ReviewRequestedEvents
+a review request, not a comment; the cap counts ReviewRequestedEvents
 the agent caused after the first completed review, not mentions; and
 severities live in the review overview, not in the inline comments. The wait
 is anchored on the head commit. Only the `gh` boundary is stubbed.
@@ -102,69 +102,6 @@ def test_a_copilot_that_left_findings_is_discovered_from_its_threads(loop, monke
     assert [(r["login"], r["source"]) for r in reviewers] == [(COPILOT, "thread")]
 
 
-@pytest.mark.parametrize("unparsed", [False, True])
-@pytest.mark.parametrize("linked", [False, True])
-def test_filtered_body_findings_only_block_clean_when_unparsed(loop, monkeypatch, capsys, unparsed, linked):
-    payload = copy.deepcopy(FIXTURE["initial"])
-    payload["reviewThreads"] = {"nodes": []}
-    review = payload["reviews"]["nodes"][-1]
-    review["body"] = '''<!-- ccr-overview-v2 -->
-### 🟡 Changes recommended
-<summary><strong>0 open findings</strong></summary>
-<details><summary><picture><img alt="Low severity"></picture> Rename test</summary>
-`tests/example.py:1`
-The test name is misleading.
-</details>
-'''
-    if unparsed:
-        review["body"] += '<picture><img alt="Medium severity"></picture> Unrecognized markup'
-    if linked:
-        review["body"] = review["body"].replace('Rename test</summary>', '[Rename test](#discussion_r11)</summary>')
-        review["body"] = review["body"].replace('0 open findings', '2 open findings' if unparsed else '1 open findings')
-        if unparsed:
-            review["body"] = review["body"].replace('<picture><img alt="Medium severity"></picture> Unrecognized markup', 'Unparsed iconless finding')
-    loop["payload"] = payload
-    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed", "--min-severity", "high")
-    assert result["threads"] == []
-    assert result["loopStatus"]["cleanBlockedBy"] == ("overview_reports_open_findings" if unparsed else None)
-
-
-@pytest.mark.parametrize("initial_event", [True, False])
-def test_fetch_reconciles_unflagged_legacy_initial_receipts(loop, monkeypatch, capsys, initial_event):
-    payload = copy.deepcopy(FIXTURE["initial"])
-    times = ["2026-10-07T15:30:00Z", "2026-10-07T16:20:00Z"]
-    payload["timelineItems"] = {"nodes": [{"__typename": "ReviewRequestedEvent", "actor": {"login": AGENT}, "requestedReviewer": {"login": COPILOT}, "createdAt": at} for at in (times if initial_event else times[1:])]}
-    fgt.save_sticky_state({"acme/widget#159": {"review_requests": [{"reviewer": COPILOT, "at": at} for at in times]}})
-    loop["payload"] = payload
-    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
-    assert result["loopStatus"]["reReviewRequests"] == (1 if initial_event else 2)
-    assert result["loopStatus"]["reReviewCountComplete"] is initial_event
-
-
-@pytest.mark.parametrize("state", ["open", "resolved", "outdated", "deferred"])
-def test_linked_body_finding_preserves_live_thread_state(loop, monkeypatch, capsys, state):
-    payload = copy.deepcopy(FIXTURE["initial"])
-    thread = payload["reviewThreads"]["nodes"][0]
-    payload["reviewThreads"]["nodes"] = [thread]
-    thread["isResolved"] = state == "resolved"
-    thread["isOutdated"] = state == "outdated"
-    if state == "deferred":
-        thread["comments"]["nodes"].append({"author": {"login": "maintainer", "__typename": "User"}, "authorAssociation": "COLLABORATOR", "body": "/review-loop defer", "createdAt": "2026-10-07T17:00:00Z"})
-    payload["reviews"]["nodes"][-1]["body"] = '''<!-- ccr-overview-v2 -->
-### 🟡 Changes recommended
-<summary><strong>1 open findings</strong></summary>
-<details><summary><picture><img alt="Low severity"></picture> [Existing finding](#discussion_r4208919854)</summary>
-`tests/example.py:1`
-This finding already has an inline thread.
-</details>
-'''
-    loop["payload"] = payload
-    result = run_fetch(monkeypatch, capsys, "--reviewer", COPILOT, "--reviewer-source", "confirmed")
-    assert len(result["threads"]) == (1 if state == "open" else 0)
-    assert all(not finding.get("isReviewBodyFinding") for finding in result["threads"])
-    assert result["loopStatus"]["cleanBlockedBy"] is None
-
-
 def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatch, capsys):
     # 1. Select Copilot and fetch its first review. The human's click that
     #    started the review is not an agent re-review request.
@@ -210,7 +147,8 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
     monkeypatch.setattr(
         request_rereview, "request_state",
         lambda *a, **k: {"state": "ABSENT", "head": NEW_HEAD, "pending_since": None,
-                         "first_completed_review_at": "2026-10-07T15:46:14Z", "rerequest_ids": ("PR_target", "BOT_copilot")},
+                         "first_completed_review_at": "2026-10-07T15:46:14Z",
+                         "rerequest_ids": ("PR_widget", "BOT_copilot")},
     )
     monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
     requested = {}
@@ -221,6 +159,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
                 "kind": "review_request", "reviewer": request_login, "posted": True}
 
     monkeypatch.setattr(request_rereview, "request_review", fake_request)
+    monkeypatch.setattr(request_rereview, "request_registered", lambda *a, **k: True)
     assert request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--json"]) == 0
     posted = json.loads(capsys.readouterr().out)
 

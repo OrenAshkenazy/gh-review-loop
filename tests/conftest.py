@@ -80,6 +80,12 @@ def stub_cap_check_known_under_cap(monkeypatch):
             return 0
         return real_count(repo, pr, trigger, agent_login, runner=runner)
 
+    real_confirm = request_rereview.confirm_posted_after_uncertain
+    def confirm_or_false(repo, pr, vendor, login, at, runner=None, **kwargs):
+        if runner is None:
+            return False
+        return real_confirm(repo, pr, vendor, login, at, runner=runner, **kwargs)
+    monkeypatch.setattr(request_rereview, "confirm_posted_after_uncertain", confirm_or_false)
     monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
     monkeypatch.setattr(request_rereview, "count_agent_pings", count_or_zero)
     for name in ("_snapshot_request_event_ids", "_snapshot_comment_ids"):

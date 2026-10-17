@@ -80,8 +80,12 @@ def file_lock(path: Path, timeout: float = 30):
             thread_lock.release()
 
 
-def pr_lock(repo: str, pr: int):
-    """Fail fast when another publisher/request owns this PR locally."""
+def pr_lock_path(repo: str, pr: int) -> Path:
     from loop_state import state_dir
     identity = hashlib.sha256(f"{repo.casefold()}#{pr}".encode("utf-8")).hexdigest()
-    return file_lock(state_dir() / "locks" / f"pr-{identity}.lock", timeout=0)
+    return state_dir() / "locks" / f"pr-{identity}.lock"
+
+
+def pr_lock(repo: str, pr: int):
+    """Fail fast when another publisher/request owns this PR locally."""
+    return file_lock(pr_lock_path(repo, pr), timeout=0)

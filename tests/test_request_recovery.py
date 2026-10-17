@@ -18,6 +18,25 @@ LOGIN = review_vendors.COPILOT.request_login
 KEY = "owner/repo#1"
 
 
+
+def saved_entry():
+    """Observe legacy state and the target's authoritative request log/reservation."""
+    entry = dict(rr.load_state().get(KEY, {}))
+    logged = loop_state.read_request_log("owner/repo", 1)
+    if logged is not None:
+        entry["review_requests"] = [dict(item, initial_review=item.get("countable") is False) for item in logged]
+    pending = rr.read_unconfirmed_request("owner/repo", 1)
+    if pending:
+        prior = pending.get("prior") or {}
+        entry["review_request_in_flight"] = {
+            "reviewer": pending.get("reviewer"), "at": pending.get("at"),
+            "head": prior.get("head"), "actor": prior.get("actor"),
+            "kind": "review_request", "request_event_ids": prior.get("request_event_ids"),
+            "initial_review": pending.get("countable") is False,
+        }
+    return entry
+
+
 def result(cmd, data, code=0, error=""):
     return subprocess.CompletedProcess(cmd, code, json.dumps(data), error)
 
@@ -62,14 +81,14 @@ def test_graphql_pr_id_without_registration_stays_uncertain_and_cannot_repost(mo
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
     payload = rr._locked_request(args)
     assert payload["status"] == "review_request_uncertain" and payload["posted"] is None
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     assert entry["review_request_in_flight"] == {"reviewer": LOGIN, "at": AT, "head": HEAD, "actor": "agent",
                                                "kind": "review_request", "request_event_ids": [99], "initial_review": False}
     assert entry.get("run", {}).get("rereviews_posted", 0) == 0 and not entry.get("review_requests")
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) is None
     for skip_cap in (False, True):
         args.no_cap_check = skip_cap
-        assert rr._locked_request(args)["status"] == "request_in_flight"
+        assert rr._locked_request(args)["status"] == "review_request_uncertain"
     args.reconcile = True
     assert rr._locked_request(args)["status"] == "request_in_flight"
     assert sum(native_write(cmd) for cmd in calls) == 1
@@ -118,7 +137,7 @@ def test_old_pending_after_cancellation_does_not_certify_or_post_a_replacement(m
     monkeypatch.setattr(rr, "request_review", lambda *a, **k: pytest.fail("old pending must disappear first"))
     payload = rr._locked_request(rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"]))
     assert payload["status"] == "stale_request_not_replaced" and payload["posted"] is False
-    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+    assert not saved_entry().get("review_request_in_flight")
 
 
 def completed_review():
@@ -170,14 +189,14 @@ def test_fast_completed_review_requires_new_event_and_records_once(monkeypatch, 
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
     payload = rr._locked_request(args)
     assert payload["posted"] is (True if event_is_new else None) and sum(native_write(cmd) for cmd in calls) == 1
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     if not event_is_new:
         assert entry["review_request_in_flight"]["request_event_ids"] == [100]
         assert entry.get("run", {}).get("rereviews_posted", 0) == 0
-        assert rr._locked_request(args)["status"] == "request_in_flight"
+        assert rr._locked_request(args)["status"] == "review_request_uncertain"
         assert sum(native_write(cmd) for cmd in calls) == 1
         return
-    assert "review_request_in_flight" not in entry and entry["run"]["rereviews_posted"] == 1
+    assert "review_request_in_flight" not in entry and entry.get("run", {}).get("rereviews_posted", 0) == (1 if rerequest else 0)
     assert entry["review_requests"][0].get("initial_review", False) is not rerequest
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([AT] if rerequest else [])
 
@@ -232,7 +251,7 @@ def test_unknown_actor_prevents_stale_request_cancellation(monkeypatch, first_co
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
     payload = rr._locked_request(args)
     assert payload["status"] == "uncountable_actor" and payload["posted"] is False
-    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+    assert not saved_entry().get("review_request_in_flight")
 
 
 @pytest.mark.parametrize("snapshot", [None, [], [{"event": "review_requested"}], [{"id": True, "event": "review_requested"}]])
@@ -252,7 +271,7 @@ def test_unknown_provenance_prevents_stale_cancellation_and_post(monkeypatch):
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
     payload = rr._locked_request(args)
     assert payload["status"] == "uncountable_provenance" and payload["posted"] is False
-    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+    assert not saved_entry().get("review_request_in_flight")
 
 
 @pytest.mark.parametrize("local_time", ["2026-10-12T19:00:00Z", "2026-10-12T21:00:00Z"])
@@ -282,11 +301,11 @@ def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch,
     assert payload["posted"] is True and payload["confirmed_after_uncertain"] is True
     assert (payload.get("status") == "review_head_unconfirmed") is (confirmed_head != HEAD)
     assert payload["created_at"] == AT
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     assert len(calls) == 1 and "review_request_in_flight" not in entry
     assert len(entry["review_requests"]) == 1 and entry["review_requests"][0]["at"] == AT
     assert entry["review_requests"][0].get("initial_review", False) is initial_review
-    assert entry["run"]["rereviews_posted"] == 1
+    assert entry.get("run", {}).get("rereviews_posted", 0) == (0 if initial_review else 1)
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([] if initial_review else [AT])
 
 
@@ -304,7 +323,7 @@ def test_reconciliation_uses_persisted_event_baseline_despite_clock_skew(monkeyp
     monkeypatch.setattr(rr, "_all_reviews", lambda *a: [review])
     payload = rr._locked_request(reconcile_args())
     assert payload["posted"] is (True if new_event else None)
-    assert bool(rr.load_state()[KEY].get("review_request_in_flight")) is not new_event
+    assert bool(saved_entry().get("review_request_in_flight")) is not new_event
 
 
 @pytest.mark.parametrize("failure,uncertain", [("HTTP 403", False), ("HTTP 422", False), ("HTTP 503", True), ("connection reset", True), ("malformed", True), ("head", False)])
@@ -324,7 +343,7 @@ def test_comment_failures_keep_only_uncertain_markers_and_never_repost(monkeypat
                                         "--phrase", "@codex review", "--expect-head", HEAD])
     payload = rr._locked_request(args)
     assert payload["posted"] is (None if uncertain else False)
-    assert bool(rr.load_state()[KEY].get("review_request_in_flight")) is uncertain
+    assert bool(saved_entry().get("review_request_in_flight")) is uncertain
     if uncertain:
         assert rr._locked_request(args)["status"] == "request_in_flight"
     assert sum("POST" in cmd for cmd in calls) == (0 if failure == "head" else 1)
@@ -347,13 +366,13 @@ def test_native_reconciliation_stamps_once_without_any_post(monkeypatch, state, 
                                                        "commit_id": HEAD, "submitted_at": AT}] if state == "COMPLETED_HEAD" else [])
     payload = rr._locked_request(reconcile_args())
     assert payload["posted"] is (True if confirmed else None)
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     if confirmed:
-        assert entry["run"]["rereviews_posted"] == 1
+        assert entry.get("run", {}).get("rereviews_posted", 0) == 0
         assert entry["review_requests"][0]["initial_review"] is True
         assert "review_request_in_flight" not in entry
         assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight"
-        assert rr.load_state()[KEY]["run"]["rereviews_posted"] == 1
+        assert saved_entry().get("run", {}).get("rereviews_posted", 0) == 0
     else:
         assert entry["review_request_in_flight"] and "run" not in entry
 
@@ -367,8 +386,8 @@ def test_native_reconciliation_does_not_clear_unproven_or_dry_run_markers(monkey
                                                        "commit_id": HEAD, "submitted_at": "2026-10-12T19:00:00Z" if problem == "older_review" else AT}])
     payload = rr._locked_request(reconcile_args(*(["--dry-run"] if problem == "dry_run" else [])))
     assert payload["posted"] is (False if problem == "dry_run" else None)
-    assert rr.load_state()[KEY]["review_request_in_flight"]
-    assert "run" not in rr.load_state()[KEY]
+    assert saved_entry()["review_request_in_flight"]
+    assert "run" not in saved_entry()
 
 
 @pytest.mark.parametrize("problem", [None, "actor", "phrase", "time"])
@@ -388,14 +407,14 @@ def test_comment_reconciliation_matches_exact_evidence_and_records_comment_id(mo
     assert payload["posted"] is (True if problem is None else None)
     assert all("POST" not in cmd and "DELETE" not in cmd for cmd in calls)
     if problem is None:
-        assert rr.load_state()[KEY]["review_requests"][0]["comment_id"] == 123
+        assert saved_entry()["review_requests"][0]["comment_id"] == 123
     else:
-        assert rr.load_state()[KEY]["review_request_in_flight"]
+        assert saved_entry()["review_request_in_flight"]
 
 
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("older_incomplete", [False, True])
-def test_failed_receipt_save_can_be_reconciled_without_poisoning_complete_history(monkeypatch, native, older_incomplete):
+def test_durable_receipt_survives_failed_cycle_stamp(monkeypatch, native, older_incomplete):
     loop_state.save_sticky_state({KEY: {"review_requests_incomplete": True} if older_incomplete else {}})
     marker = native_marker() if native else {"reviewer": "@codex", "at": AT, "actor": "agent", "kind": "comment", "phrase": "@codex review"}
     marker["initial_review"] = False
@@ -412,15 +431,15 @@ def test_failed_receipt_save_can_be_reconciled_without_poisoning_complete_histor
     monkeypatch.setattr(loop_state, "save_sticky_state", fail_once)
     payload = {"posted": True, "created_at": AT}
     rr._record_posted_payload(reconcile_args(), payload, marker["reviewer"])
-    assert payload["status"] == "state_record_failed" and payload["posted"] is True
-    assert rr.load_state()[KEY]["review_request_in_flight"]
-    assert bool(rr.load_state()[KEY].get("review_requests_incomplete")) is older_incomplete
+    assert payload["posted"] is True and payload.get("status") != "state_record_failed"
+    assert not saved_entry().get("review_request_in_flight")
+    assert bool(saved_entry().get("review_requests_incomplete")) is older_incomplete
     monkeypatch.setattr(rr, "request_state", lambda *a: {"state": "PENDING", "head": HEAD})
     monkeypatch.setattr(rr, "confirm_posted_after_uncertain", lambda *a: True)
     monkeypatch.setattr(rr, "_gh_json", lambda *a: [{"id": 123, "user": {"login": "agent"}, "body": "@codex review", "created_at": AT}])
-    assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
-    entry = rr.load_state()[KEY]
-    assert "review_request_in_flight" not in entry and entry["run"]["rereviews_posted"] == 1
+    assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight"
+    entry = saved_entry()
+    assert "review_request_in_flight" not in entry and entry.get("run", {}).get("rereviews_posted", 0) == 0
     assert bool(entry.get("review_requests_incomplete")) is older_incomplete
     if native:
         assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == (None if older_incomplete else [AT])
@@ -447,11 +466,11 @@ def test_stale_replacement_carries_refreshed_state_and_cap_into_post_and_recover
 
     def post(*args, **kwargs):
         posted.append(kwargs)
-        marker = rr.load_state()[KEY]["review_request_in_flight"]
+        marker = saved_entry()["review_request_in_flight"]
         assert marker["head"] == new_head and marker["initial_review"] is False
         if uncertain:
             raise rr.ReviewRequestRejected("connection lost", requested_at=AT)
-        return {"posted": True, "created_at": AT}
+        return {"posted": True, "created_at": AT, "registered": True}
 
     monkeypatch.setattr(rr, "request_review", post)
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--max-rereview-requests", "3"])
@@ -459,7 +478,7 @@ def test_stale_replacement_carries_refreshed_state_and_cap_into_post_and_recover
     assert cancelled == [HEAD] and counted == [("agent", AT)]
     if used != 0:
         assert payload["status"] == ("capped" if used == 3 else "uncountable_count")
-        assert not posted and not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+        assert not posted and not saved_entry().get("review_request_in_flight")
         return
     assert posted[0]["expect_head"] == new_head and posted[0]["registration_head"] == new_head
     assert posted[0]["rerequest_ids"] == ("NEW_PR", "NEW_BOT")
@@ -470,9 +489,9 @@ def test_stale_replacement_carries_refreshed_state_and_cap_into_post_and_recover
         assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
     else:
         assert payload["state"] == "STALE_PENDING" and payload["replaced_stale_request"] is True
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     assert len(posted) == 1 and "review_request_in_flight" not in entry
-    assert not entry["review_requests"][0].get("initial_review") and entry["run"]["rereviews_posted"] == 1
+    assert not entry["review_requests"][0].get("initial_review") and entry.get("run", {}).get("rereviews_posted", 0) == 1
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == [AT]
 
 
@@ -490,7 +509,7 @@ def test_comment_id_recovery_tolerates_clock_skew_but_rejects_unrelated_evidence
     monkeypatch.setattr(rr, "post_rereview", post)
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "codex"])
     assert rr._locked_request(args)["posted"] is None
-    marker = rr.load_state()[KEY]["review_request_in_flight"]
+    marker = saved_entry()["review_request_in_flight"]
     assert marker["comment_ids"] == [99]
     assert rr._locked_request(args)["status"] == "request_in_flight" and len(posted) == 1
     if problem == "baseline":
@@ -505,11 +524,11 @@ def test_comment_id_recovery_tolerates_clock_skew_but_rejects_unrelated_evidence
     monkeypatch.setattr(rr, "_gh_json", lambda *a: [comment])
     payload = rr._locked_request(reconcile_args())
     if problem is not None:
-        assert payload["status"] == "request_in_flight" and rr.load_state()[KEY]["review_request_in_flight"]
+        assert payload["status"] == "request_in_flight" and saved_entry()["review_request_in_flight"]
         return
     assert payload["status"] == "request_reconciled" and payload["created_at"] == comment["created_at"]
-    entry = rr.load_state()[KEY]
-    assert entry["review_requests"][0]["comment_id"] == 100 and entry["run"]["rereviews_posted"] == 1
+    entry = saved_entry()
+    assert entry["review_requests"][0]["comment_id"] == 100 and entry.get("run", {}).get("rereviews_posted", 0) == 1
     assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight" and len(posted) == 1
 
 
@@ -536,7 +555,7 @@ def test_unreadable_comment_snapshot_blocks_post_but_dry_run_skips_snapshot(monk
     payload = rr._locked_request(rr.build_parser().parse_args(argv))
     assert len(snapshots) == (0 if dry_run else 1) and len(posts) == (1 if dry_run else 0)
     assert payload.get("status") == (None if dry_run else "uncountable_provenance")
-    assert not rr.load_state().get(KEY, {}).get("review_request_in_flight")
+    assert not saved_entry().get("review_request_in_flight")
 
 
 @pytest.mark.parametrize("initial", [False, True])
@@ -553,9 +572,9 @@ def test_fresh_native_event_reconciles_after_head_move_without_current_registrat
     args = reconcile_args(*(["--expect-head", expected_head] if expected_head else []))
     payload = rr._locked_request(args)
     assert payload["status"] == "request_reconciled" and payload["created_at"] == event["created_at"]
-    entry = rr.load_state()[KEY]
+    entry = saved_entry()
     assert bool(entry["review_requests"][0].get("initial_review")) is initial
-    assert entry["run"]["rereviews_posted"] == 1 and "review_request_in_flight" not in entry
+    assert entry.get("run", {}).get("rereviews_posted", 0) == (0 if initial else 1) and "review_request_in_flight" not in entry
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ([] if initial else [event["created_at"]])
     assert rr._locked_request(args)["status"] == "no_request_in_flight"
 
@@ -575,7 +594,7 @@ def test_fresh_native_reconciliation_requires_exact_provenance(monkeypatch, prob
     monkeypatch.setattr(rr, "_timeline_events", lambda *a: [event])
     monkeypatch.setattr(rr, "request_state", lambda *a: pytest.fail("do not fall back from malformed ID provenance"))
     assert rr._locked_request(reconcile_args())["status"] == "request_in_flight"
-    assert rr.load_state()[KEY]["review_request_in_flight"] == marker
+    assert saved_entry()["review_request_in_flight"] == marker
 
 
 def test_fresh_native_event_retains_marker_on_record_failure_and_records_once_on_retry(monkeypatch):
@@ -591,8 +610,54 @@ def test_fresh_native_event_retains_marker_on_record_failure_and_records_once_on
 
     monkeypatch.setattr(loop_state, "save_sticky_state", fail_save)
     assert rr._locked_request(reconcile_args())["status"] == "state_record_failed"
-    assert rr.load_state()[KEY]["review_request_in_flight"] == marker
+    assert saved_entry()["review_request_in_flight"] == marker
     monkeypatch.setattr(loop_state, "save_sticky_state", real_save)
     assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
+    assert saved_entry().get("run", {}).get("rereviews_posted", 0) == 1
+    assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight"
+
+
+@pytest.mark.parametrize("countable", [False, True])
+def test_native_reservation_reconciliation_dry_run_preserves_all_records(monkeypatch, countable):
+    assert rr.record_unconfirmed_request("owner/repo", 1, reviewer=LOGIN, at=AT, kind="maybe", countable=countable,
+                                        request_id="reservation-1", prior={"actor": "agent", "request_event_ids": [99]})
+    marker = rr.unconfirmed_path("owner/repo", 1).read_bytes()
+    state = rr.load_state()
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [request_event()])
+    monkeypatch.setattr(rr, "request_review", lambda *a, **k: pytest.fail("reconciliation must not post"))
+
+    payload = rr._locked_request(reconcile_args("--dry-run"))
+
+    assert payload["dry_run"] is True and payload["would_record"] is True and payload["posted"] is False
+    assert rr.unconfirmed_path("owner/repo", 1).read_bytes() == marker
+    assert not loop_state.request_log_path("owner/repo", 1).exists()
+    assert rr.load_state() == state
+    assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
+    assert rr.read_unconfirmed_request("owner/repo", 1) is None
+    assert len(loop_state.read_request_log("owner/repo", 1)) == 1
+    assert rr.load_state()[KEY].get("run", {}).get("rereviews_posted", 0) == int(countable)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_native_reservation_reconciliation_reports_recording_failure_and_retries_once(monkeypatch, raises):
+    assert rr.record_unconfirmed_request("owner/repo", 1, reviewer=LOGIN, at=AT, kind="maybe", countable=True,
+                                        request_id="reservation-1", prior={"actor": "agent", "request_event_ids": [99]})
+    monkeypatch.setattr(rr, "_timeline_events", lambda *a: [request_event()])
+    monkeypatch.setattr(rr, "request_review", lambda *a, **k: pytest.fail("reconciliation must not post"))
+    real_record = rr.record_rereview_posted
+
+    def fail_record(*a, **k):
+        if raises:
+            raise OSError("simulated log failure")
+        return False
+
+    monkeypatch.setattr(rr, "record_rereview_posted", fail_record)
+    payload = rr._locked_request(reconcile_args())
+    assert payload["status"] == "state_record_failed" and payload["posted"] is True
+    assert rr.read_unconfirmed_request("owner/repo", 1) is not None
+    assert not loop_state.request_log_path("owner/repo", 1).exists()
+    monkeypatch.setattr(rr, "record_rereview_posted", real_record)
+    assert rr._locked_request(reconcile_args())["status"] == "request_reconciled"
     assert rr.load_state()[KEY]["run"]["rereviews_posted"] == 1
+    assert len(loop_state.read_request_log("owner/repo", 1)) == 1
     assert rr._locked_request(reconcile_args())["status"] == "no_request_in_flight"

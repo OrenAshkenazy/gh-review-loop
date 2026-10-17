@@ -26,6 +26,7 @@ import sweep_siblings
 # collapses the Patterns block's severity ordering.
 _SEVERITY_RE = re.compile(r"!\[(critical|high|medium|low)\]", re.IGNORECASE)
 _CODEX_PRIORITY_RE = re.compile(r"!\[(P[0-3])(?:\s+Badge)?\]", re.IGNORECASE)
+_PLAIN_PRIORITY_RE = re.compile(r"\A(?:[ \t]*\r?\n)* {0,3}\[(P[0-3])\](?=\s|$)", re.IGNORECASE)
 _CODEX_PRIORITY_TO_SEVERITY = {"p0": "critical", "p1": "high", "p2": "medium", "p3": "low"}
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
@@ -142,6 +143,7 @@ def _first_body(thread: Any) -> str:
 
 
 def _normalize(body: str) -> str:
+    body = _PLAIN_PRIORITY_RE.sub(" ", body, count=1)
     body = _IMG_RE.sub(" ", body)
     body = _HTML_TAG_RE.sub(" ", body)
     body = _FENCED_RE.sub(" ", body)
@@ -185,13 +187,29 @@ class Cluster:
 
 
 def _severity(thread: Any) -> str:
-    body = _first_body(thread)
-    match = _SEVERITY_RE.search(body)
-    if match:
-        return match.group(1).lower()
-    codex_match = _CODEX_PRIORITY_RE.search(body)
-    if codex_match:
-        return _CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+    """Match thread_severity's selection of the first marked comment."""
+    if not isinstance(thread, dict):
+        return "unknown"
+    comments = thread.get("comments")
+    if isinstance(comments, dict):
+        comments = comments.get("nodes")
+    if not isinstance(comments, list):
+        return "unknown"
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        plain_match = _PLAIN_PRIORITY_RE.match(body)
+        if plain_match:
+            return _CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
+        match = _SEVERITY_RE.search(body)
+        if match:
+            return match.group(1).lower()
+        codex_match = _CODEX_PRIORITY_RE.search(body)
+        if codex_match:
+            return _CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
     return "unknown"
 
 
