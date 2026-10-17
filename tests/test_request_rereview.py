@@ -893,6 +893,11 @@ T_FIRST_REVIEW = "2026-10-07T15:46:14Z"
 T_REQUEST = "2026-10-07T16:20:05Z"
 
 
+def loop_state_read(state_dir):
+    import loop_state
+    return loop_state.read_request_log("acme/widget", 159) or []
+
+
 def _completed(cmd, payload, rc=0, stderr=""):
     return subprocess.CompletedProcess(
         args=cmd, returncode=rc,
@@ -1509,6 +1514,8 @@ class TestReviewRequestMain:
     def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def", pending_since=None):
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: used)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "baseline_adopted", lambda *a, **k: False)
         monkeypatch.setattr(
             request_rereview, "request_state",
             lambda *a, **k: None if state is None else {
@@ -2377,7 +2384,6 @@ class TestReviewRequestMain:
         self._stub_reads(monkeypatch, used=3)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
-        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: [T_REQUEST] * 3)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -2394,7 +2400,7 @@ class TestReviewRequestMain:
         self._stub_reads(monkeypatch, used=3)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
-        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "baseline_adopted", lambda *a, **k: True)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
@@ -2403,6 +2409,21 @@ class TestReviewRequestMain:
         assert payload["count_is_upper_bound"] is True
         assert "manual clicks included" in payload["message"]
         assert "--max-rereview-requests" in payload["message"]
+
+    def test_history_that_cannot_be_adopted_blocks_the_post(self, monkeypatch, capsys, tmp_path):
+        """If the login's earlier requests cannot be written into the log, the
+        first post would hide them from the next count, so nothing is posted
+        (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=1)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("posted"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "state_unwritable" and payload["posted"] is False
+        assert "earlier review requests" in payload["message"]
 
     def test_a_posted_request_carries_a_status_like_every_other_result(self):
         """Every non-posting result has `status`; a posted one did not, so a
@@ -2510,6 +2531,7 @@ class TestExplicitMentionOverridesPersistedVendor:
         self._persist(tmp_path, monkeypatch, review_vendors.CODEX.login)
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: {
             "state": "ABSENT", "head": "abc1234def", "pending_since": None,
             "first_completed_review_at": T_FIRST_REVIEW,
@@ -2631,6 +2653,67 @@ class TestRequestProvenance:
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
         ) == 3
 
+    def test_adopted_history_survives_the_first_local_post(self, monkeypatch, tmp_path):
+        """Two unlogged requests, cap three: the first run counts two and
+        posts once. Without adoption the next run would match events only to
+        the one recorded post and count one, letting the PR run past the cap
+        (PR #120 review). Adoption writes the two as baseline lines first, so
+        the record-matched count is three afterwards, on this side and the
+        fetch side alike."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        history = [("agent", "2026-10-07T16:00:00Z"), ("agent", "2026-10-07T16:05:00Z"),
+                   ("a-human", "2026-10-07T16:07:00Z")]
+        events = {"items": _rest_request_events(history)}
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, events["items"])
+
+        args = ("acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW)
+        assert request_rereview.adopt_unlogged_requests(*args, runner=runner) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [
+            "2026-10-07T16:00:00Z", "2026-10-07T16:05:00Z",
+        ]
+        assert request_rereview.baseline_adopted("acme/widget", 159) is True
+        assert request_rereview.count_agent_review_requests(*args, runner=runner) == 2
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:20:00Z"
+        )
+        events["items"] = _rest_request_events(history + [("agent", "2026-10-07T16:20:01Z")])
+        assert request_rereview.count_agent_review_requests(*args, runner=runner) == 3
+        # Adoption is one-time: a log that exists is never rewritten.
+        assert request_rereview.adopt_unlogged_requests(*args, runner=runner) is True
+        assert len(loop_state_read(tmp_path)) == 3
+
+    def test_adoption_writes_nothing_without_a_login_or_history(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        events = _rest_request_events([("agent", T_REQUEST)])
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, events)
+
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW, runner=runner
+        ) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: _completed(cmd, _rest_request_events([("a-human", T_REQUEST)])),
+        ) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+    def test_adoption_fails_closed_when_the_timeline_or_log_fails(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        args = ("acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW)
+        assert request_rereview.adopt_unlogged_requests(
+            *args, runner=lambda cmd, **k: _completed(cmd, None, rc=1, stderr="boom")
+        ) is False
+        events = _rest_request_events([("agent", T_REQUEST)])
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log", lambda *a, **k: False)
+        assert request_rereview.adopt_unlogged_requests(
+            *args, runner=lambda cmd, **k: _completed(cmd, events)
+        ) is False
+
     def test_no_record_and_no_requests_is_a_verified_zero(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
 
@@ -2745,6 +2828,7 @@ class TestFreeInitialRequest:
         )
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 3)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
         monkeypatch.setattr(
             request_rereview, "request_review",

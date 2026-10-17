@@ -168,6 +168,7 @@ def test_full_copilot_cycle_fetches_requests_waits_and_rechecks(loop, monkeypatc
                          "first_completed_review_at": "2026-10-07T15:46:14Z"},
     )
     monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
+    monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
     requested = {}
 
     def fake_request(repo, pr, request_login, **kwargs):
