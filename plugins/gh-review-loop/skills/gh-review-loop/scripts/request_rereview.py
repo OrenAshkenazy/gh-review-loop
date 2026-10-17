@@ -892,8 +892,13 @@ def request_state(
     # what is left unpaired is still waiting. Overlapping requests keep their
     # own ages, and a listed request whose event the timeline does not show
     # yet has an unknown age instead of borrowing an old, answered event's.
+    removed_times = [
+        removal["created_at"]
+        for removal in map(reviewer_resolver.normalize_request_removed_event, raw_events)
+        if removal and review_vendors.vendor_for(removal["reviewer_login"]) is vendor
+    ]
     unanswered = reviewer_resolver.unanswered_request_times(
-        [event["created_at"] for event in vendor_events], completed_times
+        [event["created_at"] for event in vendor_events], completed_times, removed_times
     )
     pending_since = unanswered[-1] if unanswered else None
     now = now or _dt.datetime.now(_dt.timezone.utc)
@@ -972,15 +977,20 @@ def count_agent_review_requests(
     "request review" (paginated, unlike the fetch's GraphQL page). The rule
     itself lives in ``reviewer_resolver.counted_review_requests`` so the fetch
     and this script can never disagree. None when it cannot be established.
+
+    The recorded provenance matches the loop's own timestamps and needs no
+    login; only the actor fallback does. So an unresolvable ``gh api user``
+    (credentials that read the repo but not ``/user``) refuses only when
+    there is no record to count from (PR #116 review).
     """
-    if not agent_login:
-        return None
     if runner is None:
         runner = subprocess.run
+    recorded = loop_request_times(repo, pr, vendor)
+    if recorded is None and not agent_login:
+        return None
     events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
-    recorded = loop_request_times(repo, pr, vendor)
     counted = reviewer_resolver.counted_review_requests(
         events,
         agent_login=agent_login,

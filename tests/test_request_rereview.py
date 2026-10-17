@@ -810,6 +810,33 @@ class TestCycleTransitionStamp:
         assert self._posted(tmp_path) == 2
 
 
+class TestCountWithoutLogin:
+    """`gh api user` can fail with credentials that still read the repo. The
+    recorded provenance log needs no login to match events, so the cap must
+    count from it; only the actor fallback needs the login (PR #116 review)."""
+
+    def test_recorded_requests_count_without_a_login(self, tmp_path, monkeypatch):
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": "copilot-pull-request-reviewer[bot]", "at": "2026-10-07T16:30:00Z",
+            "countable": True, "request_id": "r1",
+        })
+        used = request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW,
+            runner=_state_runner({}, events=[("agent", "2026-10-07T16:30:05Z")]),
+        )
+        assert used == 1
+
+    def test_no_record_and_no_login_is_still_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        used = request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW,
+            runner=_state_runner({}, events=[("agent", "2026-10-07T16:30:05Z")]),
+        )
+        assert used is None
+
+
 class TestStateKeyCasing:
     """A case-mismatched --repo must not split the shared state (#111 review)."""
 
@@ -900,7 +927,7 @@ def _rest_request_events(events, reviewer="Copilot"):
 
 
 def _state_runner(payload, reviews=(), events=(), rc=0, reviews_rc=0, timeline_rc=0,
-                  review_pages=None):
+                  review_pages=None, raw_events=None):
     """Serve the three reads request_state makes, by command shape.
 
     ``review_pages`` passes pre-split REST pages verbatim, so a test can place
@@ -921,7 +948,7 @@ def _state_runner(payload, reviews=(), events=(), rc=0, reviews_rc=0, timeline_r
         assert cmd[3].endswith("/timeline"), cmd
         if timeline_rc:
             return _completed(cmd, None, rc=timeline_rc, stderr="boom")
-        return _completed(cmd, _rest_request_events(events))
+        return _completed(cmd, _rest_request_events(events) + list(raw_events or []))
     return runner
 
 
@@ -933,6 +960,26 @@ OLD_REVIEW = (COPILOT_LOGIN, "COMMENTED", T_FIRST_REVIEW, "f4a55e3000")
 
 
 class TestRequestState:
+    def test_a_withdrawn_request_does_not_claim_the_replacements_review(self):
+        """Stale A withdrawn, replacement B posted, review in B's second: the
+        head is reviewed, not PENDING for 20 minutes and then ABSENT with a
+        third request (PR #116 review)."""
+        removed = {"event": "review_request_removed", "actor": {"login": "agent"},
+                   "created_at": "2026-10-07T16:30:00Z",
+                   "requested_reviewer": {"login": "Copilot", "type": "Bot"}}
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(
+                _gql_pr("d7efa49000"),
+                reviews=[OLD_REVIEW, (COPILOT_LOGIN, "COMMENTED", "2026-10-07T16:30:00Z", "d7efa49000")],
+                events=[("agent", "2026-10-07T16:00:00Z"), ("agent", "2026-10-07T16:30:00Z")],
+                raw_events=[removed],
+            ),
+        )
+
+        assert state["state"] == "COMPLETED_HEAD"
+        assert state["pending_since"] is None
+
     def test_request_state_completed_head(self):
         state = request_rereview.request_state(
             "acme/widget", 159, review_vendors.COPILOT,

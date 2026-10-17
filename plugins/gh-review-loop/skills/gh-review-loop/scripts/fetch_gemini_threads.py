@@ -285,10 +285,19 @@ query($owner:String!, $repo:String!, $number:Int!) {
           commit { oid }
         }
       }
-      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT]) {
+      timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT]) {
         nodes {
           __typename
           ... on ReviewRequestedEvent {
+            createdAt
+            actor { login }
+            requestedReviewer {
+              __typename
+              ... on Bot { login }
+              ... on User { login }
+            }
+          }
+          ... on ReviewRequestRemovedEvent {
             createdAt
             actor { login }
             requestedReviewer {
@@ -3126,17 +3135,22 @@ def newest_unanswered_request_at(pull_request: dict[str, Any], author: str) -> s
     vendor = review_vendors.vendor_for(author)
     if vendor is None or vendor.trigger_kind != "review_request":
         return ""
-    requested = []
+    requested: list[str] = []
+    removed: list[str] = []
     for node in (pull_request.get("timelineItems") or {}).get("nodes") or []:
         event = reviewer_resolver.normalize_request_event(node)
         if event and review_vendors.vendor_for(event["reviewer_login"]) is vendor:
             requested.append(event["created_at"])
+            continue
+        removal = reviewer_resolver.normalize_request_removed_event(node)
+        if removal and review_vendors.vendor_for(removal["reviewer_login"]) is vendor:
+            removed.append(removal["created_at"])
     submitted = [
         review.get("submittedAt") or ""
         for review in filter_reviews(pull_request, author)
         if review.get("state") != "PENDING"
     ]
-    unanswered = reviewer_resolver.unanswered_request_times(requested, submitted)
+    unanswered = reviewer_resolver.unanswered_request_times(requested, submitted, removed)
     return unanswered[-1] if unanswered else ""
 
 

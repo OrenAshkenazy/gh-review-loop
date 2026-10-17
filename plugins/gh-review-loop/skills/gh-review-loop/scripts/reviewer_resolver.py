@@ -139,6 +139,38 @@ def normalize_request_event(event: Any) -> dict[str, Any] | None:
     }
 
 
+def normalize_request_removed_event(event: Any) -> dict[str, Any] | None:
+    """One shape for a review-request *removal* from either GitHub API.
+
+    Accepts a GraphQL ``ReviewRequestRemovedEvent`` node or a REST timeline
+    event with ``event == "review_request_removed"``. Everything else,
+    including a plain request event, normalizes to None.
+    """
+    if not isinstance(event, dict):
+        return None
+    if "event" in event or "requested_reviewer" in event or "requested_team" in event:
+        if event.get("event") != "review_request_removed":
+            return None
+        requested = event.get("requested_reviewer")
+        if not isinstance(requested, dict):
+            return None
+        return {
+            "created_at": event.get("created_at") or "",
+            "actor_login": (event.get("actor") or {}).get("login") or "",
+            "reviewer_login": requested.get("login") or "",
+        }
+    if event.get("__typename") != "ReviewRequestRemovedEvent":
+        return None
+    requested = event.get("requestedReviewer")
+    if not isinstance(requested, dict):
+        return None
+    return {
+        "created_at": event.get("createdAt") or "",
+        "actor_login": (event.get("actor") or {}).get("login") or "",
+        "reviewer_login": requested.get("login") or "",
+    }
+
+
 def first_completed_review_at(
     reviews: Any, vendor: review_vendors.ReviewVendor
 ) -> str | None:
@@ -161,18 +193,30 @@ def first_completed_review_at(
     return earliest
 
 
-def unanswered_request_times(request_times: list[str], review_times: list[str]) -> list[str]:
+def unanswered_request_times(
+    request_times: list[str],
+    review_times: list[str],
+    removed_times: list[str] | tuple[str, ...] = (),
+) -> list[str]:
     """Review-request times no submitted review has answered, oldest first.
 
-    Each submitted review answers the earliest request made at or before it;
-    GitHub stamps both to the second, so a same-second answer counts. What
-    is left is still waiting. Comparing only the newest request time with
-    the newest review time cannot tell two requests in one second from one,
-    and took the old review for the new request's answer (PR #116 review).
-    Both the request-side state machine and the fetch-side head check pair
-    this way so they never disagree about which review is current.
+    A removal cancels the latest request made strictly before it: the stale
+    path withdraws request A and posts B in the same second, and the review
+    that answers B must not be paired with A, or B reads as unanswered for
+    twenty minutes and then invites a third request (PR #116 review). Each
+    submitted review then answers the earliest remaining request made at or
+    before it; GitHub stamps both to the second, so a same-second answer
+    counts. What is left is still waiting. Comparing only the newest request
+    time with the newest review time cannot tell two requests in one second
+    from one. Both the request-side state machine and the fetch-side head
+    check pair this way so they never disagree about which review is current.
     """
     unanswered = sorted(time for time in request_times if time)
+    for removed in sorted(time for time in removed_times if time):
+        for index in range(len(unanswered) - 1, -1, -1):
+            if unanswered[index] < removed:
+                unanswered.pop(index)
+                break
     for submitted in sorted(time for time in review_times if time):
         for index, requested in enumerate(unanswered):
             if requested <= submitted:

@@ -4338,7 +4338,7 @@ class TestReviewRequestCounting:
         assert any("review-request events" in w for w in _fgt.pagination_warnings(full, review_request_vendor=True))
 
     def test_the_fetch_query_asks_for_review_requested_events_and_review_commits(self):
-        assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT])" in _fgt.QUERY
+        assert "timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT])" in _fgt.QUERY
         assert "... on ReviewRequestedEvent" in _fgt.QUERY
         assert "commit { oid }" in _fgt.QUERY
 
@@ -4468,6 +4468,29 @@ class TestHeadAnchoredWait:
         assert _fgt.wait_activity_fingerprint(pr, self.COPILOT, at) is None
         overview = _fgt.latest_reviewer_overview(pr, self.COPILOT)
         assert overview is None or overview["covers_head"] is False
+
+    @staticmethod
+    def _removed_event(at, actor="agent"):
+        return {"__typename": "ReviewRequestRemovedEvent", "createdAt": at, "actor": {"login": actor},
+                "requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}}
+
+    def test_a_withdrawn_request_does_not_claim_the_replacements_review(self):
+        """Stale request A withdrawn, replacement B posted, Copilot answered
+        B in B's second. Pairing without the removal gave the review to A and
+        kept the waiter waiting on a head it had (PR #116 review)."""
+        pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))
+        pr["timelineItems"]["nodes"] = [
+            self._request_event("2026-10-07T16:00:00Z"),
+            self._removed_event("2026-10-07T16:30:00Z"),
+            self._request_event("2026-10-07T16:30:00Z"),
+        ]
+
+        assert _fgt.head_review(pr, self.COPILOT)["id"] == "R0"
+        assert _fgt.latest_reviewer_overview(pr, self.COPILOT)["covers_head"] is True
+
+    def test_the_fetch_query_reads_request_removals(self):
+        assert "REVIEW_REQUEST_REMOVED_EVENT" in _fgt.QUERY
+        assert "ReviewRequestRemovedEvent" in _fgt.QUERY
 
     def test_an_older_withdrawn_request_does_not_unseat_a_later_head_review(self):
         """Two request events before one review: the first was withdrawn and

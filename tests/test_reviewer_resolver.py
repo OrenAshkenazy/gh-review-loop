@@ -499,3 +499,32 @@ def test_unordered_and_blank_times_are_tolerated():
     assert reviewer_resolver.unanswered_request_times(
         ["2026-10-07T16:30:00Z", "", "2026-10-07T16:10:00Z"], ["", "2026-10-07T16:20:00Z"]
     ) == ["2026-10-07T16:30:00Z"]
+
+
+def test_a_withdrawn_request_is_not_paired_with_a_later_review():
+    """Stale request A was withdrawn and replacement B posted; B's review
+    arrived in B's second. Without the removal, the review paired with A and
+    B stayed "unanswered" (PR #116 review)."""
+    a, removed, b = "2026-10-07T16:00:00Z", "2026-10-07T16:30:00Z", "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.unanswered_request_times([a, b], [b]) == [b]
+    assert reviewer_resolver.unanswered_request_times([a, b], [b], removed_times=[removed]) == []
+
+
+def test_a_removal_cancels_the_latest_request_strictly_before_it():
+    """Withdraw-then-post lands in one second: the removal must cancel the
+    old request, never the replacement posted in the same second."""
+    a, t = "2026-10-07T16:00:00Z", "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.unanswered_request_times([a, t], [], removed_times=[t]) == [t]
+    assert reviewer_resolver.unanswered_request_times([a], [], removed_times=["2026-10-07T15:00:00Z"]) == [a]
+
+
+def test_removed_events_normalize_from_both_apis():
+    rest = {"event": "review_request_removed", "created_at": "2026-10-07T16:30:00Z",
+            "actor": {"login": "agent"}, "requested_reviewer": {"login": "Copilot"}}
+    gql = {"__typename": "ReviewRequestRemovedEvent", "createdAt": "2026-10-07T16:30:00Z",
+           "actor": {"login": "agent"}, "requestedReviewer": {"login": "copilot-pull-request-reviewer"}}
+    assert reviewer_resolver.normalize_request_removed_event(rest)["reviewer_login"] == "Copilot"
+    assert reviewer_resolver.normalize_request_removed_event(gql)["created_at"] == "2026-10-07T16:30:00Z"
+    assert reviewer_resolver.normalize_request_removed_event({"event": "review_requested"}) is None
+    assert reviewer_resolver.normalize_request_event(rest) is None
+    assert reviewer_resolver.normalize_request_event(gql) is None

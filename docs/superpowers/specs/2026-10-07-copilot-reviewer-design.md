@@ -118,7 +118,8 @@ first request on a never-reviewed PR fails rule 3.
   (accepts the GraphQL node shape and the REST event shape). There is no second
   implementation.
 - **I7** Request side reads the timeline with `--paginate`; the count is complete.
-  Fetch side reads `timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT])`
+  Fetch side reads `timelineItems(last:100, itemTypes:[REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT])`
+  (removals cancel the withdrawn request before requests are paired with reviews)
   in the main GraphQL query. When 100 nodes come back the count is reported as a
   lower bound: `loopStatus.reReviewCountComplete: false` plus a `pageLimitWarnings`
   entry, and `limitReached` is computed from the lower bound (it can only
