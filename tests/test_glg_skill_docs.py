@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from test_doc_budgets import orphan_references
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -171,6 +173,29 @@ def test_triage_reads_the_submission_history_from_the_script():
     assert "answer_bank.py\" handled" in text or "answer_bank.py handled" in text
     assert "--project \"" not in text
     assert "--detail \"" not in text
+
+
+@pytest.mark.parametrize("action", ["accepted", "submitted"])
+def test_triage_keeps_fresh_followups_actionable_after_initial_submission(monkeypatch, tmp_path, action):
+    monkeypatch.syspath_prepend(str(SKILL_DIR / "scripts"))
+    monkeypatch.setenv("GLGQ_STATE_DIR", str(tmp_path / "glgq"))
+    import answer_bank as bank
+    import parse_glg_email as parser
+
+    title = "Cloud Security Platforms | Customers"
+    parsed = parser.parse((REPO_ROOT / "tests" / "fixtures" / "glg" / "followup.txt").read_text(encoding="utf-8"),
+                          f"GLG: Follow up on your acceptance for {title}")
+    bank.log_submission(title, "193913672", action)
+    history = bank.handled()
+    assert parsed["kind"] == "followup"
+    assert parsed["cpid"] == history[0]["cpid"] == "193913672"
+    assert parsed["project_title"] == history[0]["project"] == title
+    assert history[0]["action"] == action
+
+    text = SKILL_MD.read_text(encoding="utf-8")
+    assert "For invitations and accept confirmations, match" in text
+    assert "Do not mark a fresh `followup` done from project history" in text
+    assert "keep it separate from the original invitation when grouping" in text
 
 
 def test_the_logging_template_passes_the_title_by_file():

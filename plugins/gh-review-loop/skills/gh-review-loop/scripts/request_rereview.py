@@ -214,7 +214,7 @@ def uncertain_payload(repo: str, pr: int, reviewer: str, exc: ReviewRequestRejec
     settle = f"{REGISTRATION_SETTLE_SECONDS // 60} minutes"
     if exc.reason == "registration_pending":
         message = (
-            f"GitHub accepted the review request for `{reviewer}` (HTTP 201), but it is "
+            f"GitHub accepted the review request for `{reviewer}` (HTTP {exc.http_status}), but it is "
             "not on the PR yet. It may still appear, so nothing was recorded as posted. "
             f"Do not request again now: re-run this script after {settle}. It reports "
             "review_pending if the request landed, or not_enabled if it never appeared."
@@ -492,7 +492,7 @@ def record_unconfirmed_request(
 ) -> bool:
     """Remember a request whose outcome this run could not confirm; True if saved.
 
-    ``kind`` is ``accepted`` (GitHub answered 201, the read-back did not see
+    ``kind`` is ``accepted`` (GitHub accepted the call, the read-back did not see
     it yet) or ``maybe`` (5xx or no HTTP status: it may or may not have
     landed). ``countable`` says whether it was a re-review. The next run
     settles it instead of posting a possible duplicate.
@@ -1473,7 +1473,8 @@ def request_review(
     if not registered:
         transport = "GraphQL re-request" if rerequest_ids else "REST"
         raise ReviewRequestRejected(f"{transport} accepted the call but selected reviewer registration is unconfirmed",
-                                    requested_at=requested_at, allow_timeline_confirmation=False)
+                                    reason="registration_pending", http_status=200 if rerequest_ids else 201,
+                                    requested_at=requested_at, outcome_unknown=True, allow_timeline_confirmation=False)
     payload = {
         "created_at": requested_at,
         "repo": repo,
@@ -1691,7 +1692,7 @@ def _settle_unconfirmed_request(
 
     Returns a payload to emit (and post nothing), or None to continue with a
     normal request. Inside the settle time: refuse. Past it: if the request
-    landed, record its provenance and continue; if it never appeared, a 201
+    landed, record its provenance and continue; if it never appeared, an accepted call
     is the definite not_enabled signal, and a 5xx/no-status one simply did not
     land, so a fresh request is safe.
     """
@@ -1726,8 +1727,8 @@ def _settle_unconfirmed_request(
         return rejected_payload(
             args.repo, args.pr, reviewer,
             ReviewRequestRejected(
-                "GitHub returned 201 but the reviewer was never added",
-                reason="not_enabled", http_status=201, retryable=False, requested_at=at,
+                "GitHub accepted the call but the reviewer was never added",
+                reason="not_enabled", http_status=(marker.get("prior") or {}).get("http_status", 201), retryable=False, requested_at=at,
             ),
         )
     return None
@@ -1860,7 +1861,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         # A 5xx is not a clean refusal: GitHub can register the request and
         # still fail the response, and it does not dedupe. Never replay it;
         # reconcile it like a missing status (PR #116 review).
-        maybe_landed = exc.reason in ("uncertain", "transient")
+        maybe_landed = exc.reason in ("uncertain", "transient", "registration_pending")
         event = _new_request_event(args.repo, args.pr, vendor, actor, event_ids, subprocess.run) if maybe_landed and exc.allow_timeline_confirmation and actor and event_ids is not None else None
         if event is not None or (maybe_landed and exc.allow_timeline_confirmation and confirm_posted_after_uncertain(
             args.repo, args.pr, vendor, gh_login(), exc.requested_at, prior=prior
@@ -1878,9 +1879,11 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             }
         else:
             if maybe_landed:
+                if exc.reason == "registration_pending":
+                    prior["http_status"] = exc.http_status
                 saved = record_unconfirmed_request(
                     args.repo, args.pr, reviewer=reviewer, at=exc.requested_at,
-                    kind="maybe", countable=countable, request_id=request_id, prior=prior,
+                    kind="accepted" if exc.reason == "registration_pending" else "maybe", countable=countable, request_id=request_id, prior=prior,
                 )
                 refused = _remembered(uncertain_payload(args.repo, args.pr, reviewer, exc), saved)
             else:

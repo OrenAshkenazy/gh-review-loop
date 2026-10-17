@@ -28,6 +28,10 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Accepted Copilot requests retain their settlement state.** Successful REST and GraphQL calls without confirmed registration remain reserved as accepted; settled absence reports `not_enabled` instead of posting again. Failed settlement reads preserve the reservation, and delayed registration is recorded once.
+
+- **Fresh GLG follow-ups remain actionable.** Prior acceptance or submission of the original project no longer marks new follow-up questions done or groups them into the original invitation.
+
 - **Copilot summary parsing survives upstream integration.** Restores summary-only findings, absolute discussion links, severity-filter accounting, and their regression tests while retaining newer-request precedence and live inline-thread state.
 
 - **Accepted requests require registration before counting.** A successful

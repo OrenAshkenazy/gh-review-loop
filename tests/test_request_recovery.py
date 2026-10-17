@@ -112,6 +112,71 @@ def test_rest_success_without_selected_registration_remains_uncertain(monkeypatc
 
 
 @pytest.mark.parametrize("rerequest", [False, True])
+@pytest.mark.parametrize("settled", ["absent", "landed", "unreadable"])
+def test_accepted_unregistered_request_settles_without_reposting(monkeypatch, rerequest, settled):
+    stub_cap_check_known_under_cap(monkeypatch)
+    monkeypatch.setattr(rr.time, "sleep", lambda seconds: None)
+    now = [AT]
+    monkeypatch.setattr(rr, "utc_now_iso", lambda: now[0])
+    monkeypatch.setattr(rr, "request_state", lambda *a: {
+        "state": "PENDING" if now[0] != AT and settled == "landed" else "ABSENT",
+        "head": HEAD, "pending_since": AT if settled == "landed" else None,
+        "first_completed_review_at": "2026-10-12T19:00:00Z" if rerequest else None,
+        "rerequest_ids": ("PR_target", "BOT_copilot") if rerequest else None,
+    })
+    monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if native_write(cmd):
+            return result(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}}
+                          if rerequest else {"requested_reviewers": []})
+        if "graphql" in cmd:
+            return result(cmd, registration("other"))
+        if any("/timeline" in arg for arg in cmd):
+            if now[0] != AT and settled == "unreadable":
+                return result(cmd, {}, 1, "HTTP 503")
+            return result(cmd, [request_event()] if now[0] != AT and settled == "landed" else [])
+        if any("/reviews" in arg for arg in cmd):
+            return result(cmd, [])
+        return result(cmd, {"state": "open", "head": {"sha": HEAD}})
+
+    monkeypatch.setattr(rr.subprocess, "run", runner)
+    args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot", "--expect-head", HEAD])
+    first = rr._locked_request(args)
+    assert first["status"] == "review_request_uncertain" and first["posted"] is None
+    assert first["reason"] == "registration_pending"
+    assert first["http_status"] == (200 if rerequest else 201)
+    marker = rr.read_unconfirmed_request("owner/repo", 1)
+    assert marker["kind"] == "accepted" and marker["countable"] is rerequest
+    assert not saved_entry().get("review_requests")
+    assert rr._locked_request(args)["reason"] == "settling"
+
+    now[0] = "2026-10-12T20:02:01Z"
+    second = rr._locked_request(args)
+    if settled == "absent":
+        assert second["status"] == "review_request_rejected" and second["posted"] is False
+        assert second["reason"] == "not_enabled" and second["retryable"] is False
+        assert second["http_status"] == (200 if rerequest else 201)
+        assert rr.read_unconfirmed_request("owner/repo", 1) is None
+        assert not saved_entry().get("review_requests")
+    elif settled == "landed":
+        assert second["status"] == "review_pending" and second["posted"] is False
+        assert rr.read_unconfirmed_request("owner/repo", 1) is None
+        logged = saved_entry()["review_requests"]
+        assert len(logged) == 1 and logged[0]["countable"] is rerequest
+        assert rr._locked_request(args)["status"] == "review_pending"
+        assert len(saved_entry()["review_requests"]) == 1
+    else:
+        assert second["status"] == "review_request_uncertain" and second["posted"] is None
+        assert second["reason"] == "settle_unreadable"
+        assert rr.read_unconfirmed_request("owner/repo", 1) == marker
+        assert not saved_entry().get("review_requests")
+    assert sum(native_write(cmd) for cmd in calls) == 1
+
+
+@pytest.mark.parametrize("rerequest", [False, True])
 @pytest.mark.parametrize("read", [registration("other"), {}, registration(head="b" * 40)])
 def test_registration_recheck_is_bounded_and_can_observe_delayed_registration(monkeypatch, read, rerequest):
     calls = []
