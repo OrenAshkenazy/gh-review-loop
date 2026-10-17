@@ -959,6 +959,20 @@ def request_state(
     }
 
 
+_SNAPSHOT_UNSET: Any = object()
+
+
+def timeline_snapshot(repo: str, pr: int, runner: Any = None) -> list[Any] | None:
+    """One read of the PR timeline for this run; None when it failed.
+
+    Adoption and the cap count must see the same events: a request that
+    surfaces between two reads would be counted (and allow a post) without
+    ever being adopted, and the next run's record-matched count would drop
+    it (PR #120 review). So main reads once and hands the snapshot to both.
+    """
+    return _timeline_events(repo, pr, subprocess.run if runner is None else runner)
+
+
 def _timeline_events(repo: str, pr: int, runner: Any) -> list[Any] | None:
     owner, repo_name = parse_repo(repo)
     events = _gh_json(
@@ -985,6 +999,7 @@ def adopt_unlogged_requests(
     agent_login: str | None,
     first_completed_review_at: str | None,
     runner: Any = None,
+    events: Any = _SNAPSHOT_UNSET,
 ) -> bool:
     """Write the login's historical requests into the provenance log, once.
 
@@ -1001,13 +1016,20 @@ def adopt_unlogged_requests(
     is unknown rather than a trusted subset. True when nothing needed
     writing or the batch is on disk; False when the timeline could not be
     read, a write failed, or an earlier adoption was torn. Without a login
-    there is no history to attribute, so nothing is written and the count
-    stays unknown.
+    and without a record there is history that cannot be attributed, so
+    nothing is written and the answer is False: a bypassed post must not
+    start a log that hides it (PR #120 review). A history already marked
+    incomplete is never adopted into: each retry would append the batch
+    again, and clearing the marker later would make the duplicates count.
+    ``events`` is the run's one timeline snapshot (``timeline_snapshot``);
+    left unset, this reads its own, for callers outside main.
     """
     if runner is None:
         runner = subprocess.run
+    if loop_state.provenance_incomplete(repo, pr):
+        return False
     if agent_login is None:
-        return True
+        return loop_request_times(repo, pr, vendor) is not None
     logged = loop_state.read_request_log(repo, pr) or []
     started = any(isinstance(item, dict) and item.get("baseline") is True for item in logged)
     closed = any(isinstance(item, dict) and item.get("baseline_complete") is True for item in logged)
@@ -1016,7 +1038,8 @@ def adopt_unlogged_requests(
         return False
     if loop_request_times(repo, pr, vendor) is not None:
         return True
-    events = _timeline_events(repo, pr, runner)
+    if events is _SNAPSHOT_UNSET:
+        events = _timeline_events(repo, pr, runner)
     if events is None:
         return False
     counted = reviewer_resolver.counted_review_requests(
@@ -1050,6 +1073,7 @@ def count_agent_review_requests(
     agent_login: str | None,
     first_completed_review_at: str | None,
     runner: Any = None,
+    events: Any = _SNAPSHOT_UNSET,
 ) -> int | None:
     """Count the agent's review requests for ``vendor`` that consume the cap.
 
@@ -1070,7 +1094,8 @@ def count_agent_review_requests(
     recorded = loop_request_times(repo, pr, vendor)
     if recorded is None and not agent_login:
         return None
-    events = _timeline_events(repo, pr, runner)
+    if events is _SNAPSHOT_UNSET:
+        events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
     counted = reviewer_resolver.counted_review_requests(
@@ -1906,6 +1931,11 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # unresolvable `gh api user` would block the very first request.
     first = state["first_completed_review_at"]
     login = gh_login() if first else None
+    adopting = bool(first) and not args.dry_run and not provenance_incomplete(args.repo, args.pr)
+    counting = bool(first) and not args.no_cap_check
+    # One timeline read serves both adoption and the count, so they cannot
+    # disagree about which requests exist (PR #120 review).
+    events = timeline_snapshot(args.repo, args.pr) if (adopting or counting) else None
     # History under this login with no local record is adopted into the log
     # before anything is counted or posted, so the first post from this
     # machine cannot hide it from the next count (PR #120 review). Outside
@@ -1913,17 +1943,24 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # request, not keeping the record the next one is counted against; when
     # adoption fails under it, the history is marked incomplete so later
     # counts are unknown rather than a trusted subset. A dry run posts
-    # nothing, so it writes nothing either and previews from the bound.
-    if first and not args.dry_run and not adopt_unlogged_requests(
-        args.repo, args.pr, vendor, login, first
+    # nothing, so it writes nothing either and previews from the bound. An
+    # already-incomplete history is left alone: the count below is unknown.
+    if adopting and not adopt_unlogged_requests(
+        args.repo, args.pr, vendor, login, first, events=events
     ):
-        if not args.no_cap_check:
+        if args.no_cap_check:
+            loop_state.mark_provenance_incomplete(args.repo, args.pr)
+        elif login is None:
+            # Nothing to attribute the history to: the existing answer.
+            cap = effective_cap(args.max_rereview_requests)
+            _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
+            return 0
+        else:
             _emit(baseline_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
             return 0
-        loop_state.mark_provenance_incomplete(args.repo, args.pr)
-    if not args.no_cap_check and first:
+    if counting:
         cap = effective_cap(args.max_rereview_requests)
-        used = count_agent_review_requests(args.repo, args.pr, vendor, login, first)
+        used = count_agent_review_requests(args.repo, args.pr, vendor, login, first, events=events)
         if used is None:
             _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
             return 0
