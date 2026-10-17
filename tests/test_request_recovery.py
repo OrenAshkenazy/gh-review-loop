@@ -97,7 +97,7 @@ def test_rest_success_without_selected_registration_remains_uncertain(monkeypatc
 def test_registration_recheck_is_bounded_and_can_observe_delayed_registration(monkeypatch, read, rerequest):
     calls = []
     monkeypatch.setattr(rr.time, "sleep", lambda seconds: None)
-    responses = iter([{"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}} if rerequest else {"requested_reviewers": []}, read, registration()])
+    responses = iter([{"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}} if rerequest else {"requested_reviewers": []}, read, registration(), {"state": "open", "head": {"sha": HEAD}}])
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
@@ -106,7 +106,7 @@ def test_registration_recheck_is_bounded_and_can_observe_delayed_registration(mo
     payload = rr.request_review("owner/repo", 1, LOGIN, runner=runner, registration_head=HEAD,
                                 rerequest_ids=("PR_target", "BOT_copilot") if rerequest else None)
     assert payload["posted"] is True
-    assert sum(native_write(cmd) for cmd in calls) == 1 and len(calls) == 3
+    assert sum(native_write(cmd) for cmd in calls) == 1 and len(calls) == 4
 
 
 def test_old_pending_after_cancellation_does_not_certify_or_post_a_replacement(monkeypatch):
@@ -257,7 +257,8 @@ def test_unknown_provenance_prevents_stale_cancellation_and_post(monkeypatch):
 
 @pytest.mark.parametrize("local_time", ["2026-10-12T19:00:00Z", "2026-10-12T21:00:00Z"])
 @pytest.mark.parametrize("initial_review", [False, True])
-def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch, local_time, initial_review):
+@pytest.mark.parametrize("confirmed_head", [HEAD, "b" * 40])
+def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch, local_time, initial_review, confirmed_head):
     stub_cap_check_known_under_cap(monkeypatch)
     monkeypatch.setattr(rr, "utc_now_iso", lambda: local_time)
     monkeypatch.setattr(rr, "request_state", lambda *a: {
@@ -268,6 +269,7 @@ def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch,
     monkeypatch.setattr(rr, "count_agent_review_requests", lambda *a: 0)
     monkeypatch.setattr(rr, "_snapshot_request_event_ids", lambda *a: [99])
     monkeypatch.setattr(rr, "_timeline_events", lambda *a: [request_event()])
+    monkeypatch.setattr(rr, "_gh_json", lambda *a: {"state": "open", "head": {"sha": confirmed_head}})
     calls = []
 
     def post(*a, **kw):
@@ -278,6 +280,7 @@ def test_event_confirmed_uncertain_request_records_server_timestamp(monkeypatch,
     args = rr.build_parser().parse_args(["--repo", "owner/repo", "--pr", "1", "--reviewer-login", "copilot"])
     payload = rr._locked_request(args)
     assert payload["posted"] is True and payload["confirmed_after_uncertain"] is True
+    assert (payload.get("status") == "review_head_unconfirmed") is (confirmed_head != HEAD)
     assert payload["created_at"] == AT
     entry = rr.load_state()[KEY]
     assert len(calls) == 1 and "review_request_in_flight" not in entry

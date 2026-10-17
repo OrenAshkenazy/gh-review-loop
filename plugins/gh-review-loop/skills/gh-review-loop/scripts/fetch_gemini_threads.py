@@ -170,9 +170,13 @@ def run_gh(args: list[str], cwd: str | None = None) -> Any:
             cwd=cwd,
             check=False,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=120,
         )
+    except (UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"gh output could not be read within 120s as UTF-8: {exc}") from exc
     except FileNotFoundError as exc:
         # A missing binary must surface as the same clean `error: ...` line the
         # rest of the script prints, not a traceback -- reviewers running the
@@ -303,7 +307,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
           originalStartLine
           diffSide
           comments(first:50) {
-            pageInfo { hasNextPage }
+            pageInfo { hasNextPage endCursor }
             nodes {
               id
               author { login __typename }
@@ -409,6 +413,34 @@ mutation($threadId:ID!) {
 """
 
 
+THREAD_COMMENTS_QUERY = """
+query($threadId:ID!, $after:String!) {
+  node(id:$threadId) {
+    ... on PullRequestReviewThread {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          authorAssociation
+          body
+          createdAt
+          updatedAt
+          url
+          path
+          line
+          startLine
+          originalLine
+          originalStartLine
+          diffHunk
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def fetch_threads(pr: PullRequest) -> dict[str, Any]:
     result = run_gh(
         [
@@ -427,9 +459,34 @@ def fetch_threads(pr: PullRequest) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected gh GraphQL response.")
     try:
-        return result["data"]["repository"]["pullRequest"]
+        pull_request = result["data"]["repository"]["pullRequest"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected gh GraphQL shape: missing {exc}") from exc
+    for thread in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+        comments = thread.get("comments") or {}
+        seen = set()
+        for _ in range(20):
+            if not (comments.get("pageInfo") or {}).get("hasNextPage"):
+                break
+            cursor = comments["pageInfo"].get("endCursor")
+            if not cursor or cursor in seen or not thread.get("id"):
+                break
+            seen.add(cursor)
+            try:
+                page = run_gh(["api", "graphql", "-f", f"query={THREAD_COMMENTS_QUERY}",
+                               "-F", f"threadId={thread['id']}", "-f", f"after={cursor}"])
+                if not isinstance(page, dict) or page.get("errors"):
+                    break
+                connection = page["data"]["node"]["comments"]
+                nodes, info = connection["nodes"], connection["pageInfo"]
+                if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes) or not isinstance(info.get("hasNextPage"), bool):
+                    break
+            except (RuntimeError, KeyError, TypeError, AttributeError) as exc:
+                print(f"warning: could not complete thread {thread.get('id')} comments: {exc}", file=sys.stderr)
+                break
+            comments.setdefault("nodes", []).extend(nodes)
+            comments["pageInfo"] = info
+    return pull_request
 
 
 def fetch_remaining_discovery_comments(
@@ -532,7 +589,7 @@ def fetch_discovery_review_authors(pr: PullRequest, *, max_pages: int = 20) -> d
 def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[str, Any]:
     """Fetch review-thread comment authors for reviewer discovery.
 
-    Normal loop fetches intentionally stay single-page for compatibility. This
+    Normal loop fetches keep the thread list single-page for compatibility. This
     discovery-only path paginates review threads so a high-activity PR does not
     falsely appear to have no AI reviewer candidates.
     """
@@ -962,7 +1019,8 @@ def pagination_warnings(
         )
     for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []
-        if len(comments) >= PAGE_LIMIT_THREAD_COMMENTS:
+        page_info = (thread.get("comments") or {}).get("pageInfo") or {}
+        if page_info.get("hasNextPage", len(comments) >= PAGE_LIMIT_THREAD_COMMENTS):
             thread_id = thread.get("id") or "(unknown)"
             warnings.append(
                 f"thread {thread_id} comments hit page limit "

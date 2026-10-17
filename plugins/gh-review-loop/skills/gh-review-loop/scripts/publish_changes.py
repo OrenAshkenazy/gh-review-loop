@@ -19,12 +19,19 @@ import review_vendors
 from run_profile import command_argv, run_profile
 
 
+COMMAND_TIMEOUT_SECONDS = 120
+
+
 class PublishError(RuntimeError):
     pass
 
 
 def run(argv: list[str], root: Path) -> str:
-    result = subprocess.run(argv, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False)
+    # argv is constructed locally; run it literally, without a shell.
+    try:
+        result = subprocess.run(argv, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False, timeout=COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise PublishError(f"{argv[0]} timed out after {COMMAND_TIMEOUT_SECONDS}s; inspect publication state before retrying") from exc
     if result.returncode:
         raise PublishError(f"{argv[0]} failed: {(result.stderr or result.stdout).strip()}")
     return result.stdout
@@ -75,18 +82,21 @@ def approved_paths(root: Path, paths: list[str]) -> list[str]:
     return paths
 
 
-def snapshot(root: Path, paths: list[str]) -> tuple[str, tuple]:
+def snapshot(root: Path, paths: list[str], resume_commit: str | None = None) -> tuple[str, tuple]:
     if git(root, "diff", "--cached", "--name-only", "-z"):
         raise PublishError("index must be empty; preserve or unstage existing staged changes first")
     changed = set(git(root, "diff", "--name-only", "--no-renames", "-z").split("\0")) - {""}
     untracked = set(git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""}
-    if changed | untracked != set(paths):
+    if changed | untracked != (set() if resume_commit else set(paths)):
         raise PublishError("approved paths must exactly match all changed and untracked files")
+    if resume_commit and (git(root, "rev-parse", "HEAD").strip() != resume_commit or git(root, "status", "--porcelain")):
+        raise PublishError("resume requires the exact local commit and a clean checkout")
     files = []
     for raw in approved_paths(root, paths):
         path = root / raw
         files.append((raw, path.stat().st_mode, hashlib.sha256(path.read_bytes()).hexdigest()) if path.exists() else (raw, None, None))
-    diff = git(root, "--literal-pathspecs", "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", "--", *paths)
+    revisions = (f"{resume_commit}^", resume_commit) if resume_commit else ()
+    diff = git(root, "--literal-pathspecs", "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", *revisions, "--", *paths)
     return diff, tuple(files)
 
 
@@ -132,8 +142,9 @@ def verified_blobs(root: Path, paths: list[str]) -> dict[str, tuple[str, frozens
     return blobs
 
 
-def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozenset[str]]]) -> None:
-    staged = set(git(root, "diff", "--cached", "--name-only", "--no-renames", "-z").split("\0")) - {""}
+def staged_gate(root: Path, paths: list[str], blobs: dict[str, tuple[str, frozenset[str]]], resume_commit: str | None = None) -> None:
+    revisions = (f"{resume_commit}^", resume_commit) if resume_commit else ("--cached",)
+    staged = set(git(root, "diff", *revisions, "--name-only", "--no-renames", "-z").split("\0")) - {""}
     entries = {}
     for entry in git(root, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", *paths).split("\0"):
         if entry:
@@ -177,7 +188,7 @@ def loop_gate(repo: str, pr: int, max_rereview_requests: int | None = None, *, r
     return login
 
 
-def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: str | None = None) -> tuple[str, str]:
+def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: str | None = None, resume_commit: str | None = None) -> tuple[str, str]:
     info = pr_info(repo, pr, root)
     head, base = info.get("head", {}), info.get("base", {})
     head_repo = head.get("repo") or {}
@@ -186,8 +197,16 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
         raise PublishError("PR head repository metadata is incomplete")
     if branch in {base.get("ref"), head_repo["default_branch"]}:
         raise PublishError("publishing from a base/default branch is blocked")
-    if git(root, "branch", "--show-current").strip() != branch or git(root, "rev-parse", "HEAD").strip() != sha:
+    local_head = git(root, "rev-parse", "HEAD").strip()
+    if git(root, "branch", "--show-current").strip() != branch or local_head != (resume_commit or sha):
         raise PublishError("checkout branch and HEAD must match the current PR head")
+    if resume_commit:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", resume_commit):
+            raise PublishError("resume-commit must be a full commit SHA")
+        if local_head == sha:
+            raise PublishError("commit is already published; reconcile its review request instead of pushing again")
+        if git(root, "rev-list", "--parents", "-n", "1", resume_commit).split() != [resume_commit, sha]:
+            raise PublishError("resume requires one local commit with the current PR head as its only parent")
     if expected_head and sha != expected_head:
         raise PublishError("PR head changed during verification")
     urls = git(root, "remote", "get-url", "--push", "--all", remote).splitlines()
@@ -199,49 +218,58 @@ def checkout_gate(root: Path, repo: str, pr: int, remote: str, expected_head: st
     return branch, sha
 
 
-def publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None) -> dict:
+def publish(repo: str, pr: int, root: Path, paths: list[str], message: str = "", remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None, resume_commit: str | None = None) -> dict:
     with loop_lock.pr_lock(repo, pr):
-        return _publish(repo, pr, root, paths, message, remote, dry_run, max_rereview_requests, receipt_options)
+        return _publish(repo, pr, root, paths, message, remote, dry_run, max_rereview_requests, receipt_options, resume_commit)
 
 
-def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None) -> dict:
+def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, remote: str = "origin", dry_run: bool = False, max_rereview_requests: int | None = None, receipt_options: list[str] | None = None, resume_commit: str | None = None) -> dict:
     root = root.resolve()
-    if not message.strip() or remote.startswith("-") or not remote:
-        raise PublishError("provide a commit message and a named Git remote")
+    if bool(message.strip()) == bool(resume_commit) or remote.startswith("-") or not remote:
+        raise PublishError("provide either a commit message or resume-commit, and a named Git remote")
     if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
         raise PublishError("repo-root must be the checkout root")
-    branch, head = checkout_gate(root, repo, pr, remote)
-    loop_gate(repo, pr, max_rereview_requests, require_summary=False)
-    before = snapshot(root, paths)
+    branch, head = checkout_gate(root, repo, pr, remote, resume_commit=resume_commit)
+    loop_gate(repo, pr, max_rereview_requests, require_summary=bool(resume_commit))
+    before = snapshot(root, paths, resume_commit)
     blobs = verified_blobs(root, paths)
-    if snapshot(root, paths) != before:
+    if resume_commit:
+        staged_gate(root, paths, blobs, resume_commit)
+    if snapshot(root, paths, resume_commit) != before:
         raise PublishError("files changed while computing expected Git content")
     profile = validate_profile(judge.get_profile(repo), root)
     result = run_profile(profile, root)
     if result.verification != "passed":
         raise PublishError(f"required verification failed: {', '.join(result.failed_required)}")
-    if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
+    if snapshot(root, paths, resume_commit) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during verification; verify again")
-    checkout_gate(root, repo, pr, remote, expected_head=head)
-    agent_login = loop_gate(repo, pr, max_rereview_requests, require_summary=False)
-    if snapshot(root, paths) != before:
+    checkout_gate(root, repo, pr, remote, expected_head=head, resume_commit=resume_commit)
+    agent_login = loop_gate(repo, pr, max_rereview_requests, require_summary=bool(resume_commit))
+    if snapshot(root, paths, resume_commit) != before:
         raise PublishError("files changed before staging; verify again")
     payload = {"status": "verified", "published": False, "dry_run": dry_run, "head": head, "verification": result.to_details()}
+    if resume_commit:
+        payload.update(head=resume_commit, resumed=True)
     if dry_run:
         return payload
     options = list(receipt_options or [])
     if max_rereview_requests is not None:
         options.extend(["--max-rereview-requests", str(max_rereview_requests)])
-    payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options, agent_login=agent_login)
-    checkout_gate(root, repo, pr, remote, expected_head=head)
+    if not resume_commit:
+        payload["cycle_summary"] = loop_lifecycle.emit_receipt(repo, pr, root, verification=payload["verification"], options=options, agent_login=agent_login)
+    checkout_gate(root, repo, pr, remote, expected_head=head, resume_commit=resume_commit)
     loop_gate(repo, pr, max_rereview_requests)
-    if snapshot(root, paths) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
+    if snapshot(root, paths, resume_commit) != before or verified_blobs(root, paths) != blobs or judge.get_profile(repo) != profile:
         raise PublishError("files or verification profile changed during summary delivery; verify again")
-    git(root, "--literal-pathspecs", "add", "--", *paths)
-    staged_gate(root, paths, blobs)
+    if not resume_commit:
+        git(root, "--literal-pathspecs", "add", "--", *paths)
+    staged_gate(root, paths, blobs, resume_commit)
     tree = git(root, "write-tree").strip()
-    git(root, "commit", "-m", message)
+    if not resume_commit:
+        git(root, "commit", "-m", message)
     commit = git(root, "rev-parse", "HEAD").strip()
+    if resume_commit and commit != resume_commit:
+        raise PublishError("local HEAD changed during recovery; no push")
     if git(root, "rev-parse", "HEAD^").strip() != head or git(root, "rev-parse", "HEAD^{tree}").strip() != tree or git(root, "status", "--porcelain"):
         raise PublishError("commit hooks changed the verified tree; local commit preserved, no push")
     info = pr_info(repo, pr, root)
@@ -252,7 +280,7 @@ def _publish(repo: str, pr: int, root: Path, paths: list[str], message: str, rem
         raise PublishError("push remote changed; local commit preserved, no push")
     loop_gate(repo, pr, max_rereview_requests)
     try:
-        git(root, "push", remote, f"HEAD:refs/heads/{branch}")
+        git(root, "push", remote, f"{commit}:refs/heads/{branch}")
         tip = git(root, "ls-remote", "--refs", urls[0], f"refs/heads/{branch}").strip().split()
         if len(tip) != 2 or tip[0] != commit:
             raise PublishError("push could not be confirmed; local commit preserved")
@@ -274,14 +302,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pr", required=True, type=rr.positive_pr)
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--paths", required=True, nargs="+")
-    parser.add_argument("--message", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--message", default="")
+    mode.add_argument("--resume-commit", help="Reverify and push this exact unpublished single commit without creating another commit.")
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-rereview-requests", type=int, default=None)
     loop_lifecycle.add_receipt_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run, args.max_rereview_requests, loop_lifecycle.receipt_arguments(args))
+        payload = publish(args.repo, args.pr, args.repo_root, args.paths, args.message, args.remote, args.dry_run, args.max_rereview_requests, loop_lifecycle.receipt_arguments(args), args.resume_commit)
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"status": "blocked", "published": False, "error": str(exc)}))
         return 1

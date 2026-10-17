@@ -502,6 +502,117 @@ def test_failed_push_preserves_local_commit(checkout, monkeypatch, push_landed):
     assert tip == (result["head"] if push_landed else checkout[2])
 
 
+@pytest.fixture
+def unpublished_commit(checkout):
+    root = checkout[0]
+    pc.git(root, "add", "fix.txt")
+    pc.git(root, "commit", "-m", "preserved verified fix")
+    tracking = rr.load_state()["owner/repo#1"]["run"]
+    tracking["last_summary_seq"] = tracking["update_seq"]
+    return pc.git(root, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_resume_reverifies_without_another_commit_or_receipt(checkout, unpublished_commit, monkeypatch, capsys, dry_run):
+    root, remote, previous, _, _ = checkout
+    original_git, original_verify = pc.git, pc.run_profile
+    verified, pushes = [], []
+
+    def git(root, *args):
+        assert args[:1] not in {("commit",), ("add",)}
+        if args[:1] == ("push",):
+            pushes.append(args)
+        return original_git(root, *args)
+
+    def verify(*args):
+        verified.append(args)
+        return original_verify(*args)
+
+    monkeypatch.setattr(pc, "git", git)
+    monkeypatch.setattr(pc, "run_profile", verify)
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **k: pytest.fail("recovery must not duplicate a receipt"))
+    args = ["--repo", "owner/repo", "--pr", "1", "--repo-root", str(root), "--paths", "fix.txt", "--resume-commit", unpublished_commit]
+    assert pc.main(args + (["--dry-run"] if dry_run else [])) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["resumed"] is True and result["published"] is not dry_run
+    assert result["head"] == pc.git(root, "rev-parse", "HEAD").strip() == unpublished_commit
+    assert len(verified) == 1 and "cycle_summary" not in result
+    assert pushes == ([] if dry_run else [("push", "origin", f"{unpublished_commit}:refs/heads/fix")])
+    assert pc.git(root, "--git-dir", str(remote), "rev-parse", "refs/heads/fix").strip() == (previous if dry_run else unpublished_commit)
+
+
+@pytest.mark.parametrize("problem", ["wrong_sha", "dirty", "untracked", "staged", "extra_commit", "merge", "wrong_paths", "head", "remote", "landed", "summary"])
+def test_resume_rejects_unsafe_state_before_verification(checkout, unpublished_commit, monkeypatch, problem):
+    root, remote, _, info, _ = checkout
+    sha, paths = unpublished_commit, ["fix.txt"]
+    if problem == "wrong_sha":
+        sha = "a" * 40
+    elif problem in {"dirty", "staged", "extra_commit"}:
+        (root / "fix.txt").write_text("another change\n")
+        if problem in {"staged", "extra_commit"}:
+            pc.git(root, "add", "fix.txt")
+        if problem == "extra_commit":
+            pc.git(root, "commit", "-m", "another commit")
+            sha = pc.git(root, "rev-parse", "HEAD").strip()
+    elif problem == "untracked":
+        (root / "unrelated.txt").write_text("user work")
+    elif problem == "merge":
+        pc.git(root, "checkout", "-b", "side", "HEAD^")
+        pc.git(root, "commit", "--allow-empty", "-m", "side commit")
+        pc.git(root, "checkout", "fix")
+        pc.git(root, "merge", "--no-ff", "side", "-m", "merge")
+        sha = pc.git(root, "rev-parse", "HEAD").strip()
+    elif problem == "wrong_paths":
+        paths = ["other.txt"]
+    elif problem == "head":
+        info["head"]["sha"] = "b" * 40
+    elif problem == "remote":
+        pc.git(root, "--git-dir", str(remote), "update-ref", "-d", "refs/heads/fix")
+    elif problem == "landed":
+        pc.git(root, "push", "origin", "fix")
+        info["head"]["sha"] = sha
+    elif problem == "summary":
+        rr.load_state()["owner/repo#1"]["run"]["last_summary_seq"] = 0
+    monkeypatch.setattr(pc, "run_profile", lambda *a: pytest.fail("unsafe recovery must not run verification"))
+    original_git = pc.git
+
+    def no_push(root, *args):
+        assert args[:1] != ("push",)
+        return original_git(root, *args)
+
+    monkeypatch.setattr(pc, "git", no_push)
+    with pytest.raises(pc.PublishError):
+        pc.publish("owner/repo", 1, root, paths, resume_commit=sha)
+
+
+@pytest.mark.parametrize("problem", ["failed_check", "files", "profile", "head", "remote"])
+def test_resume_rechecks_evidence_after_fresh_verification(checkout, unpublished_commit, monkeypatch, problem):
+    root, remote, _, info, profile = checkout
+    original = pc.run_profile
+    if problem == "failed_check":
+        profile["checks"][0]["command"] = [sys.executable, "-c", "raise SystemExit(1)"]
+
+    def verify(*args):
+        result = original(*args)
+        if problem == "files":
+            (root / "fix.txt").write_text("changed by verification")
+        elif problem == "profile":
+            profile["checks"][0]["command"] = [sys.executable, "-V"]
+        elif problem == "head":
+            info["head"]["sha"] = "b" * 40
+        elif problem == "remote":
+            pc.git(root, "--git-dir", str(remote), "update-ref", "-d", "refs/heads/fix")
+        return result
+
+    monkeypatch.setattr(pc, "run_profile", verify)
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **k: pytest.fail("blocked recovery must not emit a receipt"))
+    with pytest.raises(pc.PublishError):
+        pc.publish("owner/repo", 1, root, ["fix.txt"], resume_commit=unpublished_commit)
+    assert pc.git(root, "rev-parse", "HEAD").strip() == unpublished_commit
+    if problem != "remote":
+        assert_not_pushed(checkout)
+
+
 @pytest.mark.parametrize("confirmation", ["error", "different_tip"])
 def test_cli_preserves_uncertain_publication_after_successful_push(checkout, monkeypatch, capsys, confirmation):
     original_git = pc.git
@@ -565,5 +676,5 @@ def test_rereview_guard_posts_only_matching_head():
         return rr.subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
 
     rr.post_rereview("owner/repo", 1, "@coderabbitai review", runner=runner, expect_head="b" * 40)
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert "POST" in calls[1]

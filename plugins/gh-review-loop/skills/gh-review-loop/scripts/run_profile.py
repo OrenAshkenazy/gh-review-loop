@@ -143,6 +143,7 @@ def _run_one(check: Any, cwd: Path, timeout: int) -> CheckResult:
         return CheckResult(name, command, required, "failed", None,
                            time.monotonic() - start, reason_code="invalid_command")
     if isinstance(command, list):
+        # Display only; execution below uses the original literal argv.
         command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"

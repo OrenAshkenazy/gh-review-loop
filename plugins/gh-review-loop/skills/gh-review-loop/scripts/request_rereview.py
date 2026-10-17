@@ -529,7 +529,7 @@ def gh_login(runner: Any = None) -> str | None:
         result = runner(
             ["gh", "api", "user", "--jq", ".login"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -561,7 +561,7 @@ def count_agent_pings(
             ["gh", "api", "--paginate",
              f"repos/{owner}/{repo_name}/issues/{pr}/comments"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -593,7 +593,7 @@ def _gh_json(cmd: list[str], runner: Any) -> Any:
     try:
         result = runner(
             cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            errors="replace", check=False, timeout=120,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -985,13 +985,25 @@ def positive_pr(value: str) -> int:
 
 
 def ensure_expected_head(repo: str, pr: int, expect_head: str, runner: Any) -> None:
-    """Check the open PR immediately before a guarded review write."""
+    """Best-effort check immediately before writing; GitHub has no atomic head guard."""
     if not re.fullmatch(r"[0-9a-fA-F]{40}", expect_head):
         raise ValueError("--expect-head must be a full commit SHA")
     owner, repo_name = parse_repo(repo)
     info = _gh_json(["gh", "api", f"repos/{owner}/{repo_name}/pulls/{pr}"], runner)
     if not isinstance(info, dict) or info.get("state") != "open" or not isinstance(info.get("head"), dict) or info["head"].get("sha") != expect_head:
         raise RuntimeError("PR head changed or could not be established; no re-review posted")
+
+
+def confirm_posted_head(payload: dict[str, Any], repo: str, pr: int, expect_head: str | None, runner: Any) -> dict[str, Any]:
+    """A successful write remains posted even if its head cannot be reconfirmed."""
+    if expect_head is not None:
+        info = _gh_json(["gh", "api", f"repos/{repo}/pulls/{pr}"], runner)
+        head_info = info.get("head") if isinstance(info, dict) else None
+        head = head_info.get("sha") if isinstance(head_info, dict) else None
+        if not isinstance(info, dict) or info.get("state") != "open" or head != expect_head:
+            payload.update(status="review_head_unconfirmed", posted=True, expected_head=expect_head, observed_head=head,
+                           message="Review request was posted, but the open PR head could not be reconfirmed. Fetch current feedback; do not automatically request another review.")
+    return payload
 
 
 def post_rereview(
@@ -1042,7 +1054,7 @@ def post_rereview(
         f"body={phrase}",
     ]
     try:
-        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ReviewRequestRejected(f"could not run gh api: {exc}", requested_at=requested_at) from exc
 
@@ -1071,7 +1083,7 @@ def post_rereview(
     }
     if type(response.get("id")) is int:
         payload["comment_id"] = response["id"]
-    return payload
+    return confirm_posted_head(payload, repo, pr, expect_head, runner)
 
 
 def _registered_review(repo: str, pr: int, request_login: str, expect_head: str | None, runner: Any, *, actor: str | None = None, request_event_ids: list[int] | None = None) -> bool:
@@ -1160,7 +1172,7 @@ def request_review(
         query = "mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }"
         cmd = ["gh", "api", "graphql", "-f", "query=" + query, "-f", "pr=" + pull_id, "-f", "bot=" + bot_id]
     try:
-        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        result = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ReviewRequestRejected(
             f"could not run gh api: {exc}", reason="uncertain", requested_at=requested_at
@@ -1203,7 +1215,7 @@ def request_review(
         transport = "GraphQL re-request" if rerequest_ids else "REST"
         raise ReviewRequestRejected(f"{transport} accepted the call but selected reviewer registration is unconfirmed",
                                     requested_at=requested_at, allow_timeline_confirmation=False)
-    return {
+    payload = {
         "created_at": requested_at,
         "repo": repo,
         "pr": pr,
@@ -1211,6 +1223,7 @@ def request_review(
         "reviewer": request_login,
         "posted": True,
     }
+    return confirm_posted_head(payload, repo, pr, expect_head or registration_head, runner)
 
 
 def cancel_review_request(
@@ -1249,7 +1262,7 @@ def cancel_review_request(
     ]
     try:
         result = runner(cmd, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", check=False)
+                        errors="replace", check=False, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
@@ -1372,6 +1385,7 @@ def _review_request(args: argparse.Namespace, vendor: review_vendors.ReviewVendo
                 "posted": True,
                 "confirmed_after_uncertain": True,
             }
+            payload = confirm_posted_head(payload, args.repo, args.pr, args.expect_head or state["head"], subprocess.run)
         else:
             return rejected_payload(args.repo, args.pr, reviewer, exc)
     payload["state"] = original_state

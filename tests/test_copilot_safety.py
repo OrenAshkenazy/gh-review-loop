@@ -190,7 +190,8 @@ def test_copilot_matching_head_posts_native_request_and_records_provenance(monke
          "query=mutation($pr:ID!, $bot:ID!) { rerequestReviews(input:{pullRequestId:$pr, botIds:[$bot]}) { pullRequest { id } } }",
          "-f", "pr=PR_target", "-f", "bot=BOT_copilot"],
     ]
-    assert len(calls) == 3 and rr.STATE_QUERY in calls[2][4]
+    assert len(calls) == 4 and rr.STATE_QUERY in calls[2][4]
+    assert calls[3] == calls[0]
     assert rr.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [payload["created_at"]]
 
 

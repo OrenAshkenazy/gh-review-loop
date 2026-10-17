@@ -55,3 +55,13 @@ New commits pushed to the PR branch after the loop stopped:
 `publication_unconfirmed` exits nonzero with `published: null`, the new commit in `head`, its `previous_head`, verification details, and an error. A failed push transport or confirmation can follow a successful remote update; no review was requested. Do not automatically retry publication.
 
 Read the PR head and the branch at the validated push URL. If both equal `head`, use the standalone `request_rereview.py --expect-head <sha>` helper to recover the missing review request; do not republish. A different or unreadable remote requires investigation before any further push.
+
+If both still equal `previous_head`, recover the preserved local commit explicitly:
+
+```bash
+python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/publish_changes.py" \
+    --repo OWNER/REPO --pr PR_NUMBER --repo-root /path/to/checkout \
+    --paths path/to/fix.py --resume-commit FULL_LOCAL_COMMIT_SHA
+```
+
+Use `--resume-commit` instead of `--message`, listing every changed path in that commit. Recovery requires a clean checkout at that exact commit, with the current PR head as its only parent, the same validated branch and push destination, a fresh existing cycle summary, and available review capacity. It runs the confirmed verification profile again and rechecks files, profile, heads, and staged content. It creates no commit or duplicate receipt and pushes the verified commit SHA without force. `--dry-run` verifies without pushing or requesting review. Already-published commits, multiple local commits, merge commits, and unrelated edits are refused; investigate those states separately.

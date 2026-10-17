@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **Interrupted publications can resume one preserved commit.** Explicit `--resume-commit` recovery reruns verification and retains head, content, profile, remote, and cap safeguards without another commit or receipt.
+
+- **GitHub commands have bounded waits and explicit UTF-8 decoding.** Publication and request commands time out; an uncertain push or request still requires reconciliation. Collection preserves Unicode review text and fails cleanly on invalid output.
+
+- **Long review threads fetch remaining comment pages.** Deferral uses the complete conversation; unavailable or truncated pages leave findings actionable.
+
+- **Posted requests retain provenance after concurrent head changes.** A post-write head check reports uncertainty without claiming that the accepted request was never posted or inviting an automatic retry.
+
 - **Linked Copilot summary findings follow live thread state.** Existing inline threads are not duplicated or reopened by synthetic summary findings after resolution, outdated classification, or explicit deferral.
 
 - **Edited reviewer feedback invalidates stale deferrals.** Authorization must follow every reviewer's latest comment update; missing or invalid timestamps leave the finding actionable.

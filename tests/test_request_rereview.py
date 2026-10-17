@@ -1152,7 +1152,8 @@ class TestReviewRequestHelpers:
         )
 
         assert result["posted"] is True
-        assert len(calls) == 3
+        assert len(calls) == 4
+        assert calls[-1] == ["gh", "api", "repos/acme/widget/pulls/159"]
         calls.clear()
         result = request_rereview.request_review(
             "acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True,
@@ -1317,7 +1318,7 @@ class TestReviewRequestMain:
         monkeypatch.setattr(request_rereview.subprocess, "run", runner)
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["posted"] is True
-        assert len(calls) == 3 and self._stamped(tmp_path) == 1
+        assert len(calls) == 4 and self._stamped(tmp_path) == 1
 
     def test_pending_state_posts_nothing_and_skips_the_cap(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, state="PENDING", pending_since=T_REQUEST)
@@ -1458,6 +1459,7 @@ class TestReviewRequestMain:
 
         monkeypatch.setattr(request_rereview, "request_review", rejecting)
         monkeypatch.setattr(request_rereview, "_new_request_event", lambda *a, **k: {"created_at": CREATED_AT})
+        monkeypatch.setattr(request_rereview, "_gh_json", lambda *a: {"state": "open", "head": {"sha": "abc1234def" * 4}})
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 

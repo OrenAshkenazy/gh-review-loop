@@ -73,7 +73,9 @@ def test_incomplete_comments_do_not_defer_or_hide_the_thread(monkeypatch):
 
     def graphql_response(args):
         query = next(arg for arg in args if arg.startswith("query="))
-        assert "pageInfo { hasNextPage }" in query.split("comments(first:50) {", 1)[1]
+        if fgt.THREAD_COMMENTS_QUERY in query:
+            raise RuntimeError("next page unavailable")
+        assert "pageInfo { hasNextPage endCursor }" in query.split("comments(first:50) {", 1)[1]
         return {"data": {"repository": {"pullRequest": pr}}}
 
     monkeypatch.setattr(fgt, "run_gh", graphql_response)
