@@ -35,6 +35,7 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     resolve_current_repo,
     save_sticky_state,
     state_dir,
+    state_key_for,
     state_transaction,
     sticky_state_path,  # noqa: F401 — re-exported; state consumers import via this module
     summary_is_stale,  # noqa: F401 — re-exported; state consumers import via this module
@@ -1657,33 +1658,14 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
     if vendor is None or vendor.trigger_kind != "review_request":
         return None
-    entry = load_sticky_state().get(_state_key(pr), {})
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
-        return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
-        # No record for this PR: unknown, not empty. An empty list is
-        # authoritative to the counter and would display zero cap usage, so the
-        # loop would run another fix/push cycle before the write refuses.
-        return None
-    out = []
-    for item in requests:
-        if not isinstance(item, dict):
-            continue
-        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
-            continue
-        if item.get("initial_review") is True:
-            continue
-        at = item.get("at")
-        if _parse_iso_utc(at) is None:
-            return None
-        out.append(at)
-    return sorted(out)
+    state = load_sticky_state()
+    entry = state.get(state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number))
+    return reviewer_resolver.recorded_review_request_times(entry, vendor)
 
 
 def loop_comment_receipts(pr: PullRequest) -> list[dict[str, Any]] | None:
     state = load_sticky_state()
-    key = next((key for key in state if key.casefold() == _state_key(pr).casefold()), _state_key(pr))
+    key = state_key_for(state, f"{pr.owner}/{pr.repo}", pr.number)
     entry = state.get(key, {})
     if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
         return None

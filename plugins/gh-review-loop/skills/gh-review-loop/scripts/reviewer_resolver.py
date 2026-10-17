@@ -180,6 +180,29 @@ def _parse_instant(value: str) -> _dt.datetime | None:
         return None
 
 
+def recorded_review_request_times(entry: Any, vendor: review_vendors.ReviewVendor) -> list[str] | None:
+    """Read loop-owned re-review timestamps; None means unknown, not empty."""
+    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
+        # Unknown provenance must not look like zero cap usage after a POST.
+        return None
+    requests = entry.get("review_requests")
+    if not isinstance(requests, list):
+        return None
+    out = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
+            continue
+        if item.get("initial_review") is True:
+            continue
+        at = item.get("at")
+        if _parse_instant(at) is None:
+            return None
+        out.append(at)
+    return sorted(out)
+
+
 def merge_comment_receipts(comments: list[dict[str, Any]], trigger: str, receipts: Any) -> list[dict[str, Any]]:
     """Union filtered GitHub comments with successful local posts by database ID."""
     out = []

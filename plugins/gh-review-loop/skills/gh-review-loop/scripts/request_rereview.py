@@ -269,20 +269,7 @@ def load_state() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
-    """The key this PR's state already lives under, whatever its casing.
-
-    GitHub accepts `--repo owner/Repo` for a PR the fetch resolved as
-    `owner/repo`, but the shared state key is built from the raw string. A
-    case-mismatched write lands in a second entry, so the fetch never sees it
-    — the re-review stamp goes missing and the session ordinal sticks (#111
-    review). Prefer the existing entry; fall back to the literal key.
-    """
-    target = f"{repo}#{pr}".casefold()
-    for key in state:
-        if isinstance(key, str) and key.casefold() == target:
-            return key
-    return f"{repo}#{pr}"
+state_key_for = loop_state.state_key_for  # Compatibility re-export for state consumers.
 
 
 # How far after the local pre-POST timestamp a timeline event may appear and
@@ -302,28 +289,7 @@ def loop_request_times(repo: str, pr: int, vendor: review_vendors.ReviewVendor) 
     """
     state = load_state()
     entry = state.get(state_key_for(state, repo, pr))
-    if not isinstance(entry, dict) or entry.get("review_requests_incomplete") or entry.get("review_request_in_flight"):
-        # No record for this PR, or a POST whose record could not be written:
-        # the history is unknown, not empty. An empty list would be taken as
-        # authoritative and report zero requests used, which would let every
-        # pushed head post another request past the hard cap.
-        return None
-    requests = entry.get("review_requests")
-    if not isinstance(requests, list):
-        return None
-    out = []
-    for item in requests:
-        if not isinstance(item, dict):
-            continue
-        if review_vendors.vendor_for(item.get("reviewer")) is not vendor:
-            continue
-        if item.get("initial_review") is True:
-            continue
-        at = item.get("at")
-        if _parse_iso(at) is None:
-            return None
-        out.append(at)
-    return sorted(out)
+    return reviewer_resolver.recorded_review_request_times(entry, vendor)
 
 
 @loop_state.state_transaction

@@ -282,14 +282,34 @@ def test_explicit_initial_request_stays_free_after_first_review(tmp_path):
     assert rr.count_agent_review_requests("owner/repo", 1, review_vendors.COPILOT, "agent", "2026-10-12T12:00:00Z", runner=runner) == 0
 
 
-def test_fetch_and_request_readers_agree_on_initial_and_in_flight_receipts(tmp_path):
+@pytest.mark.parametrize("repo", ["owner/repo", "Owner/Repo"])
+def test_fetch_and_request_readers_agree_on_initial_and_in_flight_receipts(tmp_path, repo):
     import fetch_gemini_threads as fetch
     import review_vendors
 
     pr = fetch.PullRequest("owner", "repo", 1)
-    rr.record_rereview_posted("owner/repo", 1, reviewer="copilot", requested_at="2026-10-12T11:00:00Z", initial_review=True)
-    rr.record_rereview_posted("owner/repo", 1, reviewer="copilot", requested_at="2026-10-12T12:00:00Z")
+    rr.record_rereview_posted(repo, 1, reviewer="copilot", requested_at="2026-10-12T11:00:00Z", initial_review=True)
+    rr.record_rereview_posted(repo, 1, reviewer="copilot", requested_at="2026-10-12T12:00:00Z")
     assert fetch.loop_request_times(pr, "copilot") == rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == ["2026-10-12T12:00:00Z"]
     rr._mark_request_in_flight("owner/repo", 1, {"at": "2026-10-12T13:00:00Z"})
     assert fetch.loop_request_times(pr, "copilot") is None
     assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) is None
+
+
+@pytest.mark.parametrize("entry,expected", [
+    (None, None),
+    ({}, None),
+    ({"review_requests": []}, []),
+    ({"review_requests": "corrupt"}, None),
+    ({"review_requests": [], "review_requests_incomplete": True}, None),
+    ({"review_requests": [], "review_request_in_flight": {"at": "2026-10-12T13:00:00Z"}}, None),
+    ({"review_requests": [{"reviewer": "copilot", "at": "invalid"}]}, None),
+    ({"review_requests": [{"reviewer": "copilot", "initial_review": True}, {"reviewer": "codex"}]}, []),
+])
+def test_mixed_case_request_history_preserves_unknown_vs_empty(entry, expected):
+    import fetch_gemini_threads as fetch
+    import review_vendors
+
+    loop_state.save_sticky_state({"Owner/Repo#1": entry})
+    assert fetch.loop_request_times(fetch.PullRequest("owner", "repo", 1), "copilot") == expected
+    assert rr.loop_request_times("owner/repo", 1, review_vendors.COPILOT) == expected

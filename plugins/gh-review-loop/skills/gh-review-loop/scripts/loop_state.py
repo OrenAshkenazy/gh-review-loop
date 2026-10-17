@@ -121,6 +121,15 @@ def load_sticky_state(*, strict: bool = False) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
+    """Find this PR's existing state key regardless of repository-name casing."""
+    target = f"{repo}#{pr}".casefold()
+    for key in state:
+        if isinstance(key, str) and key.casefold() == target:
+            return key
+    return f"{repo}#{pr}"
+
+
 def state_transaction(function):
     """Serialize the complete local read/modify/write operation, never network I/O."""
     @wraps(function)

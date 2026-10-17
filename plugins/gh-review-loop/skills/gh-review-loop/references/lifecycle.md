@@ -23,3 +23,7 @@ python "<plugin-root>/skills/gh-review-loop/scripts/finish_loop.py" --repo owner
 Finish follows the final reviewer wait. On no-publication paths, report the actual failed/skipped verification result. Pass the publisher's `verification` object directly; setup and reporting never run checks. Publisher `--dry-run` verifies without a receipt or publication; finish `--dry-run` only checks whether an active run exists.
 
 Publisher and finish accept `--fixed-count`, repeatable `--fixed-finding`, `--fixed-path`, `--swept-pattern`, and `--semantic-risk`, plus severity filters and `--changed-base`/`--changed-head`. Pass the actual fix/sweep metadata and cap override. Finish also accepts terminal outcome/reason and reviewer-confirmation flags.
+
+## One full verification per publication
+
+Let the real publisher invocation own the full profile. Do not precede it with `run_profile.py`, a full-suite run in another review gate, or a publisher `--dry-run` as routine preflight. Publisher dry runs are diagnostics: they run checks, and a later real publication must verify again. Use focused checks for development or reproducing a finding. Any additional review gate should inspect the change and existing check evidence; repeat checks only when new edits or unresolved concerns justify them.
