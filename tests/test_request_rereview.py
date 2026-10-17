@@ -70,10 +70,12 @@ def test_json_stdout_parses_as_json_and_has_no_ansi(monkeypatch, capsys):
         request_rereview,
         "post_rereview",
         lambda repo, pr, phrase, **kwargs: {
+            "status": "posted",
             "created_at": CREATED_AT,
             "repo": repo,
             "pr": pr,
             "phrase": phrase,
+            "posted": True,
         },
     )
 
@@ -89,10 +91,12 @@ def test_json_stdout_parses_as_json_and_has_no_ansi(monkeypatch, capsys):
     captured = capsys.readouterr()
     parsed = json.loads(captured.out)
     assert parsed == {
+        "status": "posted",
         "created_at": CREATED_AT,
         "repo": "OrenAshkenazy/AegisLocal",
         "pr": 11,
         "phrase": request_rereview.DEFAULT_PHRASE,
+        "posted": True,
     }
     assert "\033[" not in captured.out
     assert captured.err == ""
@@ -2373,11 +2377,45 @@ class TestReviewRequestMain:
         self._stub_reads(monkeypatch, used=3)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
+        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: [T_REQUEST] * 3)
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "capped" and payload["rereviews_used"] == 3
+        assert payload["count_is_upper_bound"] is False
+        assert "manual clicks" not in payload["message"]
+
+    def test_a_cap_hit_without_local_provenance_says_the_count_is_a_bound(self, monkeypatch, capsys, tmp_path):
+        """A second machine has no provenance log, so the count is every
+        request under the login. The payload says so: the member is being
+        asked to raise the cap, not to bypass it."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
+        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: None)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "capped"
+        assert payload["count_is_upper_bound"] is True
+        assert "manual clicks included" in payload["message"]
+        assert "--max-rereview-requests" in payload["message"]
+
+    def test_a_posted_request_carries_a_status_like_every_other_result(self):
+        """Every non-posting result has `status`; a posted one did not, so a
+        wrapper branching on `status` treated success as nothing-happened and
+        skipped the wait (live Copilot test, 2026-10-17)."""
+        def runner(cmd, **kwargs):
+            assert cmd[2].endswith("/requested_reviewers")
+            return _completed(cmd, {"requested_reviewers": [{"login": COPILOT_LOGIN}]})
+
+        payload = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner)
+        assert payload["status"] == "posted" and payload["posted"] is True
+        dry = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, dry_run=True)
+        assert dry["status"] == "dry_run" and dry["posted"] is False
 
     def test_uncountable_review_requests_refuse_to_post(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, used=None)
@@ -2570,13 +2608,14 @@ class TestRequestProvenance:
         # A comment vendor's pings are recorded against that vendor only.
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.CODEX) == []
 
-    def test_requests_with_no_local_record_are_uncountable_not_free(self, monkeypatch, tmp_path):
+    def test_requests_with_no_local_record_count_as_an_upper_bound(self, monkeypatch, tmp_path):
         """Requests exist under this login but the loop has no record of
-        posting them: they may be the member's clicks or the loop's own after a
-        cleared state dir. Charging them to the loop stops a first run as
-        capped; calling them zero lets every pushed head post another request
-        past the cap. Neither is a guess worth making, so the count is unknown
-        and the caller refuses to post (PR #116 review)."""
+        posting them: the loop's own from another machine or a cleared state
+        dir, or the member's clicks. They all count. Calling them zero would
+        let every pushed head post past the cap; calling them unknown (the
+        PR #116 rule) refused every first run on a second machine, which the
+        live Copilot test hit. An early `capped` is the cheap failure: the
+        member raises the cap."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         manual = _rest_request_events([
             ("agent", "2026-10-07T16:00:00Z"),
@@ -2590,7 +2629,7 @@ class TestRequestProvenance:
 
         assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
-        ) is None
+        ) == 3
 
     def test_no_record_and_no_requests_is_a_verified_zero(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
@@ -2910,7 +2949,9 @@ class TestProvenanceFailsClosed:
             "acme/widget", 159, review_vendors.COPILOT
         ) == [T_REQUEST]
 
-    def test_unknown_provenance_with_candidate_events_refuses_to_count(self, monkeypatch, tmp_path):
+    def test_unknown_provenance_with_candidate_events_counts_the_bound(self, monkeypatch, tmp_path):
+        """No log at all: the login's own events are the count (an upper
+        bound), never None. Only a human's request is left out."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         events = _rest_request_events([("agent", T_REQUEST), ("a-human", "2026-10-07T16:30:00Z")])
 
@@ -2919,7 +2960,7 @@ class TestProvenanceFailsClosed:
 
         assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
-        ) is None
+        ) == 1
 
 
 class TestRequestRegistered:
