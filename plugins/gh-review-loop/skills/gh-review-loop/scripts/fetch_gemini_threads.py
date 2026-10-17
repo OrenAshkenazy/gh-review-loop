@@ -100,12 +100,17 @@ COPILOT_OVERVIEW_MARKER = "<!-- ccr-overview"
 COPILOT_FINDING_RE = re.compile(
     r'alt="(?P<severity>critical|high|medium|low)\s+severity"[^\n]*?'
     # The title may itself contain brackets (`arr[i]`, `[Authorize]`), so it
-    # is matched lazily up to the `](#discussion_r` that ends it.
-    r"\[(?P<title>[^\n]*?)\]\(#discussion_r(?P<id>\d+)\)",
+    # is matched lazily up to the discussion link that ends it.
+    r"\[(?P<title>[^\n]*?)\]\((?:https?://[^\s()]+)?#discussion_r(?P<id>\d+)\)",
     re.IGNORECASE,
 )
 COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
+)
+COPILOT_BODY_FINDING_RE = re.compile(
+    r'<details[^>]*>\s*<summary>\s*<picture>.*?'
+    r'</picture>\s*(?P<title>[^<]+)</summary>(?P<body>.*?)</details>',
+    re.IGNORECASE | re.DOTALL,
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
 # "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
@@ -310,7 +315,6 @@ query($owner:String!, $repo:String!, $number:Int!) {
           originalStartLine
           diffSide
           comments(first:50) {
-            pageInfo { hasNextPage endCursor }
             pageInfo { hasNextPage endCursor }
             nodes {
               id
@@ -1253,16 +1257,23 @@ def review_body_findings(
     """Surface priority-badged findings that live in the review body.
 
     Codex usually publishes inline review comments, but it can put a finding
-    directly in the review body, where no thread exists to fetch. Only the
-    newest review counts: a later re-review supersedes older body findings, so
-    these synthetic entries go stale the same way threads do.
+    directly in the review body, where no thread exists to fetch. Copilot can
+    also embed findings in its overview. Its current-head review takes
+    precedence; otherwise the newest review supersedes older body findings.
     """
     reviews = filter_reviews(pull_request, author)
     if not reviews:
         return []
-    latest = max(reviews, key=lambda review: review.get("submittedAt") or "")
+    latest = (
+        _latest_overview_review(pull_request, author)
+        if review_vendors.vendor_for(author) is review_vendors.COPILOT
+        else max(reviews, key=lambda review: review.get("submittedAt") or "")
+    )
+    if latest is None:
+        return []
     body = latest.get("body") or ""
-    badges = list(CODEX_PRIORITY_RE.finditer(body))
+    copilot = COPILOT_OVERVIEW_MARKER in body
+    badges = list((COPILOT_BODY_FINDING_RE if copilot else CODEX_PRIORITY_RE).finditer(body))
     if not badges:
         return []
 
@@ -1276,6 +1287,16 @@ def review_body_findings(
         anchor = anchors[-1] if anchors else None
         path = anchor.group(1) if anchor else "(review body)"
         line = int(anchor.group(2)) if anchor else None
+        finding_body = body[badge.start():end].strip()
+        severity = None
+        if copilot:
+            severity = COPILOT_SEVERITY_ICON_RE.search(badge.group())
+            if not severity:
+                continue
+            finding_body = badge.group("title").strip() + "\n\n" + badge.group("body").strip()
+            location = re.search(r"`([^`\n]+):(\d+)`", badge.group("body"))
+            path = location.group(1).replace("\u200b", "") if location else "(review body)"
+            line = int(location.group(2)) if location else None
         findings.append({
             "id": f"review-body:{review_id}:{index + 1}",
             "isResolved": False,
@@ -1289,7 +1310,7 @@ def review_body_findings(
             "comments": [{
                 "id": f"{review_id}:{index + 1}",
                 "author": {"login": author},
-                "body": body[badge.start():end].strip(),
+                "body": finding_body,
                 "createdAt": latest.get("submittedAt"),
                 "updatedAt": latest.get("submittedAt"),
                 "url": latest.get("url"),
@@ -1301,6 +1322,11 @@ def review_body_findings(
                 "diffHunk": "",
             }],
         })
+        if severity:
+            findings[-1]["reviewerSeverity"] = severity.group(1).lower()
+            linked = COPILOT_FINDING_RE.search(badge.group())
+            if linked:
+                findings[-1]["reviewerDiscussionId"] = linked.group("id")
     return findings
 
 
@@ -1441,8 +1467,8 @@ def copilot_overview_severities(
         if parsed["unlinked_findings"]:
             warnings.append(
                 f"{parsed['unlinked_findings']} finding(s) in the {author} review "
-                f"overview at {review.get('url')} have no inline thread and are not "
-                "listed below."
+                f"overview at {review.get('url')} have no linked inline thread; "
+                "check the review-body findings and overview."
             )
     return severities, warnings
 
@@ -1497,18 +1523,10 @@ def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str
     return latest_reviewer_overview(pull_request, author)
 
 
-def latest_reviewer_overview(
+def _latest_overview_review(
     pull_request: dict[str, Any], author: str
 ) -> dict[str, Any] | None:
-    """The overview that describes the PR head, or the newest one, or None.
-
-    The newest ``author`` review *of the head commit* wins even when its body
-    is not a readable overview: it still proves the head was reviewed
-    (``covers_head: true``, ``complete: false``), which is "unparseable", not
-    "no review for head" — the waiter is already satisfied, so telling the
-    loop to wait would be a dead end. With no head review, the newest
-    readable overview is reported with ``covers_head: false``.
-    """
+    """Select the same submitted review for overview grading and body findings."""
     head = pull_request.get("headRefOid") or ""
     newest_request = newest_request_at(pull_request, author)
     listed = vendor_request_listed(pull_request, author)
@@ -1523,15 +1541,33 @@ def latest_reviewer_overview(
 
     for review in newest_first:
         if current(review):
-            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+            return review
     for review in newest_first:
         parsed = parse_copilot_overview(review.get("body"))
         if parsed is not None:
-            record = _overview_record(review, parsed, head)
-            if record["covers_head"] and not current(review):
-                record["covers_head"] = False
-            return record
+            return review
     return None
+
+
+def latest_reviewer_overview(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    """The overview that describes the PR head, or the newest one, or None.
+
+    The newest ``author`` review *of the head commit* wins even when its body
+    is not a readable overview: it still proves the head was reviewed
+    (``covers_head: true``, ``complete: false``), which is "unparseable", not
+    "no review for head" — the waiter is already satisfied, so telling the
+    loop to wait would be a dead end. With no head review, the newest
+    readable overview is reported with ``covers_head: false``.
+    """
+    review = _latest_overview_review(pull_request, author)
+    if review is None:
+        return None
+    record = _overview_record(review, parse_copilot_overview(review.get("body")), pull_request.get("headRefOid") or "")
+    if vendor_request_listed(pull_request, author) or (review.get("submittedAt") or "") < newest_request_at(pull_request, author):
+        record["covers_head"] = False
+    return record
 
 
 def discussion_ids_on_pr(pull_request: dict[str, Any]) -> set[str]:
@@ -1553,6 +1589,7 @@ def clean_blocked_by(
     *,
     review_request_vendor: bool,
     known_thread_ids: set[str] | None = None,
+    parsed_body_findings: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Why zero actionable threads is *not yet* clean for a review-request vendor.
 
@@ -1564,7 +1601,9 @@ def clean_blocked_by(
     review time, thread state is live, and the normal classification already
     decided those threads (spec §5.3). A reported finding the fetch never saw
     — no thread link, or a link to a thread that is not on the PR — still
-    blocks. Comment vendors have no overview gate.
+    blocks. Successfully parsed body findings are accounted for before
+    severity filtering; genuinely unparsed findings still block.
+    Comment vendors have no overview gate.
     """
     if threads or not review_request_vendor:
         return None
@@ -1572,18 +1611,22 @@ def clean_blocked_by(
         return "no_review_for_head"
     if not overview.get("complete") or overview.get("open_findings") is None:
         return "overview_unparseable"
+    body_links = {finding["reviewerDiscussionId"] for finding in parsed_body_findings or [] if finding.get("reviewerDiscussionId")}
+    unlinked_body = sum(not finding.get("reviewerDiscussionId") for finding in parsed_body_findings or [])
+    if (overview.get("unlinked_findings") or 0) > unlinked_body:
+        return "overview_reports_open_findings"
     open_findings = overview.get("open_findings") or 0
     if open_findings > 0:
-        if known_thread_ids is None or overview.get("unlinked_findings"):
+        if known_thread_ids is None:
             return "overview_reports_open_findings"
         linked = overview.get("finding_ids") or []
         # `open_findings` is the authoritative count; `finding_ids` is only what
         # the parser could recognize. Fewer links than findings means one is
         # unaccounted for — a markup change that drops a severity icon must not
         # read as clean just because the links that did parse are known.
-        if len(linked) < open_findings:
+        if len(set(linked)) + unlinked_body < open_findings:
             return "overview_reports_open_findings"
-        if any(fid not in known_thread_ids for fid in linked):
+        if any(fid not in known_thread_ids and fid not in body_links for fid in linked):
             return "overview_reports_open_findings"
     return None
 
@@ -4385,7 +4428,10 @@ def main() -> int:
         )
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
-        threads.extend(review_body_findings(pull_request, args.author))
+        parsed_body_findings = review_body_findings(pull_request, args.author)
+        known_thread_ids = discussion_ids_on_pr(pull_request)
+        threads.extend(finding for finding in parsed_body_findings
+                       if finding.get("reviewerDiscussionId") not in known_thread_ids)
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
         # an unparseable overview leaves every thread listed as `unknown`.
@@ -4623,6 +4669,7 @@ def main() -> int:
                 clean_blocked=clean_blocked_by(
                     threads, reviewer_overview, review_request_vendor=review_request_vendor,
                     known_thread_ids=discussion_ids_on_pr(pull_request),
+                    parsed_body_findings=parsed_body_findings,
                 ),
             )
             derived = derive_record_fields(
@@ -4946,6 +4993,7 @@ def main() -> int:
                             threads, reviewer_overview,
                             review_request_vendor=review_request_vendor,
                             known_thread_ids=discussion_ids_on_pr(pull_request),
+                            parsed_body_findings=parsed_body_findings,
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -5045,6 +5093,7 @@ def main() -> int:
         blocked = clean_blocked_by(
             threads, reviewer_overview, review_request_vendor=review_request_vendor,
             known_thread_ids=discussion_ids_on_pr(pull_request),
+            parsed_body_findings=parsed_body_findings,
         )
         if blocked:
             print(

@@ -38,9 +38,9 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 
 ## Thread States
 
-- **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
-- **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
-- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from recognized severity images (Codex/Gemini) or reviewer-leading plain-text `[P0]`–`[P3]` markers; unsupported formats remain `unknown`.
+- **`RESOLVED`** / **`OUTDATED`** — skip; leave unresolved unless the user explicitly requests resolution.
+- **`ADDRESSED_BY_REPLY`** — an OWNER/COLLABORATOR reply beginning with `/review-loop defer` after the latest bot comment explicitly deferred it: do not fix again; leave unresolved (details: `references/write-safety.md`).
+- **`UNRESOLVED`** — actionable, ordered `critical → high → medium → low → unknown`. Recognized badges, headers, overview grades or leading `[P0]`–`[P3]` set severity; otherwise `unknown`.
 
 ## Cycle Counting
 

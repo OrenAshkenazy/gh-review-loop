@@ -1169,6 +1169,21 @@ class TestRequestState:
         assert state["first_completed_review_at"] == T_FIRST_REVIEW
 
 
+    def test_rerequest_ids_come_from_the_selected_completed_bot(self):
+        payload = _gql_pr("new-head")
+        payload["data"]["repository"]["pullRequest"]["id"] = "PR_target"
+        review = _rest_reviews([OLD_REVIEW])[0]
+        review["user"].update(type="Bot", node_id="BOT_copilot")
+        other = {**review, "user": {"login": "other-bot", "type": "Bot", "node_id": "BOT_other"}}
+        state = request_rereview.request_state(
+            "acme/widget", 159, review_vendors.COPILOT,
+            runner=_state_runner(payload, review_pages=[[other, review]]),
+        )
+
+        assert state["state"] == "ABSENT"
+        assert state["rerequest_ids"] == ("PR_target", "BOT_copilot")
+
+
 class TestReviewRequestHelpers:
     def test_count_agent_review_requests_paginated_rest(self):
         page1 = [
@@ -1299,6 +1314,52 @@ class TestReviewRequestHelpers:
         monkeypatch.setattr(request_rereview, "read_persisted_reviewer", lambda repo, pr: None)
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention="@m") == "m"
         assert request_rereview.resolve_reviewer_login(repo="acme/widget", pr=159, reviewer_login=None, reviewer_mention=None) is None
+
+
+    def test_rerequest_uses_bot_ids_after_the_head_guard(self):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-1] == "repos/acme/widget/pulls/159":
+                return _completed(cmd, {"state": "open", "head": {"sha": "a" * 40}})
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head="a" * 40, pending=[COPILOT_REQUEST]))
+            assert "rerequestReviews" in cmd[4]
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            assert not kwargs.get("shell")
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+
+        assert result["posted"] is True
+        assert len(calls) == 4
+        assert calls[-1] == ["gh", "api", "repos/acme/widget/pulls/159"]
+        calls.clear()
+        result = request_rereview.request_review(
+            "acme/widget", 159, COPILOT_REQUEST, runner=runner, dry_run=True,
+            expect_head="a" * 40, rerequest_ids=("PR_target", "BOT_copilot"),
+        )
+        assert not result["posted"] and not calls
+
+    @pytest.mark.parametrize("response", [{}, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_other"}}}}, {"errors": [{"message": "denied"}]}])
+    def test_rerequest_requires_a_confirmed_mutation_result(self, response):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            return _completed(cmd, response)
+
+        with pytest.raises(request_rereview.ReviewRequestRejected) as info:
+            request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner, rerequest_ids=("PR_target", "BOT_copilot"))
+
+        assert info.value.reason == "uncertain"
+        assert info.value.requested_at
+        assert len(calls) == 1  # An ambiguous GraphQL write must never fall back to REST.
 
 
 def test_landed_check_is_unknown_without_the_agent_login():
@@ -2315,6 +2376,30 @@ class TestReviewRequestMain:
 
         out = capsys.readouterr().out
         assert "[loop]" in out and "Copilot" in out and CREATED_AT in out
+
+
+    def test_main_forwards_rerequest_ids_and_records_one_success(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, head="a" * 40)
+        state = request_rereview.request_state()
+        state["rerequest_ids"] = ("PR_target", "BOT_copilot")
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: state)
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == ["gh", "api", "repos/acme/widget/pulls/159"]:
+                return _completed(cmd, {"state": "open", "head": {"sha": state["head"]}})
+            assert cmd[:3] == ["gh", "api", "graphql"]
+            if request_rereview.STATE_QUERY in cmd[4]:
+                return _completed(cmd, _gql_pr(head=state["head"], pending=[COPILOT_REQUEST]))
+            assert "pr=PR_target" in cmd and "bot=BOT_copilot" in cmd
+            return _completed(cmd, {"data": {"rerequestReviews": {"pullRequest": {"id": "PR_target"}}}})
+
+        monkeypatch.setattr(request_rereview.subprocess, "run", runner)
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert len(calls) == 4 and self._stamped(tmp_path) == 1
 
 
 class TestExplicitMentionOverridesPersistedVendor:

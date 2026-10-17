@@ -45,10 +45,10 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # Parse JSON stdout and capture `created_at` as REREVIEW_AT.
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/request_rereview.py" \
     --repo OWNER/REPO --pr PR_NUMBER \
-    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --json
+    --review-trigger-mention "$REVIEW_TRIGGER_MENTION" --expect-head "$PUBLISHED_HEAD" --json
 # Copilot (persisted trigger_kind: review_request): same command without the
-# mention; it posts a GitHub reviewer request, not a comment. Add
-# --expect-head "$(git rev-parse HEAD)" to refuse if the PR head moved.
+# mention; it posts a GitHub reviewer request. PUBLISHED_HEAD is the publish
+# helper's JSON head; a moved or closed PR blocks the write.
 
 # Render deterministic human-readable formatter blocks for relay.
 # Default fetch includes both blocks (JSON: humanBlocks.profileIntro and

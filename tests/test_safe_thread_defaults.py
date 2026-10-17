@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 import fetch_gemini_threads as fgt
@@ -9,6 +11,15 @@ def thread(*comments):
 
 
 BOT = {"author": {"login": "coderabbitai", "__typename": "Bot"}, "body": "Please fix this", "createdAt": "2026-10-15T10:00:00Z"}
+
+
+def test_skill_thread_policy_keeps_resolution_opt_in_and_deferral_explicit():
+    skill = Path(__file__).parents[1] / "plugins/gh-review-loop/skills/gh-review-loop/SKILL.md"
+    policy = skill.read_text(encoding="utf-8").split("## Thread States\n", 1)[1].split("\n## ", 1)[0]
+    assert "auto-resolved" not in policy
+    assert "unless the user explicitly requests resolution" in policy
+    assert "OWNER/COLLABORATOR" in policy and "`/review-loop defer`" in policy
+    assert "after the latest bot comment" in policy and "leave unresolved" in policy
 
 
 def reply(body, association="COLLABORATOR", kind="User"):
