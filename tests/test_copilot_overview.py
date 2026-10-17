@@ -408,6 +408,30 @@ def test_finding_titles_may_contain_brackets():
     ]
 
 
+def test_the_open_count_is_read_when_copilot_calls_them_issues():
+    """Live Copilot (qizsecurity/local-dev#97, 2026-10-17) writes
+    "<strong>14 open issues</strong>" where the October 7 fixtures said
+    "open findings". The count is what the clean gate reads; missing it made
+    every live overview "unparseable" (complete=False, open_findings=None)."""
+    body = (
+        "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\n"
+        "Namespace checks can target the wrong cluster.\n\n"
+        "<details open>\n<summary><strong>14 open issues</strong></summary>\n\n"
+        '- <picture><img alt="High severity" width="62"></picture> '
+        "[Guard the namespace](https://github.com/o/r/pull/97#discussion_r4303491726) · New\n"
+        "</details>\n\n<sub>Review effort: Balanced</sub>\n"
+    )
+    parsed = parse_copilot_overview(body)
+
+    assert parsed["open_findings"] == 14
+    assert parsed["complete"] is True
+    marker = "<!-- ccr-overview-v2 -->\n\n"
+    clean = parse_copilot_overview(marker + "### 🟢 Approval recommended\n\nFine.\n\n**0 open issues**\n")
+    assert clean["open_findings"] == 0 and clean["complete"] is True
+    one = parse_copilot_overview(marker + "### 🟡 Changes recommended\n\n<strong>1 open issue</strong>\n")
+    assert one["open_findings"] == 1
+
+
 def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head():
     """Copilot reviewed the head clean, then was asked again without a push.
     The old overview must not clear the gate while the new review is

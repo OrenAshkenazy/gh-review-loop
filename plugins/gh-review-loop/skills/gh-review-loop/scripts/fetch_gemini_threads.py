@@ -111,9 +111,10 @@ COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
-# "**0 open findings**" on a clean review; "<strong>2 open findings</strong>" otherwise.
+# "**0 open findings**" on a clean review; "<strong>2 open findings</strong>"
+# otherwise. Live Copilot said "open issues" by 2026-10-17 (local-dev#97).
 COPILOT_OPEN_FINDINGS_RE = re.compile(
-    r"(?:<strong>|\*\*)(\d+) open findings?(?:</strong>|\*\*)", re.IGNORECASE
+    r"(?:<strong>|\*\*)(\d+) open (?:findings?|issues?)(?:</strong>|\*\*)", re.IGNORECASE
 )
 # Match approval phrasing only; enumerating every way Copilot can decline would
 # miss one, and an unrecognized decline read as approval dismisses a review.
