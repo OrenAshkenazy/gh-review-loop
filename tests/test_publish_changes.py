@@ -48,6 +48,7 @@ def checkout(tmp_path, monkeypatch):
     state = {"owner/repo#1": {"run": {"update_seq": 1, "last_summary_seq": 0}}}
     monkeypatch.setattr(rr, "load_state", lambda: state)
     def emit_receipt(*args, **kwargs):
+        state["owner/repo#1"]["run"]["update_seq"] += 1
         state["owner/repo#1"]["run"]["last_summary_seq"] = state["owner/repo#1"]["run"]["update_seq"]
         return {"output": "[loop] receipt", "warnings": ""}
     monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", emit_receipt)
@@ -564,3 +565,104 @@ def test_rereview_guard_posts_only_matching_head():
     rr.post_rereview("owner/repo", 1, "@coderabbitai review", runner=runner, expect_head="b" * 40)
     assert len(calls) == 2
     assert "POST" in calls[1]
+
+
+def test_publication_refreshes_network_evidence_only_at_write_boundaries(checkout, monkeypatch):
+    logins, counts, receipt_actors = [], [], []
+    monkeypatch.setattr(rr, "gh_login", lambda: logins.append(True) or "agent")
+    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: counts.append(True) or 0)
+    original = pc.loop_lifecycle.emit_receipt
+
+    def receipt(*args, **kwargs):
+        receipt_actors.append(kwargs["agent_login"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", receipt)
+    assert publish(checkout)["published"] is True
+    assert len(logins) == len(counts) == 3 and receipt_actors == ["agent"]
+
+
+@pytest.mark.parametrize("change", ["cap", "account", "reviewer", "sequence", "run"])
+def test_changes_during_verification_block_receipt_and_publication(checkout, monkeypatch, change):
+    original = pc.run_profile
+
+    def verify(*args):
+        result = original(*args)
+        if change == "cap":
+            monkeypatch.setattr(rr, "count_agent_pings", lambda *args: 3)
+        elif change == "account":
+            monkeypatch.setattr(rr, "gh_login", lambda: "other-agent")
+        elif change == "reviewer":
+            monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": "codex"})
+        else:
+            run = rr.load_state()["owner/repo#1"]["run"]
+            run["update_seq" if change == "sequence" else "started_at"] = 99 if change == "sequence" else "new run"
+        return result
+
+    monkeypatch.setattr(pc, "run_profile", verify)
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **k: pytest.fail("stale publication cannot post a receipt"))
+    with pytest.raises(pc.PublishError, match="cap|account|reviewer or active run"):
+        publish(checkout)
+    assert_not_pushed(checkout)
+    assert pc.git(checkout[0], "rev-parse", "HEAD").strip() == checkout[2]
+
+
+@pytest.mark.parametrize("phase", ["receipt", "commit"])
+def test_concurrent_fetch_after_receipt_prevents_push(checkout, monkeypatch, phase):
+    def advance():
+        state = rr.load_state()["owner/repo#1"]["run"]
+        state["update_seq"] += 1
+        # Even an incorrectly current summary cannot certify another fetch.
+        state["last_summary_seq"] = state["update_seq"]
+
+    if phase == "receipt":
+        original = pc.loop_lifecycle.emit_receipt
+        def receipt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            advance()
+            return result
+        monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", receipt)
+    else:
+        original = pc.git
+        def git(root, *args):
+            result = original(root, *args)
+            if args[:1] == ("commit",):
+                advance()
+            return result
+        monkeypatch.setattr(pc, "git", git)
+    with pytest.raises(pc.PublishError, match="reviewer or active run"):
+        publish(checkout)
+    assert_not_pushed(checkout)
+
+
+@pytest.mark.parametrize("change", ["cap", "account"])
+def test_final_write_gate_refreshes_changes_after_receipt(checkout, monkeypatch, change):
+    original = pc.loop_lifecycle.emit_receipt
+
+    def receipt(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if change == "cap":
+            monkeypatch.setattr(rr, "count_agent_pings", lambda *args: 3)
+        else:
+            monkeypatch.setattr(rr, "gh_login", lambda: "other-agent")
+        return result
+
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", receipt)
+    with pytest.raises(pc.PublishError, match="cap|account"):
+        publish(checkout)
+    assert_not_pushed(checkout)
+
+
+def test_run_is_rechecked_after_network_capacity_lookup(monkeypatch):
+    state = {"owner/repo#1": {"run": {"started_at": "run", "update_seq": 1}}}
+    monkeypatch.setattr(rr, "load_state", lambda: state)
+    monkeypatch.setattr(rr, "read_persisted_reviewer", lambda *args: {"login": "coderabbitai", "review_trigger": "@coderabbitai"})
+    monkeypatch.setattr(rr, "gh_login", lambda: "agent")
+
+    def count(*args):
+        state["owner/repo#1"]["run"]["update_seq"] += 1
+        return 0
+
+    monkeypatch.setattr(rr, "count_agent_pings", count)
+    with pytest.raises(pc.PublishError, match="reviewer or active run"):
+        pc.loop_gate("owner/repo", 1, require_summary=False)

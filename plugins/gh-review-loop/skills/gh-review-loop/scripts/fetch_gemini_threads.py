@@ -2706,6 +2706,71 @@ def merge_judge_results(
     return merged
 
 
+@state_transaction
+def save_judge_cache(pr: PullRequest, expected_run: dict[str, Any], cache: dict[str, Any]) -> None:
+    """Keep successful verdicts within the exact active run that evaluated them."""
+    state = load_sticky_state()
+    entry = state.get(_state_key(pr))
+    run = entry.get("run") if isinstance(entry, dict) else None
+    identity = ("started_at", "update_seq", "rereviews_posted")
+    if not isinstance(run, dict) or _safe_int(run.get("update_seq")) <= 0 or any(run.get(name) != expected_run.get(name) for name in identity):
+        return
+    stored = run.get("judge_cache")
+    run["judge_cache"] = {**(stored if isinstance(stored, dict) else {}), **cache}
+    save_sticky_state(state)
+
+
+def judge_findings(pr: PullRequest, author: str, pull_request: dict[str, Any], threads: list[dict[str, Any]], client: Any, status: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Reuse only successful judgments with identical inputs, head, and settings."""
+    from judge import JudgeError, SYSTEM_PROMPT, VALID_VERDICTS, build_user_prompt, skipped_result
+
+    run = read_run_tracking(pr)
+    run = run if isinstance(run, dict) else {}
+    cache = run.get("judge_cache")
+    cache = cache if isinstance(cache, dict) else {}
+    results = {}
+    successful = {}
+    status["reused_count"] = 0
+    for thread in threads:
+        body = (thread.get("comments") or [{}])[0].get("body") or ""
+        finding = {
+            "severity": thread_severity(thread),
+            "path": thread.get("path"),
+            "line": thread.get("line") or thread.get("originalLine"),
+            "body": body,
+            "diff_hunk": (thread.get("comments") or [{}])[0].get("diffHunk") or "",
+        }
+        context = {
+            "repo": f"{pr.owner}/{pr.repo}".casefold(), "pr": pr.number, "author": author,
+            "head": pull_request.get("headRefOid"), "model": client.model,
+            "base_url": getattr(client, "base_url", ""), "temperature": getattr(client, "temperature", 0.0),
+            "system_prompt": SYSTEM_PROMPT, "user_prompt": build_user_prompt(finding),
+        }
+        key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest() if context["head"] else None
+        stored = cache.get(thread["id"])
+        prior = stored.get("result") if isinstance(stored, dict) else None
+        if key and isinstance(prior, dict) and stored.get("key") == key and prior.get("status") == "ok" and prior.get("verdict") in VALID_VERDICTS:
+            results[thread["id"]] = dict(prior)
+            status["reused_count"] += 1
+            continue
+        try:
+            result = dataclasses.asdict(client.judge(finding))
+            results[thread["id"]] = result
+            if result.get("status") == "ok":
+                status["judged_count"] += 1
+                if key:
+                    successful[thread["id"]] = {"key": key, "result": result}
+        except JudgeError as exc:
+            results[thread["id"]] = dataclasses.asdict(skipped_result(f"judge error: {exc}"))
+            status["errors"] += 1
+    if successful:
+        try:
+            save_judge_cache(pr, run, successful)
+        except OSError as exc:
+            print(f"warning: could not cache judge verdicts: {exc}", file=sys.stderr)
+    return results
+
+
 def resolve_judge_phase(explicit_phase: str | None, *, record_run: bool) -> str:
     """Infer the judge phase from invocation context when unset.
 
@@ -4269,7 +4334,7 @@ def main() -> int:
         # --judge-mode override) and decide.
         try:
             from judge import (  # noqa: PLC0415
-                JudgeClient, JudgeError, should_judge_run, skipped_result,
+                JudgeClient, should_judge_run,
             )
             judge_available = True
         except ImportError:
@@ -4313,27 +4378,9 @@ def main() -> int:
                         "judged_count": 0,
                         "errors": 0,
                     }
-                    for thread in threads:
-                        # Build a single judge input from the first matching
-                        # bot comment in this filtered thread.
-                        body = (thread.get("comments") or [{}])[0].get("body") or ""
-                        finding_payload = {
-                            "severity": thread_severity(thread),
-                            "path": thread.get("path"),
-                            "line": thread.get("line") or thread.get("originalLine"),
-                            "body": body,
-                            "diff_hunk": (thread.get("comments") or [{}])[0].get("diffHunk") or "",
-                        }
-                        try:
-                            jr = client.judge(finding_payload)
-                            judge_results[thread["id"]] = dataclasses.asdict(jr)
-                            if jr.status == "ok":
-                                judge_status["judged_count"] += 1
-                        except JudgeError as exc:
-                            judge_results[thread["id"]] = dataclasses.asdict(
-                                skipped_result(f"judge error: {exc}")
-                            )
-                            judge_status["errors"] += 1
+                    judge_results = judge_findings(pr, args.author, pull_request, threads, client, judge_status)
+                    if judge_status["reused_count"]:
+                        print(f"info: reused {judge_status['reused_count']} unchanged judge verdict(s); {judge_status['judged_count']} newly evaluated.", file=sys.stderr)
             else:
                 judge_status = {
                     "ran": False,
