@@ -1257,6 +1257,7 @@ def review_request_count_complete(
     loop_request_times: list[str] | None | object = _PROVENANCE_UNSET,
     counted_requests: int | None = None,
     provenance_incomplete: bool = False,
+    baseline_adopted: bool = False,
 ) -> bool:
     """False when either page the count rests on is full, so it is a lower bound.
 
@@ -1281,6 +1282,11 @@ def review_request_count_complete(
     # A posted request that could not be logged: its event may not have
     # reached the timeline yet, so even zero matched events is a bound.
     if provenance_incomplete:
+        return False
+    # Adopted history (the login's timeline events copied into the log by the
+    # request side) may include the member's own clicks, so a count that
+    # includes any of it is an upper bound, not an exact number.
+    if baseline_adopted and counted_requests:
         return False
     # A request the loop durably recorded but whose event the timeline does
     # not show yet still consumed the cap: fewer matched events than records
@@ -1544,31 +1550,59 @@ def clean_blocked_by(
     return None
 
 
+def cap_count_attributable(
+    loop_request_times: list[str] | None,
+    agent_login: str | None,
+    *,
+    no_agent_filter: bool = False,
+    provenance_incomplete: bool = False,
+) -> bool:
+    """Can the re-review count be charged to this agent, so it may prove the cap?
+
+    Yes with a local record, a resolved login (the actor fallback is then an
+    upper bound on this agent) or an explicit ``--no-agent-filter`` (every
+    actor's requests count, as its help says). No when the record is
+    explicitly incomplete: a posted request could not be logged, the request
+    side then answers ``uncountable_count`` regardless of the cap, and a
+    ``limitReached`` here would send the member to raise a cap that cannot
+    continue the loop (PR #120 review). With neither record nor login the
+    count is every actor's requests and proves nothing.
+    """
+    if provenance_incomplete:
+        return False
+    return loop_request_times is not None or agent_login is not None or no_agent_filter
+
+
 def rereview_limit_reached(
     pull_request: dict[str, Any],
     author: str | None,
     used: int,
     limit: int,
     *,
-    provenance_known: bool = True,
+    attributable: bool = True,
 ) -> bool:
     """Has the loop used its re-review cap?
 
     For a review-request vendor (Copilot) with no completed review yet, the
     next request is the free cycle 0, which request_rereview.py allows even
     at a cap of 0, so the limit cannot be reached before that first review.
-    Without local provenance (``provenance_known=False``) ``used`` is the
-    actor fallback: every request under the member's login, manual clicks
-    included, an upper bound that proves nothing; the request side reports
-    that count as unknown rather than capped, and so does this. A
-    page-limited count is a lower bound and still proves the cap.
+    Without local provenance ``used`` is the actor fallback: every request
+    under the member's login, manual clicks included. That upper bound
+    counts toward the cap, exactly as the request side counts it (an early
+    ``capped`` is answered by raising the cap; refusing it as unknown
+    stopped every first run on a second machine), but only while the count
+    is ``attributable``: a local record or a resolved login. With neither
+    the count is every actor's requests and proves nothing about this
+    agent, which the request side reports as unknown, and so does this
+    (PR #120 review). A page-limited count is a lower bound and still
+    proves the cap.
     """
     vendor = review_vendors.vendor_for(author) if author else None
     if vendor is not None and vendor.trigger_kind == "review_request":
         first = reviewer_resolver.first_completed_review_at(
             (pull_request.get("reviews") or {}).get("nodes") or [], vendor
         )
-        if not first or not provenance_known:
+        if not first or not attributable:
             return False
     return used >= limit
 
@@ -4332,11 +4366,18 @@ def main() -> int:
             loop_request_times=recorded_request_times,
         )
         # One decision for the stderr warning, the JSON flag and the
-        # `capped` outcome: cycle 0 is free and an actor-fallback count is
-        # not proof (PR #116 review).
+        # `capped` outcome: cycle 0 is free; an actor-fallback count is an
+        # upper bound and counts (post-#116 live test), but only when it
+        # can be attributed to this agent — see cap_count_attributable.
         _limit_reached = rereview_limit_reached(
             pull_request, args.author, len(rereviews), args.max_rereview_requests,
-            provenance_known=recorded_request_times is not None,
+            attributable=cap_count_attributable(
+                recorded_request_times, agent_login,
+                no_agent_filter=bool(args.no_agent_filter),
+                provenance_incomplete=loop_state.provenance_incomplete(
+                    f"{pr.owner}/{pr.repo}", pr.number
+                ),
+            ),
         )
         if args.resolve_outdated:
             resolved_outdated = resolve_outdated_threads(
@@ -4946,6 +4987,9 @@ def main() -> int:
                             loop_request_times=loop_request_times(pr, args.author),
                             counted_requests=len(rereviews),
                             provenance_incomplete=loop_state.cap_count_uncertain(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
+                            baseline_adopted=loop_state.baseline_adopted(
                                 f"{pr.owner}/{pr.repo}", pr.number
                             ),
                         ),

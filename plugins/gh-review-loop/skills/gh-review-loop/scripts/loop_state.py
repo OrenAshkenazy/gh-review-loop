@@ -180,6 +180,41 @@ def append_request_log(repo: str, pr: int, record: dict[str, Any]) -> bool:
     return _append_jsonl(request_log_path(repo, pr), record)
 
 
+def baseline_adopted(repo: str, pr: int) -> bool:
+    """Does the PR's provenance log hold adopted history (``baseline`` lines)?
+
+    Those lines are every request found under the login on the timeline,
+    manual clicks included, so any count that rests on them is an upper
+    bound: the request side says so in ``capped`` and the fetch reports the
+    count as not complete (PR #120 review).
+    """
+    return any(
+        isinstance(item, dict) and item.get("baseline") is True
+        for item in read_request_log(repo, pr) or []
+    )
+
+
+def append_request_log_batch(repo: str, pr: int, records: list[dict[str, Any]]) -> bool:
+    """Append several records in one write; True once they are on disk.
+
+    One ``write`` of one buffer, so a crash leaves either nothing, the whole
+    batch, or a torn last line that ``read_request_log`` already reports as
+    incomplete: never a clean-looking prefix that a later reader would trust
+    (PR #120 review).
+    """
+    path = request_log_path(repo, pr)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def cycle_stamp_log_path(repo: str, pr: int) -> Path:
     return pr_scoped_path(repo, pr, "provenance", ".stamps.jsonl")
 
@@ -277,7 +312,8 @@ def provenance_incomplete(repo: str, pr: int) -> bool:
 
 
 def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
-    """The PR's appended request records; None when there is no log yet.
+    """The PR's appended request records; None when there is no log yet
+    (no file, or a file holding no records).
 
     An unreadable log, or any malformed line (a crash can tear the last
     append), yields ``[INCOMPLETE_LOG_RECORD]``: dropping a torn record would
@@ -302,7 +338,11 @@ def read_request_log(repo: str, pr: int) -> list[dict[str, Any]] | None:
         if not isinstance(item, dict):
             return [dict(INCOMPLETE_LOG_RECORD)]
         records.append(item)
-    return records
+    # A file with no records is no record: the loop writes a line for every
+    # request it posts, the free first one included, so an empty file is an
+    # append that opened the file and wrote nothing (PR #120 review). Calling
+    # it an authoritative empty history would skip adoption and count zero.
+    return records or None
 
 
 def safe_int(value: Any) -> int:

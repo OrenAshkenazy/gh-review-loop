@@ -4446,17 +4446,46 @@ class TestHeadAnchoredWait:
         assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 0, 0) is True
         assert _fgt.rereview_limit_reached(pr, "chatgpt-codex-connector", 0, 0) is True
 
-    def test_an_actor_fallback_count_never_proves_the_cap_reached(self):
+    def test_an_actor_fallback_count_reaches_the_cap_like_the_request_side(self):
         """Without local provenance the Copilot count is every request made
         under the member's login after the first review: an upper bound that
-        includes manual clicks. It must not set limitReached or derive a
-        `capped` outcome; the request side reports that count as unknown
-        (PR #116 review). A page-limited count is a lower bound and still
-        proves the cap."""
+        includes manual clicks. It counts toward the cap, as the request side
+        now counts it (refusing it as unknown stopped every first run on a
+        second machine); `reReviewCountComplete` still flags it as a bound.
+        A page-limited count is a lower bound and still proves the cap."""
         reviewed = self._pr("d7efa49", ("COMMENTED", "2026-10-07T15:46:14Z", "f4a55e3"))
-        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=False) is False
-        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, provenance_known=True) is True
-        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, provenance_known=False) is True
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, attributable=True) is True
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 2, 3, attributable=True) is False
+        # No record and no login: the count is every actor's requests and
+        # proves nothing about this agent, so it never reaches the cap.
+        assert _fgt.rereview_limit_reached(reviewed, self.COPILOT, 3, 3, attributable=False) is False
+        assert _fgt.rereview_limit_reached(reviewed, "chatgpt-codex-connector", 3, 3, attributable=False) is True
+
+    def test_attribution_needs_a_record_a_login_or_the_explicit_all_actors_flag(self):
+        """An explicitly incomplete record wins over all of them: the request
+        side answers uncountable_count then, so a limitReached here would
+        send the member to raise a cap that cannot continue (PR #120 review)."""
+        assert _fgt.cap_count_attributable(["2026-10-07T16:00:00Z"], None) is True
+        assert _fgt.cap_count_attributable(None, "agent") is True
+        assert _fgt.cap_count_attributable(None, None) is False
+        assert _fgt.cap_count_attributable(None, None, no_agent_filter=True) is True
+        assert _fgt.cap_count_attributable(None, "agent", provenance_incomplete=True) is False
+        assert _fgt.cap_count_attributable(["x"], "agent", no_agent_filter=True, provenance_incomplete=True) is False
+
+    def test_adopted_history_keeps_the_count_marked_incomplete(self):
+        """Baseline lines are the login's timeline events, manual clicks
+        included, so a count that rests on any of them stays a bound even
+        when both pages are partial (PR #120 review)."""
+        partial = {"timelineItems": {"nodes": []}, "reviews": {"nodes": []}, "comments": {"nodes": []}}
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=["2026-10-07T16:00:00Z"], counted_requests=1, baseline_adopted=True
+        ) is False
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=[], counted_requests=0, baseline_adopted=True
+        ) is True
+        assert _fgt.review_request_count_complete(
+            partial, loop_request_times=["2026-10-07T16:00:00Z"], counted_requests=1, baseline_adopted=False
+        ) is True
 
     def test_a_same_second_answer_to_the_newest_request_counts(self):
         pr = self._pr("d7efa49", ("COMMENTED", "2026-10-07T16:30:00Z", "d7efa49"))

@@ -70,10 +70,12 @@ def test_json_stdout_parses_as_json_and_has_no_ansi(monkeypatch, capsys):
         request_rereview,
         "post_rereview",
         lambda repo, pr, phrase, **kwargs: {
+            "status": "posted",
             "created_at": CREATED_AT,
             "repo": repo,
             "pr": pr,
             "phrase": phrase,
+            "posted": True,
         },
     )
 
@@ -89,10 +91,12 @@ def test_json_stdout_parses_as_json_and_has_no_ansi(monkeypatch, capsys):
     captured = capsys.readouterr()
     parsed = json.loads(captured.out)
     assert parsed == {
+        "status": "posted",
         "created_at": CREATED_AT,
         "repo": "OrenAshkenazy/AegisLocal",
         "pr": 11,
         "phrase": request_rereview.DEFAULT_PHRASE,
+        "posted": True,
     }
     assert "\033[" not in captured.out
     assert captured.err == ""
@@ -889,6 +893,11 @@ T_FIRST_REVIEW = "2026-10-07T15:46:14Z"
 T_REQUEST = "2026-10-07T16:20:05Z"
 
 
+def loop_state_read(state_dir):
+    import loop_state
+    return loop_state.read_request_log("acme/widget", 159) or []
+
+
 def _completed(cmd, payload, rc=0, stderr=""):
     return subprocess.CompletedProcess(
         args=cmd, returncode=rc,
@@ -1505,6 +1514,9 @@ class TestReviewRequestMain:
     def _stub_reads(monkeypatch, *, state="ABSENT", used=0, head="abc1234def", pending_since=None):
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: used)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "baseline_adopted", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "timeline_snapshot", lambda *a, **k: [])
         monkeypatch.setattr(
             request_rereview, "request_state",
             lambda *a, **k: None if state is None else {
@@ -2372,12 +2384,159 @@ class TestReviewRequestMain:
     def test_cap_applies_to_review_requests_too(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, used=3)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "loop_request_times", lambda *a, **k: [T_REQUEST] * 3)
         monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
 
         assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
 
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "capped" and payload["rereviews_used"] == 3
+        assert payload["count_is_upper_bound"] is False
+        assert "manual clicks" not in payload["message"]
+
+    def test_a_cap_hit_without_local_provenance_says_the_count_is_a_bound(self, monkeypatch, capsys, tmp_path):
+        """A second machine has no provenance log, so the count is every
+        request under the login. The payload says so: the member is being
+        asked to raise the cap, not to bypass it."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("capped"))
+        monkeypatch.setattr(request_rereview, "baseline_adopted", lambda *a, **k: True)
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "capped"
+        assert payload["count_is_upper_bound"] is True
+        assert "manual clicks included" in payload["message"]
+        assert "--max-rereview-requests" in payload["message"]
+
+    def test_history_that_cannot_be_adopted_blocks_the_post(self, monkeypatch, capsys, tmp_path):
+        """If the login's earlier requests cannot be written into the log, the
+        first post would hide them from the next count, so nothing is posted
+        (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=1)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "request_review", lambda *a, **k: pytest.fail("posted"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "state_unwritable" and payload["posted"] is False
+        assert "earlier review requests" in payload["message"]
+
+    def test_no_cap_check_still_adopts_the_history(self, monkeypatch, capsys, tmp_path):
+        """`--no-cap-check` skips enforcing this request, not keeping the
+        record the next one is counted against (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        adopted = []
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: adopted.append(a) or True)
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: pytest.fail("no count"))
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
+            "status": "posted", "created_at": CREATED_AT, "repo": repo, "pr": pr,
+            "kind": "review_request", "reviewer": login, "posted": True,
+        })
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--no-cap-check", "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert len(adopted) == 1 and adopted[0][3] == "agent"
+
+    def test_no_cap_check_with_a_failed_adoption_posts_but_marks_history_incomplete(self, monkeypatch, capsys, tmp_path):
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: False)
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
+            "status": "posted", "created_at": CREATED_AT, "repo": repo, "pr": pr,
+            "kind": "review_request", "reviewer": login, "posted": True,
+        })
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--no-cap-check", "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert loop_state.provenance_incomplete("acme/widget", 159) is True
+
+    def test_a_dry_run_adopts_nothing(self, monkeypatch, capsys, tmp_path):
+        """A preview posts nothing, so it writes nothing: a baseline written
+        now would make a later real run skip adoption and miss any request
+        made in between (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=1)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: pytest.fail("dry run adopted"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["dry_run"] is True
+
+    def test_a_dry_run_cap_hit_without_a_record_still_says_upper_bound(self, monkeypatch, capsys, tmp_path):
+        """A dry run adopts nothing, so no baseline line exists to read the
+        flag from; the count still came straight from the timeline with no
+        record behind it (PR #120 review)."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch, used=3)
+        monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: pytest.fail("dry run adopted"))
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--dry-run", "--json"]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "capped"
+        assert payload["count_is_upper_bound"] is True
+
+    def test_a_login_less_bypass_marks_the_history_incomplete(self, monkeypatch, capsys, tmp_path):
+        """`gh api user` failed and `--no-cap-check` posts anyway: that post
+        must not become the first line of a log later runs trust, so the
+        history is marked incomplete (PR #120 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        real_adopt = request_rereview.adopt_unlogged_requests
+        self._stub_reads(monkeypatch)
+        monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: None)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", real_adopt)
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
+            "status": "posted", "created_at": CREATED_AT, "repo": repo, "pr": pr,
+            "kind": "review_request", "reviewer": login, "posted": True,
+        })
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--no-cap-check", "--json"]) == 0
+
+        assert json.loads(capsys.readouterr().out)["posted"] is True
+        assert loop_state.provenance_incomplete("acme/widget", 159) is True
+
+    def test_main_hands_one_snapshot_to_adoption_and_the_count(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._stub_reads(monkeypatch)
+        snapshot = [{"event": "marker"}]
+        seen = []
+        monkeypatch.setattr(request_rereview, "timeline_snapshot", lambda *a, **k: snapshot)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: seen.append(("adopt", k.get("events"))) or True)
+        monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: seen.append(("count", k.get("events"))) or 0)
+        monkeypatch.setattr(request_rereview, "request_review", lambda repo, pr, login, **k: {
+            "status": "posted", "created_at": CREATED_AT, "repo": repo, "pr": pr,
+            "kind": "review_request", "reviewer": login, "posted": True,
+        })
+
+        assert self._run(["--reviewer-login", COPILOT_LOGIN, "--json"]) == 0
+
+        assert seen == [("adopt", snapshot), ("count", snapshot)]
+        assert all(events is snapshot for _, events in seen)
+
+    def test_a_posted_request_carries_a_status_like_every_other_result(self):
+        """Every non-posting result has `status`; a posted one did not, so a
+        wrapper branching on `status` treated success as nothing-happened and
+        skipped the wait (live Copilot test, 2026-10-17)."""
+        def runner(cmd, **kwargs):
+            assert cmd[2].endswith("/requested_reviewers")
+            return _completed(cmd, {"requested_reviewers": [{"login": COPILOT_LOGIN}]})
+
+        payload = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, runner=runner)
+        assert payload["status"] == "posted" and payload["posted"] is True
+        dry = request_rereview.request_review("acme/widget", 159, COPILOT_REQUEST, dry_run=True)
+        assert dry["status"] == "dry_run" and dry["posted"] is False
 
     def test_uncountable_review_requests_refuse_to_post(self, monkeypatch, capsys):
         self._stub_reads(monkeypatch, used=None)
@@ -2472,6 +2631,8 @@ class TestExplicitMentionOverridesPersistedVendor:
         self._persist(tmp_path, monkeypatch, review_vendors.CODEX.login)
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 0)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "timeline_snapshot", lambda *a, **k: [])
         monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: {
             "state": "ABSENT", "head": "abc1234def", "pending_since": None,
             "first_completed_review_at": T_FIRST_REVIEW,
@@ -2570,13 +2731,14 @@ class TestRequestProvenance:
         # A comment vendor's pings are recorded against that vendor only.
         assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.CODEX) == []
 
-    def test_requests_with_no_local_record_are_uncountable_not_free(self, monkeypatch, tmp_path):
+    def test_requests_with_no_local_record_count_as_an_upper_bound(self, monkeypatch, tmp_path):
         """Requests exist under this login but the loop has no record of
-        posting them: they may be the member's clicks or the loop's own after a
-        cleared state dir. Charging them to the loop stops a first run as
-        capped; calling them zero lets every pushed head post another request
-        past the cap. Neither is a guess worth making, so the count is unknown
-        and the caller refuses to post (PR #116 review)."""
+        posting them: the loop's own from another machine or a cleared state
+        dir, or the member's clicks. They all count. Calling them zero would
+        let every pushed head post past the cap; calling them unknown (the
+        PR #116 rule) refused every first run on a second machine, which the
+        live Copilot test hit. An early `capped` is the cheap failure: the
+        member raises the cap."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         manual = _rest_request_events([
             ("agent", "2026-10-07T16:00:00Z"),
@@ -2590,7 +2752,146 @@ class TestRequestProvenance:
 
         assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
+        ) == 3
+
+    def test_adopted_history_survives_the_first_local_post(self, monkeypatch, tmp_path):
+        """Two unlogged requests, cap three: the first run counts two and
+        posts once. Without adoption the next run would match events only to
+        the one recorded post and count one, letting the PR run past the cap
+        (PR #120 review). Adoption writes the two as baseline lines first, so
+        the record-matched count is three afterwards, on this side and the
+        fetch side alike."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        history = [("agent", "2026-10-07T16:00:00Z"), ("agent", "2026-10-07T16:05:00Z"),
+                   ("a-human", "2026-10-07T16:07:00Z")]
+        events = {"items": _rest_request_events(history)}
+
+        def runner(cmd, **kwargs):
+            return _completed(cmd, events["items"])
+
+        args = ("acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW)
+        assert request_rereview.adopt_unlogged_requests(*args, runner=runner) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [
+            "2026-10-07T16:00:00Z", "2026-10-07T16:05:00Z",
+        ]
+        assert request_rereview.baseline_adopted("acme/widget", 159) is True
+        assert request_rereview.count_agent_review_requests(*args, runner=runner) == 2
+
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at="2026-10-07T16:20:00Z"
+        )
+        events["items"] = _rest_request_events(history + [("agent", "2026-10-07T16:20:01Z")])
+        assert request_rereview.count_agent_review_requests(*args, runner=runner) == 3
+        # Adoption is one-time: a log that exists is never rewritten.
+        assert request_rereview.adopt_unlogged_requests(*args, runner=runner) is True
+        records = loop_state_read(tmp_path)
+        assert len(records) == 4  # two baseline lines, the closing line, the post
+        assert records[2] == {"baseline_complete": True, "adopted": 2}
+
+    def test_an_empty_log_file_is_no_record_and_still_adopts(self, monkeypatch, tmp_path):
+        """A zero-byte log (an append that opened the file and died) must not
+        read as an authoritative empty history, or adoption is skipped and the
+        timeline's requests count as zero (PR #120 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        path = loop_state.request_log_path("acme/widget", 159)
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        assert loop_state.read_request_log("acme/widget", 159) is None
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+        events = _rest_request_events([("agent", "2026-10-07T16:00:00Z")])
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: _completed(cmd, events),
+        ) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) == [
+            "2026-10-07T16:00:00Z"
+        ]
+
+    def test_a_torn_adoption_is_marked_incomplete_not_trusted(self, monkeypatch, tmp_path):
+        """Baseline lines without the closing line are a partial copy. Trusting
+        them would count a subset as the whole history (PR #120 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert loop_state.append_request_log("acme/widget", 159, {
+            "reviewer": COPILOT_REQUEST, "at": "2026-10-07T16:00:00Z", "countable": True,
+            "baseline": True, "request_id": "baseline:2026-10-07T16:00:00Z",
+        })
+
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: pytest.fail("no timeline read for a torn log"),
+        ) is False
+        assert loop_state.provenance_incomplete("acme/widget", 159) is True
+        assert request_rereview.count_agent_review_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: _completed(cmd, _rest_request_events([("agent", T_REQUEST)])),
         ) is None
+
+    def test_adoption_without_a_login_cannot_vouch_for_an_empty_log(self, monkeypatch, tmp_path):
+        """No login and no record: the history cannot be attributed, so a
+        bypassed post must not start a log that hides it (PR #120 review).
+        With a record the login is not needed."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        runner = lambda cmd, **k: pytest.fail("no timeline read without a login")  # noqa: E731
+
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW, runner=runner
+        ) is False
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+        request_rereview.record_rereview_posted(
+            "acme/widget", 159, reviewer=COPILOT_LOGIN, requested_at=T_REQUEST
+        )
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, None, T_FIRST_REVIEW, runner=runner
+        ) is True
+
+    def test_adoption_never_appends_to_an_incomplete_history(self, monkeypatch, tmp_path):
+        """Each retry would append the batch again, and clearing the marker
+        later would make the duplicates count (PR #120 review)."""
+        import loop_state
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        loop_state.mark_provenance_incomplete("acme/widget", 159)
+
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: pytest.fail("no timeline read for an incomplete history"),
+        ) is False
+        assert loop_state.request_log_path("acme/widget", 159).exists() is False
+
+    def test_adoption_and_the_count_share_one_snapshot(self, monkeypatch, tmp_path):
+        """A request surfacing between two reads would be counted and allow a
+        post without ever being adopted (PR #120 review). Given one snapshot,
+        both see the same events and the count is exact afterwards."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        snapshot = _rest_request_events([("agent", "2026-10-07T16:00:00Z")])
+        runner = lambda cmd, **k: pytest.fail("the snapshot replaces the read")  # noqa: E731
+        args = ("acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW)
+
+        assert request_rereview.adopt_unlogged_requests(*args, runner=runner, events=snapshot) is True
+        assert request_rereview.count_agent_review_requests(*args, runner=runner, events=snapshot) == 1
+        assert request_rereview.count_agent_review_requests(*args, runner=runner, events=None) is None
+
+    def test_adoption_writes_nothing_without_history(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert request_rereview.adopt_unlogged_requests(
+            "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW,
+            runner=lambda cmd, **k: _completed(cmd, _rest_request_events([("a-human", T_REQUEST)])),
+        ) is True
+        assert request_rereview.loop_request_times("acme/widget", 159, review_vendors.COPILOT) is None
+
+    def test_adoption_fails_closed_when_the_timeline_or_log_fails(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        args = ("acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW)
+        assert request_rereview.adopt_unlogged_requests(
+            *args, runner=lambda cmd, **k: _completed(cmd, None, rc=1, stderr="boom")
+        ) is False
+        events = _rest_request_events([("agent", T_REQUEST)])
+        monkeypatch.setattr(request_rereview.loop_state, "append_request_log_batch", lambda *a, **k: False)
+        assert request_rereview.adopt_unlogged_requests(
+            *args, runner=lambda cmd, **k: _completed(cmd, events)
+        ) is False
 
     def test_no_record_and_no_requests_is_a_verified_zero(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
@@ -2706,6 +3007,8 @@ class TestFreeInitialRequest:
         )
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
         monkeypatch.setattr(request_rereview, "count_agent_review_requests", lambda *a, **k: 3)
+        monkeypatch.setattr(request_rereview, "adopt_unlogged_requests", lambda *a, **k: True)
+        monkeypatch.setattr(request_rereview, "timeline_snapshot", lambda *a, **k: [])
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
         monkeypatch.setattr(
             request_rereview, "request_review",
@@ -2910,7 +3213,9 @@ class TestProvenanceFailsClosed:
             "acme/widget", 159, review_vendors.COPILOT
         ) == [T_REQUEST]
 
-    def test_unknown_provenance_with_candidate_events_refuses_to_count(self, monkeypatch, tmp_path):
+    def test_unknown_provenance_with_candidate_events_counts_the_bound(self, monkeypatch, tmp_path):
+        """No log at all: the login's own events are the count (an upper
+        bound), never None. Only a human's request is left out."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         events = _rest_request_events([("agent", T_REQUEST), ("a-human", "2026-10-07T16:30:00Z")])
 
@@ -2919,7 +3224,7 @@ class TestProvenanceFailsClosed:
 
         assert request_rereview.count_agent_review_requests(
             "acme/widget", 159, review_vendors.COPILOT, "agent", T_FIRST_REVIEW, runner=runner
-        ) is None
+        ) == 1
 
 
 class TestRequestRegistered:

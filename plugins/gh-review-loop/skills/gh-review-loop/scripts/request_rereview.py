@@ -959,6 +959,20 @@ def request_state(
     }
 
 
+_SNAPSHOT_UNSET: Any = object()
+
+
+def timeline_snapshot(repo: str, pr: int, runner: Any = None) -> list[Any] | None:
+    """One read of the PR timeline for this run; None when it failed.
+
+    Adoption and the cap count must see the same events: a request that
+    surfaces between two reads would be counted (and allow a post) without
+    ever being adopted, and the next run's record-matched count would drop
+    it (PR #120 review). So main reads once and hands the snapshot to both.
+    """
+    return _timeline_events(repo, pr, subprocess.run if runner is None else runner)
+
+
 def _timeline_events(repo: str, pr: int, runner: Any) -> list[Any] | None:
     owner, repo_name = parse_repo(repo)
     events = _gh_json(
@@ -973,6 +987,85 @@ def provenance_incomplete(repo: str, pr: int) -> bool:
     return loop_state.provenance_incomplete(repo, pr)
 
 
+def baseline_adopted(repo: str, pr: int) -> bool:
+    """See ``loop_state.baseline_adopted``: shared so the fetch agrees."""
+    return loop_state.baseline_adopted(repo, pr)
+
+
+def adopt_unlogged_requests(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    agent_login: str | None,
+    first_completed_review_at: str | None,
+    runner: Any = None,
+    events: Any = _SNAPSHOT_UNSET,
+) -> bool:
+    """Write the login's historical requests into the provenance log, once.
+
+    With no local record the cap counts every request under the login, an
+    upper bound. The first post from this machine would then start a log
+    holding only that post, and the next count, which matches events to
+    recorded times, would drop the history it had just counted and let the
+    PR run past the cap (PR #120 review). So before the first post the
+    history is adopted: one ``baseline`` line per counted event, at the
+    event's own time, where the matcher finds it on every later run and on
+    the fetch side too, written as one batch and closed by a
+    ``baseline_complete`` line. A log with baseline lines and no closing
+    line is a torn adoption: it is marked incomplete, so every later count
+    is unknown rather than a trusted subset. True when nothing needed
+    writing or the batch is on disk; False when the timeline could not be
+    read, a write failed, or an earlier adoption was torn. Without a login
+    and without a record there is history that cannot be attributed, so
+    nothing is written and the answer is False: a bypassed post must not
+    start a log that hides it (PR #120 review). A history already marked
+    incomplete is never adopted into: each retry would append the batch
+    again, and clearing the marker later would make the duplicates count.
+    ``events`` is the run's one timeline snapshot (``timeline_snapshot``);
+    left unset, this reads its own, for callers outside main.
+    """
+    if runner is None:
+        runner = subprocess.run
+    if loop_state.provenance_incomplete(repo, pr):
+        return False
+    if agent_login is None:
+        return loop_request_times(repo, pr, vendor) is not None
+    logged = loop_state.read_request_log(repo, pr) or []
+    started = any(isinstance(item, dict) and item.get("baseline") is True for item in logged)
+    closed = any(isinstance(item, dict) and item.get("baseline_complete") is True for item in logged)
+    if started and not closed:
+        loop_state.mark_provenance_incomplete(repo, pr)
+        return False
+    if loop_request_times(repo, pr, vendor) is not None:
+        return True
+    if events is _SNAPSHOT_UNSET:
+        events = _timeline_events(repo, pr, runner)
+    if events is None:
+        return False
+    counted = reviewer_resolver.counted_review_requests(
+        events,
+        agent_login=agent_login,
+        vendor=vendor,
+        first_completed_review_at=first_completed_review_at,
+        loop_request_times=None,
+        match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
+    )
+    if not counted:
+        return True
+    records: list[dict[str, Any]] = [
+        {
+            "reviewer": vendor.request_login,
+            "at": event["created_at"],
+            "countable": True,
+            "baseline": True,
+            "request_id": f"baseline:{event['created_at']}",
+        }
+        for event in counted
+    ]
+    records.append({"baseline_complete": True, "adopted": len(counted)})
+    return loop_state.append_request_log_batch(repo, pr, records)
+
+
 def count_agent_review_requests(
     repo: str,
     pr: int,
@@ -980,13 +1073,16 @@ def count_agent_review_requests(
     agent_login: str | None,
     first_completed_review_at: str | None,
     runner: Any = None,
+    events: Any = _SNAPSHOT_UNSET,
 ) -> int | None:
     """Count the agent's review requests for ``vendor`` that consume the cap.
 
     The REST timeline is the complete record of who clicked or called
     "request review" (paginated, unlike the fetch's GraphQL page). The rule
     itself lives in ``reviewer_resolver.counted_review_requests`` so the fetch
-    and this script can never disagree. None when it cannot be established.
+    and this script can never disagree. None when it cannot be established
+    (a failed read, no login and no record, or an unlogged post in flight).
+    Without a local record the count is an upper bound: see the comment below.
 
     The recorded provenance matches the loop's own timestamps and needs no
     login; only the actor fallback does. So an unresolvable ``gh api user``
@@ -998,7 +1094,8 @@ def count_agent_review_requests(
     recorded = loop_request_times(repo, pr, vendor)
     if recorded is None and not agent_login:
         return None
-    events = _timeline_events(repo, pr, runner)
+    if events is _SNAPSHOT_UNSET:
+        events = _timeline_events(repo, pr, runner)
     if events is None:
         return None
     counted = reviewer_resolver.counted_review_requests(
@@ -1015,13 +1112,15 @@ def count_agent_review_requests(
         return None
     if recorded is None and counted:
         # No local record, yet requests under this login exist after the
-        # vendor's first review. They may be the loop's (a cleared state dir)
-        # or the member's own clicks, and the two findings this resolves pull
-        # opposite ways: charging the member's clicks to the loop stops a first
-        # run as capped, while assuming zero would let every pushed head post
-        # another request past the cap. So the count is unknown and the caller
-        # refuses to post — `--no-cap-check` is the deliberate override.
-        return None
+        # vendor's first review: the loop's own from another machine or a
+        # cleared state dir, or the member's clicks. Count them all. That is
+        # an upper bound, so the worst case is an early `capped` that the
+        # member answers by raising the cap; refusing as unknown (the earlier
+        # rule) stopped every first run on a second machine, which the live
+        # Copilot test hit, and the fetch already reports this same bound.
+        # The writer adopts these into the log before its first post
+        # (``adopt_unlogged_requests``) so later counts keep them.
+        return len(counted)
     if recorded is not None and len(recorded) > len(counted):
         # A countable request is durably logged but its event has not
         # surfaced on the timeline yet. It still consumed the cap, so the
@@ -1207,7 +1306,19 @@ def request_registered(
     return False
 
 
-def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
+def capped_payload(
+    repo: str, pr: int, used: int, cap: int, *, upper_bound: bool = False
+) -> dict[str, Any]:
+    """``upper_bound``: the count rests on the timeline alone (no local
+    provenance), so it includes every request under this login, manual
+    clicks included. Said in the payload so the member knows raising the
+    cap is the honest answer, not a bypass."""
+    basis = (
+        " This count has no local record behind it and includes every request "
+        "made under this login, manual clicks included, so it may overstate "
+        "the loop's own use."
+        if upper_bound else ""
+    )
     return {
         "status": "capped",
         "posted": False,
@@ -1215,9 +1326,10 @@ def capped_payload(repo: str, pr: int, used: int, cap: int) -> dict[str, Any]:
         "pr": pr,
         "rereviews_used": used,
         "rereview_limit": cap,
+        "count_is_upper_bound": upper_bound,
         "message": (
             f"Re-review cap reached: {used} of {cap} requests already posted by "
-            "this agent on this PR. Raise max_rereview_requests or pass "
+            f"this agent on this PR.{basis} Raise max_rereview_requests or pass "
             "--max-rereview-requests to continue."
         ),
     }
@@ -1306,6 +1418,7 @@ def post_rereview(
 
     if dry_run:
         return {
+            "status": "dry_run",
             "created_at": None,
             "repo": repo,
             "pr": pr,
@@ -1345,10 +1458,12 @@ def post_rereview(
         raise RuntimeError("gh api response missing created_at")
 
     return {
+        "status": "posted",
         "created_at": created_at,
         "repo": repo,
         "pr": pr,
         "phrase": phrase,
+        "posted": True,
     }
 
 
@@ -1377,6 +1492,7 @@ def request_review(
 
     if dry_run:
         return {
+            "status": "dry_run",
             "created_at": None,
             "repo": repo,
             "pr": pr,
@@ -1413,6 +1529,7 @@ def request_review(
             requested_at=requested_at,
         )
     return {
+        "status": "posted",
         "created_at": requested_at,
         "repo": repo,
         "pr": pr,
@@ -1567,6 +1684,26 @@ def unconfirmed_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[st
             f"be read ({path}). That request may have landed, so nothing was posted. "
             "Check the PR for a pending or completed review request, then delete that "
             "file and run this again."
+        ),
+    }
+
+
+def baseline_unwritable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:
+    """The login's earlier requests could not be adopted into the provenance
+    log (timeline unreadable or the log unwritable), so nothing was posted:
+    the first post would otherwise hide that history from the next count."""
+    return {
+        "status": "state_unwritable",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "reviewer": reviewer,
+        "message": (
+            f"Could not record the earlier review requests found on {repo}#{pr} "
+            "under this login into the local provenance log, so nothing was "
+            "posted: a first post without that record would hide them from "
+            "the next cap count. Check `gh auth status` and the state directory "
+            "(GGRL_STATE_DIR), then run this again."
         ),
     }
 
@@ -1792,16 +1929,54 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # needs. With no completed vendor review there is nothing to count: zero
     # would mean "no first review", not "no re-reviews", and a cap of 0 or an
     # unresolvable `gh api user` would block the very first request.
-    if not args.no_cap_check and state["first_completed_review_at"]:
+    first = state["first_completed_review_at"]
+    login = gh_login() if first else None
+    adopting = bool(first) and not args.dry_run and not provenance_incomplete(args.repo, args.pr)
+    counting = bool(first) and not args.no_cap_check
+    # One timeline read serves both adoption and the count, so they cannot
+    # disagree about which requests exist (PR #120 review).
+    events = timeline_snapshot(args.repo, args.pr) if (adopting or counting) else None
+    # History under this login with no local record is adopted into the log
+    # before anything is counted or posted, so the first post from this
+    # machine cannot hide it from the next count (PR #120 review). Outside
+    # the cap check on purpose: `--no-cap-check` skips enforcing this
+    # request, not keeping the record the next one is counted against; when
+    # adoption fails under it, the history is marked incomplete so later
+    # counts are unknown rather than a trusted subset. A dry run posts
+    # nothing, so it writes nothing either and previews from the bound. An
+    # already-incomplete history is left alone: the count below is unknown.
+    if adopting and not adopt_unlogged_requests(
+        args.repo, args.pr, vendor, login, first, events=events
+    ):
+        if args.no_cap_check:
+            loop_state.mark_provenance_incomplete(args.repo, args.pr)
+        elif login is None:
+            # Nothing to attribute the history to: the existing answer.
+            cap = effective_cap(args.max_rereview_requests)
+            _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
+            return 0
+        else:
+            _emit(baseline_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
+            return 0
+    if counting:
         cap = effective_cap(args.max_rereview_requests)
-        used = count_agent_review_requests(
-            args.repo, args.pr, vendor, gh_login(), state["first_completed_review_at"]
-        )
+        used = count_agent_review_requests(args.repo, args.pr, vendor, login, first, events=events)
         if used is None:
             _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
             return 0
         if used >= cap:
-            _emit(capped_payload(args.repo, args.pr, used, cap), json_output=json_output)
+            _emit(
+                capped_payload(
+                    args.repo, args.pr, used, cap,
+                    # Adopted history, or (a dry run adopts nothing) a count
+                    # taken straight from the timeline with no record at all.
+                    upper_bound=(
+                        baseline_adopted(args.repo, args.pr)
+                        or loop_request_times(args.repo, args.pr, vendor) is None
+                    ),
+                ),
+                json_output=json_output,
+            )
             return 0
     # The open request is withdrawn only once the cap has cleared, so a cap
     # refusal never leaves the PR with nothing pending. A dry run withdraws
@@ -1850,6 +2025,7 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             args.repo, args.pr, vendor, posting_login, exc.requested_at, prior=prior
         ):
             payload = {
+                "status": "posted",
                 "created_at": exc.requested_at,
                 "repo": args.repo,
                 "pr": args.pr,
