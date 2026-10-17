@@ -1003,14 +1003,26 @@ def adopt_unlogged_requests(
     PR run past the cap (PR #120 review). So before the first post the
     history is adopted: one ``baseline`` line per counted event, at the
     event's own time, where the matcher finds it on every later run and on
-    the fetch side too. True when nothing needed writing or every line is
-    on disk; False when the timeline could not be read or a write failed,
-    and the caller posts nothing. Without a login there is no history to
-    attribute, so nothing is written and the count stays unknown.
+    the fetch side too, written as one batch and closed by a
+    ``baseline_complete`` line. A log with baseline lines and no closing
+    line is a torn adoption: it is marked incomplete, so every later count
+    is unknown rather than a trusted subset. True when nothing needed
+    writing or the batch is on disk; False when the timeline could not be
+    read, a write failed, or an earlier adoption was torn. Without a login
+    there is no history to attribute, so nothing is written and the count
+    stays unknown.
     """
     if runner is None:
         runner = subprocess.run
-    if agent_login is None or loop_request_times(repo, pr, vendor) is not None:
+    if agent_login is None:
+        return True
+    logged = loop_state.read_request_log(repo, pr) or []
+    started = any(isinstance(item, dict) and item.get("baseline") is True for item in logged)
+    closed = any(isinstance(item, dict) and item.get("baseline_complete") is True for item in logged)
+    if started and not closed:
+        loop_state.mark_provenance_incomplete(repo, pr)
+        return False
+    if loop_request_times(repo, pr, vendor) is not None:
         return True
     events = _timeline_events(repo, pr, runner)
     if events is None:
@@ -1023,16 +1035,20 @@ def adopt_unlogged_requests(
         loop_request_times=None,
         match_window_seconds=REQUEST_MATCH_WINDOW_SECONDS,
     )
-    for event in counted:
-        if not loop_state.append_request_log(repo, pr, {
+    if not counted:
+        return True
+    records: list[dict[str, Any]] = [
+        {
             "reviewer": vendor.request_login,
             "at": event["created_at"],
             "countable": True,
             "baseline": True,
             "request_id": f"baseline:{event['created_at']}",
-        }):
-            return False
-    return True
+        }
+        for event in counted
+    ]
+    records.append({"baseline_complete": True, "adopted": len(counted)})
+    return loop_state.append_request_log_batch(repo, pr, records)
 
 
 def count_agent_review_requests(
@@ -1896,16 +1912,25 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
     # needs. With no completed vendor review there is nothing to count: zero
     # would mean "no first review", not "no re-reviews", and a cap of 0 or an
     # unresolvable `gh api user` would block the very first request.
-    if not args.no_cap_check and state["first_completed_review_at"]:
-        cap = effective_cap(args.max_rereview_requests)
-        login = gh_login()
-        first = state["first_completed_review_at"]
-        # History under this login with no local record is adopted into the
-        # log before anything is counted or posted, so the first post from
-        # this machine cannot hide it from the next count (PR #120 review).
-        if not adopt_unlogged_requests(args.repo, args.pr, vendor, login, first):
+    first = state["first_completed_review_at"]
+    login = gh_login() if first else None
+    # History under this login with no local record is adopted into the log
+    # before anything is counted or posted, so the first post from this
+    # machine cannot hide it from the next count (PR #120 review). Outside
+    # the cap check on purpose: `--no-cap-check` skips enforcing this
+    # request, not keeping the record the next one is counted against; when
+    # adoption fails under it, the history is marked incomplete so later
+    # counts are unknown rather than a trusted subset. A dry run posts
+    # nothing, so it writes nothing either and previews from the bound.
+    if first and not args.dry_run and not adopt_unlogged_requests(
+        args.repo, args.pr, vendor, login, first
+    ):
+        if not args.no_cap_check:
             _emit(baseline_unwritable_payload(args.repo, args.pr, reviewer), json_output=json_output)
             return 0
+        loop_state.mark_provenance_incomplete(args.repo, args.pr)
+    if not args.no_cap_check and first:
+        cap = effective_cap(args.max_rereview_requests)
         used = count_agent_review_requests(args.repo, args.pr, vendor, login, first)
         if used is None:
             _emit(uncountable_count_payload(args.repo, args.pr, cap), json_output=json_output)
