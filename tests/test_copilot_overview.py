@@ -426,23 +426,13 @@ def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head()
     assert clean_blocked_by([], overview, review_request_vendor=True) == "no_review_for_head"
 
 
-def test_absolute_discussion_links_are_graded():
-    body = OVERVIEW.replace("](#discussion_r", f"]({PR_URL}#discussion_r")
-
-    parsed = parse_copilot_overview(body)
-
-    assert parsed["findings"] == parse_copilot_overview(OVERVIEW)["findings"]
-    assert parsed["unlinked_findings"] == 0
-
-
-def test_absolute_discussion_links_keep_bracketed_titles():
-    body = OVERVIEW.replace("Test exceeds 30-second limit", "Guard arr[i]")
-    body = body.replace("Test bypasses production parser", "Add [Authorize]")
+def test_absolute_discussion_links_keep_plain_and_bracketed_titles():
+    body = OVERVIEW.replace("Test bypasses production parser", "Guard arr[i] / [Authorize]")
     absolute = body.replace("](#discussion_r", f"]({PR_URL}#discussion_r")
 
     parsed = parse_copilot_overview(absolute)
 
-    assert [finding["title"] for finding in parsed["findings"]] == ["Guard arr[i]", "Add [Authorize]"]
+    assert [finding["title"] for finding in parsed["findings"]] == ["Test exceeds 30-second limit", "Guard arr[i] / [Authorize]"]
     assert parsed["findings"] == parse_copilot_overview(body)["findings"]
     assert parsed["unlinked_findings"] == 0
 

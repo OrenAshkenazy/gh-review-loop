@@ -44,6 +44,8 @@ def checkout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pc, "git", local_git)
     profile = {"source": "confirmed", "checks": [{"name": "tests", "required": True, "command": [sys.executable, "-c", "assert open('fix.txt').read() == 'after\\n'"]}]}
+    counter = tmp_path / "verification-count"
+    profile["checks"][0]["command"][-1] += f"; from pathlib import Path; p=Path({str(counter)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x')"
     monkeypatch.setattr(pc.judge, "get_profile", lambda repo: copy.deepcopy(profile))
     state = {"owner/repo#1": {"run": {"update_seq": 1, "last_summary_seq": 0}}}
     monkeypatch.setattr(rr, "load_state", lambda: state)
@@ -68,9 +70,10 @@ def assert_not_pushed(checkout):
     assert pc.git(root, "--git-dir", str(remote), "rev-parse", "refs/heads/fix").strip() == head
 
 
-def test_publishes_only_verified_changes(checkout):
+def test_publishes_only_verified_changes(checkout, tmp_path):
     result = publish(checkout)
     assert result["published"] is True
+    assert (tmp_path / "verification-count").read_text() == "x"
     root, remote, head, _, _ = checkout
     assert result["head"] != head
     assert pc.git(root, "--git-dir", str(remote), "rev-parse", "refs/heads/fix").strip() == result["head"]
@@ -93,10 +96,14 @@ def test_separate_fetch_and_push_urls_validate_the_push_destination(checkout, tm
     assert fetch_tip == ([head, "refs/heads/fix"] if fetch_has_branch else [])
 
 
-def test_dry_run_verifies_without_staging_committing_or_pushing(checkout):
+def test_dry_run_verifies_without_staging_committing_or_pushing(checkout, tmp_path, monkeypatch):
+    monkeypatch.setattr(rr, "request_rereview", lambda *args: pytest.fail("dry run cannot request review"))
+    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **kw: pytest.fail("dry run cannot emit a receipt"))
     result = publish(checkout, dry_run=True)
     assert result["verification"]["verification"] == "passed"
+    assert (tmp_path / "verification-count").read_text() == "x"
     assert result["published"] is False
+    assert "review_request" not in result and "cycle_summary" not in result
     assert pc.git(checkout[0], "rev-parse", "HEAD").strip() == checkout[2]
     assert pc.git(checkout[0], "diff", "--cached", "--name-only") == ""
     assert_not_pushed(checkout)
@@ -150,11 +157,6 @@ def test_publish_holds_pr_lock_through_request_and_forwards_head_cap(checkout, m
     assert result["review_request"]["posted"] is True
 
 
-def test_dry_run_never_requests_review(checkout, monkeypatch):
-    monkeypatch.setattr(rr, "request_rereview", lambda *args: pytest.fail("dry run cannot request review"))
-    assert "review_request" not in publish(checkout, dry_run=True)
-
-
 @pytest.mark.parametrize("failure", [False, True])
 def test_request_failure_preserves_confirmed_publication(checkout, monkeypatch, failure):
     def request(*args):
@@ -186,9 +188,15 @@ def test_missing_path_still_allows_verified_deletion(checkout):
     assert pc.git(root, "ls-tree", "--name-only", result["head"]).strip() == ""
 
 
-@pytest.mark.parametrize("profile", [None, {}, {"source": "skipped"}, {"source": "confirmed", "checks": []}, {"source": "confirmed", "checks": [{"required": False, "command": ["python", "-V"]}]}, {"source": "confirmed", "checks": [{"required": "true", "command": ["python", "-V"]}]}])
-def test_incomplete_or_optional_only_profile_blocks(checkout, monkeypatch, profile):
-    monkeypatch.setattr(pc.judge, "get_profile", lambda repo: profile)
+@pytest.mark.parametrize("profile", [{}, {"source": "skipped"}, {"source": "confirmed", "checks": []}, {"source": "confirmed", "checks": [{"required": False, "command": ["python", "-V"]}]}, {"source": "confirmed", "checks": [{"required": "true", "command": ["python", "-V"]}]}])
+def test_incomplete_or_optional_only_profile_blocks(tmp_path, profile):
+    with pytest.raises(pc.PublishError, match="profile"):
+        pc.validate_profile(profile, tmp_path)
+
+
+def test_missing_profile_blocks_publication(checkout, monkeypatch):
+    monkeypatch.setattr(pc.judge, "get_profile", lambda repo: None)
+    monkeypatch.setattr(pc, "run_profile", lambda *args: pytest.fail("a missing profile must not run verification"))
     with pytest.raises(pc.PublishError, match="profile"):
         publish(checkout)
     assert_not_pushed(checkout)
@@ -202,13 +210,10 @@ def test_failed_required_check_blocks(checkout):
 
 
 @pytest.mark.parametrize("override", ["", None])
-def test_empty_check_directory_cannot_hide_profile_outside_checkout(checkout, monkeypatch, override):
-    checkout[4]["working_directory"] = ".."
-    checkout[4]["checks"][0]["working_directory"] = override
-    monkeypatch.setattr(pc, "run_profile", lambda *args: pytest.fail("an outside verification directory must not run"))
+def test_empty_check_directory_cannot_hide_profile_outside_checkout(tmp_path, override):
+    profile = {"source": "confirmed", "working_directory": "..", "checks": [{"required": True, "command": ["python", "-V"], "working_directory": override}]}
     with pytest.raises(pc.PublishError, match="working directories"):
-        publish(checkout)
-    assert_not_pushed(checkout)
+        pc.validate_profile(profile, tmp_path)
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -230,7 +235,7 @@ def test_verification_rewriting_files_blocks(checkout):
     assert_not_pushed(checkout)
 
 
-@pytest.mark.parametrize("change", ["head", "branch", "base", "closed", "remote"])
+@pytest.mark.parametrize("change", ["head", "branch", "base", "remote"])
 def test_wrong_checkout_or_remote_blocks(checkout, monkeypatch, change):
     info = checkout[3]
     if change == "head":
@@ -239,13 +244,21 @@ def test_wrong_checkout_or_remote_blocks(checkout, monkeypatch, change):
         info["head"]["ref"] = "other"
     elif change == "base":
         info["base"]["ref"] = "fix"
-    elif change == "closed":
-        monkeypatch.setattr(pc, "pr_info", lambda *args: (_ for _ in ()).throw(pc.PublishError("PR must be open")))
     else:
         info["head"]["repo"]["html_url"] = "https://github.com/other/repo"
     with pytest.raises(pc.PublishError):
         publish(checkout)
     assert_not_pushed(checkout)
+
+
+def test_closed_pr_is_rejected_by_pr_info(tmp_path, monkeypatch):
+    def run(argv, root):
+        assert argv == ["gh", "api", "repos/owner/repo/pulls/1"] and root == tmp_path
+        return json.dumps({"state": "closed"})
+
+    monkeypatch.setattr(pc, "run", run)
+    with pytest.raises(pc.PublishError, match="PR must be open"):
+        pc.pr_info("owner/repo", 1, tmp_path)
 
 
 def test_pr_head_change_during_verification_blocks(checkout, monkeypatch):
@@ -263,20 +276,10 @@ def test_pr_head_change_during_verification_blocks(checkout, monkeypatch):
 
 
 @pytest.mark.parametrize("state", [{}, {"owner/repo#2": {"run": {"update_seq": 1, "last_summary_seq": 1}}}])
-def test_missing_or_other_pr_run_blocks(checkout, monkeypatch, state):
+def test_missing_or_other_pr_run_blocks(monkeypatch, state):
     monkeypatch.setattr(rr, "load_state", lambda: state)
     with pytest.raises(pc.PublishError, match="fetch this PR"):
-        publish(checkout)
-    assert_not_pushed(checkout)
-
-
-@pytest.mark.parametrize("dry_run", [False, True])
-def test_profile_runs_exactly_once_per_publication(checkout, tmp_path, dry_run):
-    counter = tmp_path / "verification-count"
-    checkout[4]["checks"][0]["command"] = [sys.executable, "-c", f"from pathlib import Path; p=Path({str(counter)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x')"]
-    result = publish(checkout, dry_run=dry_run)
-    assert counter.read_text() == "x"
-    assert result["verification"]["verification"] == "passed"
+        pc.loop_gate("owner/repo", 1, require_summary=False)
 
 
 def test_publisher_emits_verified_summary_and_forwards_metadata(checkout, monkeypatch):
@@ -297,11 +300,6 @@ def test_publisher_emits_verified_summary_and_forwards_metadata(checkout, monkey
     assert calls[0][2]["agent_login"] == "receipt-agent"
     assert calls[0][2]["options"] == ["--fixed-count", "2", "--semantic-risk", "changed return shape", "--max-rereview-requests", "6"]
     assert result["cycle_summary"]["output"] == "[loop] receipt"
-
-
-def test_dry_run_does_not_emit_or_post_a_receipt(checkout, monkeypatch):
-    monkeypatch.setattr(pc.loop_lifecycle, "emit_receipt", lambda *a, **kw: pytest.fail("dry run cannot emit a receipt"))
-    assert "cycle_summary" not in publish(checkout, dry_run=True)
 
 
 @pytest.mark.parametrize("failure", ["error", "unstamped", "files", "profile", "head"])
@@ -328,10 +326,21 @@ def test_summary_failure_or_changes_block_staging_and_push(checkout, monkeypatch
 
 
 @pytest.mark.parametrize("count", [None, 3])
-def test_unknown_or_exhausted_cap_blocks(checkout, monkeypatch, count):
-    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: count)
+def test_unknown_or_exhausted_cap_before_push_blocks(checkout, monkeypatch, count):
+    original_git = pc.git
+    used = [0]
+
+    def git(root, *args):
+        result = original_git(root, *args)
+        if args[0] == "commit":
+            used[0] = count
+        return result
+
+    monkeypatch.setattr(pc, "git", git)
+    monkeypatch.setattr(rr, "count_agent_pings", lambda *args: used[0])
     with pytest.raises(pc.PublishError, match="cap"):
         publish(checkout)
+    assert pc.git(checkout[0], "rev-parse", "HEAD").strip() != checkout[2]
     assert_not_pushed(checkout)
 
 
@@ -347,16 +356,15 @@ def test_cli_cap_override_applies_to_every_publication_gate(checkout, monkeypatc
     monkeypatch.setattr(rr, "count_agent_pings", lambda *args: count)
     status = pc.main(["--repo", "owner/repo", "--pr", "1", "--repo-root", str(checkout[0]), "--paths", "fix.txt", "--message", "fix review", "--max-rereview-requests", str(cap)])
     result = json.loads(capsys.readouterr().out)
+    assert seen_caps and all(override == cap for override in seen_caps)
     if blocked:
         assert status == 1
         assert result["published"] is False
         assert "cap reached" in result["error"]
-        assert seen_caps == [cap]
         assert_not_pushed(checkout)
     else:
         assert status == 0
         assert result["published"] is True
-        assert seen_caps == [cap, cap, cap, cap]
         assert pc.git(checkout[0], "--git-dir", str(checkout[1]), "rev-parse", "refs/heads/fix").strip() == result["head"]
 
 

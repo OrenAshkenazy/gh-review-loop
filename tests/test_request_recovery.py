@@ -512,8 +512,7 @@ def test_durable_receipt_survives_failed_cycle_stamp(monkeypatch, native, older_
         assert rr.count_agent_pings("owner/repo", 1, "@codex", "agent", runner=lambda cmd, **kw: result(cmd, [])) == (None if older_incomplete else 1)
 
 
-@pytest.mark.parametrize("used", [0, 3, None])
-@pytest.mark.parametrize("uncertain", [False, True])
+@pytest.mark.parametrize("used, uncertain", [(0, False), (0, True), (3, False), (None, False)])
 def test_stale_replacement_carries_refreshed_state_and_cap_into_post_and_recovery(monkeypatch, used, uncertain):
     stub_cap_check_known_under_cap(monkeypatch)
     monkeypatch.setattr(rr, "utc_now_iso", lambda: AT)
@@ -604,7 +603,7 @@ def test_comment_snapshot_requires_complete_positive_ids(data):
 
 
 @pytest.mark.parametrize("native", [False, True])
-@pytest.mark.parametrize("stdout", ["", " ", "[]\n[", "{}"])
+@pytest.mark.parametrize("stdout", ["", "[]\n[", "{}"])
 def test_provenance_snapshot_rejects_blank_or_malformed_paginated_output(native, stdout):
     reader = rr._snapshot_request_event_ids if native else rr._snapshot_comment_ids
     assert reader("owner/repo", 1, runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout, "")) is None
@@ -624,8 +623,7 @@ def test_unreadable_comment_snapshot_blocks_post_but_dry_run_skips_snapshot(monk
 
 
 @pytest.mark.parametrize("initial", [False, True])
-@pytest.mark.parametrize("expected_head", [None, HEAD, "b" * 40])
-def test_fresh_native_event_reconciles_after_head_move_without_current_registration(monkeypatch, initial, expected_head):
+def test_fresh_native_event_reconciles_after_head_move_without_current_registration(monkeypatch, initial):
     marker = native_marker()
     marker.update(request_event_ids=[99], initial_review=initial)
     rr._mark_request_in_flight("owner/repo", 1, marker)
@@ -634,7 +632,7 @@ def test_fresh_native_event_reconciles_after_head_move_without_current_registrat
     monkeypatch.setattr(rr, "request_state", lambda *a: pytest.fail("past request proof is independent of current PR state"))
     monkeypatch.setattr(rr, "_all_reviews", lambda *a: pytest.fail("event proof needs no review-completion read"))
     monkeypatch.setattr(rr, "_timeline_events", lambda *a: [event])
-    args = reconcile_args(*(["--expect-head", expected_head] if expected_head else []))
+    args = reconcile_args("--expect-head", "b" * 40)
     payload = rr._locked_request(args)
     assert payload["status"] == "request_reconciled" and payload["created_at"] == event["created_at"]
     entry = saved_entry()

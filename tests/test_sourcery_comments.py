@@ -46,6 +46,8 @@ def test_partial_thread_history_never_authorizes_deferral(monkeypatch, problem):
     def read(args):
         calls.append(args)
         if len(calls) == 1:
+            query = next(arg for arg in args if arg.startswith("query="))
+            assert "pageInfo { hasNextPage endCursor }" in query.split("comments(first:50) {", 1)[1]
             return {"data": {"repository": {"pullRequest": pull}}}
         if problem == "error":
             raise RuntimeError("page unavailable")
@@ -57,6 +59,8 @@ def test_partial_thread_history_never_authorizes_deferral(monkeypatch, problem):
     fgt.fetch_threads(fgt.PullRequest("owner", "repo", 1))
     assert thread["comments"]["pageInfo"]["hasNextPage"] is True
     assert not fgt.is_addressed_by_reply(thread, "coderabbitai")
+    assert len(fgt.filter_threads(pull, "coderabbitai", False, False)) == 1
+    assert fgt.addressed_by_reply_threads(pull, "coderabbitai") == []
     assert fgt.pagination_warnings(pull)
     assert len(calls) <= 21
 
