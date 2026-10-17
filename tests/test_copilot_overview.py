@@ -432,6 +432,66 @@ def test_the_open_count_is_read_when_copilot_calls_them_issues():
     assert one["open_findings"] == 1
 
 
+MARKER = "<!-- ccr-overview-v2 -->\n\n"
+
+
+def test_a_clean_review_that_says_no_open_issues_counts_as_zero():
+    """Live Copilot (qizsecurity org, 2026-10-17) writes "**No open issues** 🎉"
+    on a clean review, with no number at all. The clean gate needs a count,
+    so this read as overview_unparseable on every clean head."""
+    for noun in ("issues", "findings"):
+        parsed = parse_copilot_overview(MARKER + f"### 🟢 Approval recommended\n\nFine.\n\n**No open {noun}** 🎉\n")
+        assert parsed["open_findings"] == 0 and parsed["complete"] is True
+    closer = parse_copilot_overview(MARKER + "### 🔵 Needs a closer look\n\nHuman check.\n\n**No open issues** 🎉\n")
+    assert closer["open_findings"] == 0 and closer["approving"] is False
+
+
+def test_the_legacy_open_header_still_gives_the_count():
+    """Overviews from early October 2026 wrote "**Findings:** 1" and an
+    "Open (1)" section instead of "1 open finding"."""
+    body = (
+        MARKER + "## Copilot review overview\n\n### 🔵 Needs a closer look\n\nVault timing.\n\n"
+        '**Review effort:** Balanced  \n**Findings:** 1 <picture><img alt="High severity"></picture>\n\n'
+        "<details open>\n<summary><strong>Open (1)</strong></summary>\n\n"
+        '- <picture><img alt="High severity"></picture> [Retries complete too early](#discussion_r4206541439) · New\n'
+        "</details>\n"
+    )
+    parsed = parse_copilot_overview(body)
+    assert parsed["open_findings"] == 1
+    assert [f["discussion_id"] for f in parsed["findings"]] == ["4206541439"]
+    assert parsed["unlinked_findings"] == 0
+    legacy_clean = parse_copilot_overview(
+        MARKER + "## Copilot review overview\n\n### 🟢 Approval recommended\n\nFine.\n\n"
+        "**Review effort:** Lite  \n**Findings:** None\n"
+    )
+    assert legacy_clean["open_findings"] == 0 and legacy_clean["complete"] is True
+
+
+def test_previously_missed_items_are_not_open_findings():
+    """A "Previously missed (3)" section lists severity icons for issues in
+    unchanged code, outside the open section and without inline threads.
+    Counting them as unlinked findings blocked the clean gate forever on a
+    "0 open findings" review (live, capability-catalog#278)."""
+    missed = (
+        "<details>\n<summary><strong>Previously missed (2)</strong></summary>\n\n"
+        '<details>\n<summary><picture><img alt="Medium severity"></picture> Make read conditional</summary>\n\nbody\n</details>\n'
+        '<details>\n<summary><picture><img alt="Low severity"></picture> Require read</summary>\n\nbody\n</details>\n'
+        "</details>\n"
+    )
+    clean = parse_copilot_overview(MARKER + "### 🔵 Needs a closer look\n\nText.\n\n**0 open findings**\n\n" + missed)
+    assert clean["open_findings"] == 0 and clean["unlinked_findings"] == 0 and clean["findings"] == []
+
+    with_open = parse_copilot_overview(
+        MARKER + "### 🟡 Changes recommended\n\nText.\n\n"
+        "<details open>\n<summary><strong>1 open issue</strong></summary>\n\n"
+        '- <picture><img alt="High severity"></picture> [Guard it](https://github.com/o/r/pull/9#discussion_r111) · New\n'
+        "</details>\n\n" + missed
+    )
+    assert with_open["open_findings"] == 1
+    assert [f["discussion_id"] for f in with_open["findings"]] == ["111"]
+    assert with_open["unlinked_findings"] == 0
+
+
 def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head():
     """Copilot reviewed the head clean, then was asked again without a push.
     The old overview must not clear the gate while the new review is

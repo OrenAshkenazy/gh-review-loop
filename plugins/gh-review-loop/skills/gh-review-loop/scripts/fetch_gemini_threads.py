@@ -111,10 +111,17 @@ COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
-# "**0 open findings**" on a clean review; "<strong>2 open findings</strong>"
-# otherwise. Live Copilot said "open issues" by 2026-10-17 (local-dev#97).
+# The open count, as Copilot has written it (live corpus, qizsecurity org,
+# 2026-09..10): "**0 open findings**" / "<strong>2 open findings</strong>"
+# (October 7-16), "<strong>14 open issues</strong>" and "**No open issues** 🎉"
+# (October 17), and before that "<summary><strong>Open (1)</strong></summary>"
+# with "**Findings:** None" on a clean review.
 COPILOT_OPEN_FINDINGS_RE = re.compile(
-    r"(?:<strong>|\*\*)(\d+) open (?:findings?|issues?)(?:</strong>|\*\*)", re.IGNORECASE
+    r"(?:<strong>|\*\*)(?:(?P<count>\d+)|(?P<none>No)) open (?:findings?|issues?)(?:</strong>|\*\*)",
+    re.IGNORECASE,
+)
+COPILOT_OPEN_LEGACY_RE = re.compile(
+    r"<strong>Open \((?P<count>\d+)\)</strong>|\*\*Findings:\*\* (?P<none>None)\b", re.IGNORECASE
 )
 # Match approval phrasing only; enumerating every way Copilot can decline would
 # miss one, and an unrecognized decline read as approval dismisses a review.
@@ -1302,17 +1309,33 @@ def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
     if heading:
         # The heading opens with a status emoji ("🟡 Changes recommended").
         assessment = re.sub(r"^\W+", "", heading.group("assessment")).strip()
+    open_match = COPILOT_OPEN_FINDINGS_RE.search(body) or COPILOT_OPEN_LEGACY_RE.search(body)
+    open_findings: int | None = None
+    if open_match:
+        open_findings = int(open_match.group("count")) if open_match.group("count") else 0
+    # Findings are read from the open section only. The overview also lists
+    # "Previously missed (N)" items — in unchanged code, with no inline
+    # thread — whose severity icons would otherwise count as unlinked open
+    # findings and hold the clean gate shut on a "0 open" review (live,
+    # 2026-10-11). The section is the <details> block whose <summary> holds
+    # the count; a bold count outside any <summary> has no section.
+    section = body
+    if open_match:
+        head = body[: open_match.start()]
+        if head.rstrip().endswith("<summary>") or "<summary>" in head[head.rfind("\n") + 1 :]:
+            end = body.find("</details>", open_match.end())
+            section = body[open_match.end() : end if end != -1 else len(body)]
+        else:
+            section = ""
     findings = [
         {
             "severity": match.group("severity").lower(),
             "discussion_id": match.group("id"),
             "title": match.group("title").strip(),
         }
-        for match in COPILOT_FINDING_RE.finditer(body)
+        for match in COPILOT_FINDING_RE.finditer(section)
     ]
-    icon_count = len(COPILOT_SEVERITY_ICON_RE.findall(body))
-    open_match = COPILOT_OPEN_FINDINGS_RE.search(body)
-    open_findings = int(open_match.group(1)) if open_match else None
+    icon_count = len(COPILOT_SEVERITY_ICON_RE.findall(section))
     return {
         "assessment": assessment,
         "approving": bool(COPILOT_APPROVING_RE.match(assessment)),
