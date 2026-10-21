@@ -178,6 +178,12 @@ author supersedes it. From it:
 - The numbered-list shape is read whether or not the summary approves (a
   summary can approve and still list a finding), and only list items count:
   a blob link in prose is not a finding.
+- `approving` is affirmative only (`summary_approves`): a clean phrase, or a
+  `**Verdict:**` line that says approve with no negation on the line, or a
+  standalone `**APPROVED**` badge. "**Verdict:** Do not approve" names the
+  word and means the opposite; with its problems written as prose, such a
+  summary stays `complete: False` for the agent to read rather than becoming
+  a zero-finding review (PR #121 review).
 - `reviewer_overview_for` now applies to `head_reviews` vendors and returns
   the newer of the head-review overview and the summary overview.
 
