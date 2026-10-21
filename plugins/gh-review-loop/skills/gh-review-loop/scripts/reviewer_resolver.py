@@ -27,18 +27,26 @@ class Candidate:
     review_trigger: str | None
     trigger_kind: str = "comment"
     # Where discovery saw this reviewer: "thread" (inline review comment),
-    # "review" (a submitted review with no inline comments), or "requested"
-    # (a pending review request that has not produced a review yet).
+    # "review" (a submitted review with no inline comments), "requested" (a
+    # pending review request that has not produced a review yet), or
+    # "comment" (a review summary posted as a top-level PR comment).
     source: str = "thread"
+    # The known vendor this login posts for when the login is not the
+    # vendor's own (a CI job running Claude Code posts as github-actions[bot]).
+    # Selecting such a candidate persists the login bound to this vendor.
+    vendor: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "login": self.login,
             "display_name": self.display_name,
             "review_trigger": self.review_trigger,
             "trigger_kind": self.trigger_kind,
             "source": self.source,
         }
+        if self.vendor:
+            out["vendor"] = self.vendor
+        return out
 
 
 def now_iso() -> str:
@@ -50,6 +58,11 @@ def now_iso() -> str:
 def display_name_for(login: str) -> str:
     vendor = review_vendors.vendor_for(login)
     if vendor:
+        bound = review_vendors.bound_login(login)
+        if bound:
+            # Name both: the vendor whose review it is, and the login the
+            # loop filters on, so narration never hides the binding.
+            return f"{vendor.display_name} (as {bound})"
         return vendor.display_name
     words = re.split(r"[-_\s]+", login.replace("[bot]", " bot"))
     return " ".join(word.capitalize() for word in words if word) or login
@@ -103,6 +116,52 @@ def auto_reviews(login: str) -> bool:
     """
     vendor = review_vendors.vendor_for(login)
     return vendor.auto_reviews if vendor else True
+
+
+def head_reviews_for(login: str) -> bool:
+    """Whether the vendor's reviews name the head commit they cover (Copilot, Claude).
+
+    Only then can the loop tell "reviewed and clean" from "not reviewed yet"
+    and hold the clean verdict until a review covers the current head.
+    """
+    vendor = review_vendors.vendor_for(login)
+    return bool(vendor and vendor.head_reviews)
+
+
+def summary_comments_for(login: str) -> bool:
+    """Whether the vendor's verdict may arrive as a top-level PR comment (Claude)."""
+    vendor = review_vendors.vendor_for(login)
+    return bool(vendor and vendor.summary_comments)
+
+
+def vendor_key_for(login: str) -> str | None:
+    """The registry key (vendor login) of ``login``'s vendor, or None when unknown."""
+    vendor = review_vendors.vendor_for(login)
+    return vendor.login if vendor else None
+
+
+def bind_from_record(record: Any) -> None:
+    """Re-apply a persisted ``vendor`` binding so this process resolves the login.
+
+    A record selected with ``--reviewer-vendor`` stores the bound login and
+    the vendor it posts for; every later script invocation starts with an
+    empty binding table and must restore it before any author or trigger
+    lookup. A record whose login the registry already knows needs nothing.
+    """
+    if not isinstance(record, dict):
+        return
+    login = record.get("login")
+    vendor = record.get("vendor")
+    if not isinstance(login, str) or not isinstance(vendor, str) or not vendor:
+        return
+    if review_vendors.vendor_for(login) is not None:
+        return
+    try:
+        review_vendors.bind_login(login, vendor)
+    except ValueError:
+        # An unknown vendor name in an old or hand-edited record: the login
+        # stays an unknown reviewer, which is what it was before binding.
+        return
 
 
 def normalize_request_event(event: Any) -> dict[str, Any] | None:
@@ -367,8 +426,13 @@ def canonical_login(login: str) -> str:
     ``@copilot``, ``Copilot``, ``copilot-pull-request-reviewer[bot]`` — while
     review and thread filters compare authors exactly against the stored
     login. Storing an alias would request the right reviewer and then never
-    match its review. Unknown logins pass through untouched.
+    match its review. Unknown logins pass through untouched, and so does a
+    login bound to a vendor (``review_vendors.bind_login``): it is the login
+    the vendor's reviews really carry.
     """
+    bound = review_vendors.bound_login(login)
+    if bound:
+        return bound
     vendor = review_vendors.vendor_for(login)
     return vendor.login if vendor else login
 
@@ -380,9 +444,22 @@ def make_reviewer_record(
     review_trigger: str | None = None,
     source: str,
     selected_at: str | None = None,
+    vendor: str | None = None,
 ) -> dict[str, Any]:
+    """The persisted reviewer selection for ``login``.
+
+    ``vendor`` binds a login the registry does not know to a known vendor's
+    trigger and formats (``--reviewer-vendor claude`` for a CI job that posts
+    Claude's review as ``github-actions[bot]``). The binding is stored on the
+    record so later runs restore it (``bind_from_record``). Naming the
+    vendor whose own login this already is changes nothing.
+    """
+    if vendor:
+        # Raises ValueError for an unknown vendor or a login that belongs to
+        # another vendor; the CLI reports that as an argument error.
+        review_vendors.bind_login(login, vendor)
     login = canonical_login(login)
-    return {
+    record = {
         "login": login,
         "display_name": display_name or display_name_for(login),
         "review_trigger": review_trigger if review_trigger is not None else trigger_for(login),
@@ -392,6 +469,9 @@ def make_reviewer_record(
         "source": source,
         "selected_at": selected_at or now_iso(),
     }
+    if review_vendors.bound_login(login):
+        record["vendor"] = vendor_key_for(login)
+    return record
 
 
 def _iter_comments(thread: dict[str, Any]) -> list[dict[str, Any]]:
@@ -415,7 +495,7 @@ def _is_bot_author(author: dict[str, Any]) -> bool:
     return False
 
 
-_SOURCE_RANK = {"thread": 0, "review": 1, "requested": 2}
+_SOURCE_RANK = {"thread": 0, "review": 1, "requested": 2, "comment": 3}
 
 
 def discover_candidates(
@@ -423,17 +503,21 @@ def discover_candidates(
     *,
     self_login: str | None,
 ) -> list[Candidate]:
-    """Bot reviewers visible on the PR: threads first, then reviews, then pending requests.
+    """Bot reviewers visible on the PR: threads, then reviews, pending requests, summary comments.
 
     Thread comment authors are the strongest signal (they left findings). A
     review with no inline comments (a clean Copilot pass) only shows up as a
     review author. A reviewer that was requested but has not answered yet only
-    shows up as a pending request. Within a source, first-seen order; a login
-    seen in an earlier source keeps that source.
+    shows up as a pending request. A reviewer whose whole verdict is a
+    top-level PR comment (a clean Claude pass, or a CI job posting Claude's
+    summary as ``github-actions[bot]``) only shows up as the author of a
+    comment carrying a known vendor's review signal; such a login is offered
+    bound to that vendor. Within a source, first-seen order; a login seen in
+    an earlier source keeps that source.
     """
-    seen: dict[str, tuple[int, int, str]] = {}
+    seen: dict[str, tuple[int, int, str, str | None]] = {}
 
-    def consider(author: Any, index: int, source: str) -> None:
+    def consider(author: Any, index: int, source: str, vendor: str | None = None) -> None:
         if not isinstance(author, dict):
             return
         login = author.get("login")
@@ -443,7 +527,7 @@ def discover_candidates(
             return
         if login in seen or not _is_bot_author(author):
             return
-        seen[login] = (_SOURCE_RANK[source], index, source)
+        seen[login] = (_SOURCE_RANK[source], index, source, vendor)
 
     threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
     for thread_index, thread in enumerate(threads):
@@ -459,16 +543,45 @@ def discover_candidates(
     for request_index, request in enumerate(requests):
         if isinstance(request, dict):
             consider(request.get("requestedReviewer"), request_index, "requested")
+    comments = (pull_request.get("comments") or {}).get("nodes") or []
+    for comment_index, comment in enumerate(comments):
+        if not isinstance(comment, dict):
+            continue
+        signalled = review_vendors.summary_review_vendor(comment.get("body"))
+        if signalled is None:
+            continue
+        author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+        own = review_vendors.vendor_for(author.get("login"))
+        # The vendor's own login needs no binding; another vendor's login
+        # carrying this signal is that vendor's comment, not a candidate here.
+        if own is not None and own is not signalled:
+            continue
+        consider(author, comment_index, "comment", None if own else signalled.login)
 
-    return [
-        Candidate(
-            login=login,
-            display_name=display_name_for(login),
-            review_trigger=trigger_for(login),
-            trigger_kind=trigger_kind_for(login),
-            source=source,
+    candidates = []
+    for login, (_rank, _index, source, vendor) in sorted(
+        seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
+    ):
+        if vendor:
+            known = review_vendors.vendor_for(vendor)
+            candidates.append(
+                Candidate(
+                    login=login,
+                    display_name=f"{known.display_name} (as {login})" if known else login,
+                    review_trigger=known.mention if known and known.trigger_kind == "comment" else None,
+                    trigger_kind=known.trigger_kind if known else "comment",
+                    source=source,
+                    vendor=vendor,
+                )
+            )
+            continue
+        candidates.append(
+            Candidate(
+                login=login,
+                display_name=display_name_for(login),
+                review_trigger=trigger_for(login),
+                trigger_kind=trigger_kind_for(login),
+                source=source,
+            )
         )
-        for login, (_rank, _index, source) in sorted(
-            seen.items(), key=lambda item: (item[1][0], item[1][1], item[0])
-        )
-    ]
+    return candidates

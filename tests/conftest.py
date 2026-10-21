@@ -36,6 +36,21 @@ def _forbid_real_gh(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_bound_reviewer_logins():
+    """Start and end every test with an empty login-binding table.
+
+    ``review_vendors.bind_login`` (``--reviewer-vendor``) is process-wide
+    state; a binding left behind by one test would make an unrelated test
+    see github-actions as Claude.
+    """
+    import review_vendors
+
+    review_vendors.unbind_all()
+    yield
+    review_vendors.unbind_all()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_user_state(tmp_path_factory, monkeypatch):
     """Point per-user state at a temp directory for every test.
 

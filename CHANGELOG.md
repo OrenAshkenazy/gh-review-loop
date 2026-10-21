@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Code is a first-class reviewer.** One vendor (`claude`, REST
+  `claude[bot]`) covers the three ways Claude reviews a PR through the Claude
+  GitHub App: the hosted Code Review service, the claude-code-action running
+  `/code-review --comment`, and a CI job that posts Claude's review summary as
+  a PR comment. The loop re-reviews with `@claude review` (the hosted
+  service's comment command, which also trips the action's default trigger),
+  grades inline findings from their leading 🔴 Important / 🟡 Nit / 🟣
+  Pre-existing marker, and reads the hosted review body (`<!-- bhrv:… -->`,
+  the still-open items block) and summary comments (`<!-- review:complete -->`,
+  "No issues found. Checked for bugs and CLAUDE.md compliance.") as the
+  reviewer overview. Claude's reviews name the head commit they cover, so it
+  gets Copilot's clean gate: zero threads is not clean until a review or
+  summary covers the current head (`cleanBlockedBy: no_review_for_head`), and
+  `request_rereview.py` answers `already_reviewed_head` instead of pinging a
+  head a push-triggered review already answered. Findings a summary comment
+  reports with no inline thread are surfaced as synthetic threads
+  (`isSummaryCommentFinding`), graded by the summary's `**Severity**:` field
+  or `### <Grade>:` heading. A clean verdict posted as a top-level comment
+  ends the reviewer wait, which previously only watched reviews and threads;
+  the action's "Claude Code is working…" tracking comment never does.
+- **`--reviewer-vendor`.** A login that is not a known vendor's own can be
+  bound to a vendor's trigger and formats — a CI job posting Claude's review
+  as `github-actions[bot]` is discovered as `Claude Code (as github-actions)`
+  (`source: comment`, `vendor: claude`) and selected with
+  `--reviewer github-actions --reviewer-vendor claude`. The binding is stored
+  with the selection and restored by both scripts; the login keeps its own
+  spelling in every author filter, and a vendor's own login cannot be bound
+  to another vendor. Design and live evidence:
+  `docs/superpowers/specs/2026-10-21-claude-reviewer-design.md`.
+
 ### Fixed
 
 - **A review request GitHub accepts but does not register is refused, not
