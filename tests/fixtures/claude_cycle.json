@@ -5,23 +5,42 @@
     "url": "https://github.com/acme/widget/pull/159",
     "title": "Publish with trusted publishing",
     "headRefOid": "ff99634a0000000000000000000000000000ff99",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T18:26:53Z"}}]},
-    "comments": {"nodes": []},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-20T18:26:53Z"
+          }
+        }
+      ]
+    },
+    "comments": {
+      "nodes": []
+    },
     "reviews": {
       "nodes": [
         {
           "id": "PRR_1",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "Beyond the inline findings, I also checked that no reference to the old token survives anywhere in the repo.\n\n\n<details>\n<summary>Extended reasoning...</summary>\n\nThe change moves the upload from a secret API token to OIDC trusted publishing.\n\n</details>\n\nFindings marked 🟡 are optional suggestions and need no follow-up push.\n\n<!-- bhrv:87bf3c3ca48109a6 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:35:06Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
-          "commit": {"oid": "ff99634a0000000000000000000000000000ff99"}
+          "commit": {
+            "oid": "ff99634a0000000000000000000000000000ff99"
+          }
         }
       ]
     },
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
     "reviewThreads": {
       "nodes": [
         {
@@ -38,7 +57,10 @@
             "nodes": [
               {
                 "id": "PRRC_t1",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🔴 If the trusted publisher is set up as this comment describes, every release upload fails after merging. The OIDC token's `job_workflow_ref` claim names `build-and-publish.yml`, not `publish.yml`. Fix: the publisher must name the workflow file the token actually carries.",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -67,7 +89,10 @@
             "nodes": [
               {
                 "id": "PRRC_t2",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🟡 nit (optional): the new rule has no automated check, unlike the other hardening rules.\n\n<details>\n<summary>Why this was flagged</summary>\n\nThe boundary moves to the production environment.\n\n</details>",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -90,12 +115,23 @@
     "url": "https://github.com/acme/widget/pull/159",
     "title": "Publish with trusted publishing",
     "headRefOid": "e5d1c2c00000000000000000000000000000e5d1",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T18:37:46Z"}}]},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-20T18:37:46Z"
+          }
+        }
+      ]
+    },
     "comments": {
       "nodes": [
         {
           "id": "IC_ping1",
-          "author": {"login": "loop-agent", "__typename": "User"},
+          "author": {
+            "login": "loop-agent",
+            "__typename": "User"
+          },
           "body": "@claude review",
           "createdAt": "2026-10-20T18:38:30Z",
           "url": "https://github.com/acme/widget/pull/159#issuecomment-1"
@@ -106,26 +142,40 @@
       "nodes": [
         {
           "id": "PRR_1",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "Beyond the inline findings, I also checked that no reference to the old token survives anywhere in the repo.\n\nFindings marked 🟡 are optional suggestions and need no follow-up push.\n\n<!-- bhrv:87bf3c3ca48109a6 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:35:06Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
-          "commit": {"oid": "ff99634a0000000000000000000000000000ff99"}
+          "commit": {
+            "oid": "ff99634a0000000000000000000000000000ff99"
+          }
         },
         {
           "id": "PRR_2",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "**No new blocking issues.** 1 optional suggestion (a nit) was found and not posted. Nothing in this review needs a push before merging.\n\n**Still open from earlier reviews** (1):\n- _Unresolved: 1 minor or pre-existing._\n\n<!-- bughunter:open-items:v1 count=1\nr4328761976 nit 58 CLAUDE.md\n-->\n\n<!-- bhrv:244bee2cbc900d30 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:41:00Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-2",
-          "commit": {"oid": "e5d1c2c00000000000000000000000000000e5d1"}
+          "commit": {
+            "oid": "e5d1c2c00000000000000000000000000000e5d1"
+          }
         }
       ]
     },
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
     "reviewThreads": {
       "nodes": [
         {
@@ -142,7 +192,10 @@
             "nodes": [
               {
                 "id": "PRRC_t1",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🔴 If the trusted publisher is set up as this comment describes, every release upload fails after merging.",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -171,7 +224,10 @@
             "nodes": [
               {
                 "id": "PRRC_t2",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🟡 nit (optional): the new rule has no automated check, unlike the other hardening rules.",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -194,32 +250,56 @@
     "url": "https://github.com/acme/widget/pull/159",
     "title": "Publish with trusted publishing",
     "headRefOid": "e5d1c2c00000000000000000000000000000e5d1",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T18:37:46Z"}}]},
-    "comments": {"nodes": []},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-20T18:37:46Z"
+          }
+        }
+      ]
+    },
+    "comments": {
+      "nodes": []
+    },
     "reviews": {
       "nodes": [
         {
           "id": "PRR_1",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "Beyond the inline findings, I also checked that no reference to the old token survives.\n\n<!-- bhrv:87bf3c3ca48109a6 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:35:06Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
-          "commit": {"oid": "ff99634a0000000000000000000000000000ff99"}
+          "commit": {
+            "oid": "ff99634a0000000000000000000000000000ff99"
+          }
         },
         {
           "id": "PRR_2",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "**Nothing blocking.** The follow-up commit addresses the workflow-name concern from my earlier review. I found no bugs in this version.\n\n<details>\n<summary>Extended reasoning...</summary>\n\nThe newest commit corrects the docs to name the reusable workflow.\n\n</details>\n\n<!-- bhrv:244bee2cbc900d30 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:41:00Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-2",
-          "commit": {"oid": "e5d1c2c00000000000000000000000000000e5d1"}
+          "commit": {
+            "oid": "e5d1c2c00000000000000000000000000000e5d1"
+          }
         }
       ]
     },
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
     "reviewThreads": {
       "nodes": [
         {
@@ -236,7 +316,10 @@
             "nodes": [
               {
                 "id": "PRRC_t1",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🔴 If the trusted publisher is set up as this comment describes, every release upload fails after merging.",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -265,7 +348,10 @@
             "nodes": [
               {
                 "id": "PRRC_t2",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "🟡 nit (optional): the new rule has no automated check, unlike the other hardening rules.",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -288,50 +374,88 @@
     "url": "https://github.com/acme/widget/pull/159",
     "title": "Publish with trusted publishing",
     "headRefOid": "e5d1c2c00000000000000000000000000000e5d1",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T18:37:46Z"}}]},
-    "comments": {"nodes": []},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-20T18:37:46Z"
+          }
+        }
+      ]
+    },
+    "comments": {
+      "nodes": []
+    },
     "reviews": {
       "nodes": [
         {
           "id": "PRR_1",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "**Nothing blocking.** I found no bugs in this version.\n\n<!-- bhrv:87bf3c3ca48109a6 -->",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:35:06Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
-          "commit": {"oid": "ff99634a0000000000000000000000000000ff99"}
+          "commit": {
+            "oid": "ff99634a0000000000000000000000000000ff99"
+          }
         }
       ]
     },
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
-    "reviewThreads": {"nodes": []}
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
+    "reviewThreads": {
+      "nodes": []
+    }
   },
   "action_clean_note": {
     "number": 159,
     "url": "https://github.com/acme/widget/pull/159",
     "title": "Publish with trusted publishing",
     "headRefOid": "e5d1c2c00000000000000000000000000000e5d1",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T18:37:46Z"}}]},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-20T18:37:46Z"
+          }
+        }
+      ]
+    },
     "comments": {
       "nodes": [
         {
           "id": "IC_ping1",
-          "author": {"login": "loop-agent", "__typename": "User"},
+          "author": {
+            "login": "loop-agent",
+            "__typename": "User"
+          },
           "body": "@claude review",
           "createdAt": "2026-10-20T18:38:30Z",
           "url": "https://github.com/acme/widget/pull/159#issuecomment-1"
         },
         {
           "id": "IC_working",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "Claude Code is working… <img src=\"https://github.com/user-attachments/assets/5ac382c7-e004-429b-8e35-7feb3e8f9c6f\" width=\"14px\" height=\"14px\" style=\"vertical-align: middle;\" />\n\nI'll analyze this and get back to you.\n\n[View job run](https://github.com/acme/widget/actions/runs/1)",
           "createdAt": "2026-10-20T18:38:41Z",
           "url": "https://github.com/acme/widget/pull/159#issuecomment-2"
         },
         {
           "id": "IC_clean",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "No issues found. Checked for bugs and CLAUDE.md compliance.",
           "createdAt": "2026-10-20T18:42:10Z",
           "url": "https://github.com/acme/widget/pull/159#issuecomment-3"
@@ -342,17 +466,26 @@
       "nodes": [
         {
           "id": "PRR_1",
-          "author": {"login": "claude", "__typename": "Bot"},
+          "author": {
+            "login": "claude",
+            "__typename": "Bot"
+          },
           "body": "",
           "state": "COMMENTED",
           "submittedAt": "2026-10-20T18:35:06Z",
           "url": "https://github.com/acme/widget/pull/159#pullrequestreview-1",
-          "commit": {"oid": "ff99634a0000000000000000000000000000ff99"}
+          "commit": {
+            "oid": "ff99634a0000000000000000000000000000ff99"
+          }
         }
       ]
     },
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
     "reviewThreads": {
       "nodes": [
         {
@@ -369,7 +502,10 @@
             "nodes": [
               {
                 "id": "PRRC_t1",
-                "author": {"login": "claude", "__typename": "Bot"},
+                "author": {
+                  "login": "claude",
+                  "__typename": "Bot"
+                },
                 "body": "The upload runs in the reusable workflow, so the trusted publisher must name `build-and-publish.yml`.\n\nhttps://github.com/acme/widget/blob/ff99634a0000000000000000000000000000ff99/.github/workflows/build-and-publish.yml#L228-L230",
                 "createdAt": "2026-10-20T18:35:06Z",
                 "updatedAt": "2026-10-20T18:35:06Z",
@@ -392,64 +528,137 @@
     "url": "https://github.com/acme/widget/pull/2885",
     "title": "Device walks resume after a restart",
     "headRefOid": "03d21e0d0000000000000000000000000003d21e",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-21T06:23:15Z"}}]},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-21T06:23:15Z",
+            "statusCheckRollup": {
+              "contexts": {
+                "nodes": [
+                  {
+                    "__typename": "CheckRun",
+                    "startedAt": "2026-10-21T07:05:40Z",
+                    "checkSuite": {
+                      "createdAt": "2026-10-21T06:55:50Z"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
     "comments": {
       "nodes": [
         {
           "id": "IC_linear",
-          "author": {"login": "linear", "__typename": "Bot"},
+          "author": {
+            "login": "linear",
+            "__typename": "Bot"
+          },
           "body": "<!-- linear-linkback -->\n<details>\n<summary><a href=\"https://linear.app/acme/issue/ACME-1\">ACME-1 Resume walks</a></summary>\n</details>",
           "createdAt": "2026-10-21T06:56:00Z",
           "url": "https://github.com/acme/widget/pull/2885#issuecomment-10"
         },
         {
           "id": "IC_review1",
-          "author": {"login": "github-actions", "__typename": "Bot"},
+          "author": {
+            "login": "github-actions",
+            "__typename": "Bot"
+          },
           "body": "# Code Review: PR #2885 - Device walks resume after a restart\n\n## Owners\n- **Author**: omri\n- **Reviewer**: asaf (review requested)\n\n## What Changed\n\nThis PR implements durable resume for device walks:\n\n1. **Cursor format v2**: carries the running findings count\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `wasm/modules/crowdstrike/resume_durable_test.go:19`\n**Severity**: Minor (test code only)\n\nThe `url.Parse` error is ignored:\n```go\nu, _ := url.Parse(rawURL)\n```\n\n**Suggested fix**: Check the error or add a comment explaining why it's safe to ignore.\n\n## Analysis\n\n### Correctness ✓\n\n1. **Cursor v2 format** is well-designed\n\n### Risks\n\n**Low**: This PR extends existing infrastructure.\n\n## Verdict\n\n**APPROVED** ✅\n\nThis is a well-designed, low-risk enhancement. The single minor lint issue does not block approval.\n\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:09:01Z",
           "url": "https://github.com/acme/widget/pull/2885#issuecomment-11"
         }
       ]
     },
-    "reviews": {"nodes": []},
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
-    "reviewThreads": {"nodes": []}
+    "reviews": {
+      "nodes": []
+    },
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
+    "reviewThreads": {
+      "nodes": []
+    }
   },
   "ci_summary_clean": {
     "number": 2885,
     "url": "https://github.com/acme/widget/pull/2885",
     "title": "Device walks resume after a restart",
     "headRefOid": "449cdcdd0000000000000000000000000449cdcd",
-    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-21T07:38:04Z"}}]},
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "committedDate": "2026-10-21T07:38:04Z",
+            "statusCheckRollup": {
+              "contexts": {
+                "nodes": [
+                  {
+                    "__typename": "CheckRun",
+                    "startedAt": "2026-10-21T07:47:20Z",
+                    "checkSuite": {
+                      "createdAt": "2026-10-21T07:38:11Z"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
     "comments": {
       "nodes": [
         {
           "id": "IC_review1",
-          "author": {"login": "github-actions", "__typename": "Bot"},
+          "author": {
+            "login": "github-actions",
+            "__typename": "Bot"
+          },
           "body": "# Code Review: PR #2885 - Device walks resume after a restart\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `wasm/modules/crowdstrike/resume_durable_test.go:19`\n\nThe `url.Parse` error is ignored.\n\n## Verdict\n\n**APPROVED** ✅\n\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:09:01Z",
           "url": "https://github.com/acme/widget/pull/2885#issuecomment-11"
         },
         {
           "id": "IC_ping1",
-          "author": {"login": "loop-agent", "__typename": "User"},
+          "author": {
+            "login": "loop-agent",
+            "__typename": "User"
+          },
           "body": "@claude review",
           "createdAt": "2026-10-21T07:39:00Z",
           "url": "https://github.com/acme/widget/pull/2885#issuecomment-12"
         },
         {
           "id": "IC_review2",
-          "author": {"login": "github-actions", "__typename": "Bot"},
+          "author": {
+            "login": "github-actions",
+            "__typename": "Bot"
+          },
           "body": "## Code review — PR #2885\n\n**Zone owners:** asaf (c2/pkg/collector, 8 files) — already reviewed\n\n**What changed:**\n```text\n collector* ──▶ backend ──▶ ingest\n   (*changed: durable resume enabled)\n```\n\nNo issues found.\n\n**Blast radius:**\n```text\n  ✓ traced:   collector now cuts durable checkpoints\n```\n\n**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:51:54Z",
           "url": "https://github.com/acme/widget/pull/2885#issuecomment-13"
         }
       ]
     },
-    "reviews": {"nodes": []},
-    "reviewRequests": {"nodes": []},
-    "timelineItems": {"nodes": []},
-    "reviewThreads": {"nodes": []}
+    "reviews": {
+      "nodes": []
+    },
+    "reviewRequests": {
+      "nodes": []
+    },
+    "timelineItems": {
+      "nodes": []
+    },
+    "reviewThreads": {
+      "nodes": []
+    }
   }
 }

@@ -326,7 +326,20 @@ query($owner:String!, $repo:String!, $number:Int!) {
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
       commits(last:1) {
-        nodes { commit { committedDate } }
+        nodes {
+          commit {
+            committedDate
+            statusCheckRollup {
+              contexts(first:50) {
+                nodes {
+                  __typename
+                  ... on CheckRun { startedAt checkSuite { createdAt } }
+                  ... on StatusContext { createdAt }
+                }
+              }
+            }
+          }
+        }
       }
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
@@ -1332,14 +1345,35 @@ def review_body_findings(
     return findings
 
 
-def head_committed_at(pull_request: dict[str, Any]) -> str:
-    """The head commit's committedDate, or "" when the payload lacks it."""
+def head_arrived_at(pull_request: dict[str, Any]) -> str:
+    """When the head commit can first be shown to have reached the PR, or "".
+
+    A commit's ``committedDate`` is when it was made, which can be hours
+    before it was pushed (PR #121 review): a clean summary posted in between
+    would otherwise read as covering a head the reviewer never saw. GitHub
+    creates a check suite or commit status only once a commit is pushed, so
+    the earliest one on the head is a boundary the push cannot postdate. The
+    later of the two is used; a head with no checks keeps ``committedDate``.
+    """
     nodes = (pull_request.get("commits") or {}).get("nodes") or []
     for node in reversed(nodes):
-        if isinstance(node, dict):
-            committed = (node.get("commit") or {}).get("committedDate")
-            if isinstance(committed, str):
-                return committed
+        if not isinstance(node, dict):
+            continue
+        commit = node.get("commit") or {}
+        committed = commit.get("committedDate")
+        committed = committed if isinstance(committed, str) else ""
+        rollup = commit.get("statusCheckRollup") or {}
+        contexts = (rollup.get("contexts") or {}).get("nodes") or []
+        created: list[str] = []
+        for context in contexts:
+            if not isinstance(context, dict):
+                continue
+            suite = context.get("checkSuite") or {}
+            for value in (suite.get("createdAt"), context.get("startedAt"), context.get("createdAt")):
+                if isinstance(value, str) and value:
+                    created.append(value)
+                    break
+        return max(committed, min(created) if created else "")
     return ""
 
 
@@ -1398,9 +1432,11 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
     Findings are recognized in two shapes: graded sections (a heading that
     opens with the grade, ``### Minor: …``, with a ``**File**: \\`path:line\\```
     field or a blob link inside) and the code-review skill's numbered list
-    (an item of prose ending in a full-sha blob link). A summary with neither
-    shape and no approval phrasing is ``complete: False`` — the agent reads
-    it — rather than a guessed zero.
+    (a list item of prose ending in a full-sha blob link; a link in plain
+    prose is not a finding). Approval phrasing never suppresses a finding —
+    a summary can approve and still list one (PR #121 review). A summary
+    with neither shape and no approval phrasing is ``complete: False`` — the
+    agent reads it — rather than a guessed zero.
     """
     if review_vendors.summary_review_vendor(body) is None:
         return None
@@ -1429,13 +1465,22 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
             "line": line,
             "body": (heading.group(0).strip() + "\n\n" + section.strip()).strip(),
         })
-    if not findings and not approving:
+    if not findings:
         anchors = list(BLOB_ANCHOR_RE.finditer(text))
         for index, anchor in enumerate(anchors):
             start = anchors[index - 1].end() if index else 0
             item = text[start:anchor.start()].strip()
             lines = [line for line in item.splitlines() if line.strip()]
-            title = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", lines[-1]).strip() if lines else ""
+            # The nearest list item above the link names the finding; a link
+            # with no list item above it is prose ("What changed", a verdict).
+            title = ""
+            for line in reversed(lines):
+                marker = re.match(r"^\s*(?:\d+[.)]|[-*])\s+(?P<title>.+?)\s*$", line)
+                if marker:
+                    title = marker.group("title")
+                    break
+            if not title:
+                continue
             findings.append({
                 "severity": severity_in_text(item),
                 "title": title[:200],
@@ -1538,9 +1583,10 @@ def summary_comment_overview(
     """The overview record a review summary comment amounts to, or None.
 
     A comment names no commit, so it covers the head when it was posted
-    after the head commit was made (``commits.committedDate``); a payload
-    without that date takes the newest summary as current, which the
-    timestamp-anchored wait already guarantees for the loop's own cycles.
+    after the head reached the PR (``head_arrived_at``: the head's first
+    check suite or status, else its ``committedDate``); a payload without
+    either takes the newest summary as current, which the timestamp-anchored
+    wait already guarantees for the loop's own cycles.
     """
     comment = _current_summary_comment(pull_request, author)
     if comment is None:
@@ -1549,7 +1595,7 @@ def summary_comment_overview(
     if parsed is None:
         return None
     head = pull_request.get("headRefOid") or ""
-    committed = head_committed_at(pull_request)
+    committed = head_arrived_at(pull_request)
     created = comment.get("createdAt") or ""
     comment_id = comment.get("id") or hashlib.sha1(
         (comment.get("body") or "").encode()

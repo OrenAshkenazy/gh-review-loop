@@ -525,7 +525,15 @@ def discover_candidates(
             return
         if self_login and login == self_login:
             return
-        if login in seen or not _is_bot_author(author):
+        if login in seen:
+            # Keep the stronger source; a vendor hint seen later still
+            # applies (a job that posts reviews and a summary under one
+            # login is that vendor's reviewer, PR #121 review).
+            rank, seen_index, seen_source, seen_vendor = seen[login]
+            if vendor and not seen_vendor:
+                seen[login] = (rank, seen_index, seen_source, vendor)
+            return
+        if not _is_bot_author(author):
             return
         seen[login] = (_SOURCE_RANK[source], index, source, vendor)
 

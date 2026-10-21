@@ -106,8 +106,11 @@ bindings first. Invariants:
   comment whose body carries a vendor's summary signal. The vendor's own
   login is a plain candidate; another login is offered with
   `vendor: <key>`, the vendor's trigger, and the `(as <login>)` display name.
-  Another vendor's own login carrying the signal is skipped. The discovery
-  query now reads `comments(last:100) { author body }`.
+  Another vendor's own login carrying the signal is skipped. A login already
+  seen as a thread or review author keeps that stronger source and gains the
+  vendor hint, so a job that posts both an inline review and a summary is
+  still offered as Claude's reviewer. The discovery query now reads
+  `comments(last:100) { author body }`.
 - The conftest resets bindings around every test; they are process state.
 
 ## 4. Fetch side (`fetch_gemini_threads.py`)
@@ -162,10 +165,19 @@ author supersedes it. From it:
   `review_body_findings`; their ids join `known_finding_ids` so one filtered
   out by `--min-severity` reads as dispositioned, like a Copilot thread.
 - `summary_comment_overview` → an overview record with `source: "comment"`,
-  `commit: null`, `covers_head` = created at or after the head commit's
-  `committedDate` (`commits(last:1)` added to the main query, all vendors);
-  a payload without the date takes the newest summary as current, which the
-  timestamp-anchored wait already guarantees for the loop's own cycles.
+  `commit: null`, `covers_head` = created at or after `head_arrived_at`: the
+  later of the head commit's `committedDate` and its earliest check suite or
+  commit status (`commits(last:1){committedDate statusCheckRollup}` added to
+  the main query, all vendors). A commit can be made hours before it is
+  pushed, and a summary posted in between reviewed the previous head (PR
+  #121 review); GitHub creates checks only on push, so their earliest
+  creation is a boundary the push cannot postdate. A head with no checks
+  keeps `committedDate`; a payload without either takes the newest summary
+  as current, which the timestamp-anchored wait already guarantees for the
+  loop's own cycles.
+- The numbered-list shape is read whether or not the summary approves (a
+  summary can approve and still list a finding), and only list items count:
+  a blob link in prose is not a finding.
 - `reviewer_overview_for` now applies to `head_reviews` vendors and returns
   the newer of the head-review overview and the summary overview.
 
@@ -191,8 +203,11 @@ that are specific to review-request vendors.
 ## 5. Request side (`request_rereview.py`)
 
 - Comment path, `head_reviews` vendors: `head_already_reviewed` reads the head
-  and the paginated reviews; a standing (not PENDING/DISMISSED) vendor review
-  of the head → `already_reviewed_head`, nothing posted, no stamp. An
+  and the paginated reviews; a standing (not PENDING/DISMISSED) review of the
+  head **by the selected login** (REST spelling and case normalized; not by
+  vendor, so a `claude[bot]` review never stands in for a job bound as
+  `github-actions`, which the fetch filters by login) →
+  `already_reviewed_head`, nothing posted, no stamp. An
   unreadable head or review list posts the ping as before (one extra ping at
   most; the hosted service drops a request during a running review). Codex
   and Gemini never take these reads (pinned). `--dry-run` skips the dedupe.
