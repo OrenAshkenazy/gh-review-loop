@@ -253,7 +253,7 @@ def test_a_head_review_that_is_not_a_readable_overview_is_still_the_head_review(
     assert overview["open_findings"] is None
     assert overview["url"] == PR_URL + "#pullrequestreview-2"
     assert overview["commit"] == "6f03c25000"
-    assert clean_blocked_by([], overview, review_request_vendor=True) == "overview_unparseable"
+    assert clean_blocked_by([], overview, head_review_vendor=True) == "overview_unparseable"
 
 
 def test_discussion_ids_on_pr_cover_every_thread_regardless_of_state():
@@ -276,29 +276,29 @@ def test_open_findings_whose_threads_exist_on_the_pr_do_not_block_clean():
     head = {"approving": False, "open_findings": 2, "complete": True, "covers_head": True,
             "finding_ids": ["11", "22"], "unlinked_findings": 0}
 
-    assert clean_blocked_by([], head, review_request_vendor=True, known_thread_ids={"11", "22", "99"}) is None
+    assert clean_blocked_by([], head, head_review_vendor=True, known_thread_ids={"11", "22", "99"}) is None
     # A linked finding the fetch never saw (page cap, deleted thread): block.
-    assert clean_blocked_by([], head, review_request_vendor=True, known_thread_ids={"11"}) == "overview_reports_open_findings"
+    assert clean_blocked_by([], head, head_review_vendor=True, known_thread_ids={"11"}) == "overview_reports_open_findings"
     # A finding with no thread link at all cannot be dispositioned: block.
-    assert clean_blocked_by([], {**head, "unlinked_findings": 1}, review_request_vendor=True, known_thread_ids={"11", "22"}) == "overview_reports_open_findings"
+    assert clean_blocked_by([], {**head, "unlinked_findings": 1}, head_review_vendor=True, known_thread_ids={"11", "22"}) == "overview_reports_open_findings"
     # Without thread knowledge the gate stays conservative.
-    assert clean_blocked_by([], head, review_request_vendor=True) == "overview_reports_open_findings"
+    assert clean_blocked_by([], head, head_review_vendor=True) == "overview_reports_open_findings"
 
 
 def test_clean_blocked_by_table():
     approving_head = {"approving": True, "open_findings": 0, "complete": True, "covers_head": True}
     threads = [_thread("T1", "1")]
 
-    assert clean_blocked_by(threads, approving_head, review_request_vendor=True) is None
-    assert clean_blocked_by([], approving_head, review_request_vendor=True) is None
-    assert clean_blocked_by([], None, review_request_vendor=True) == "no_review_for_head"
-    assert clean_blocked_by([], {**approving_head, "covers_head": False}, review_request_vendor=True) == "no_review_for_head"
-    assert clean_blocked_by([], {**approving_head, "complete": False, "open_findings": None}, review_request_vendor=True) == "overview_unparseable"
-    assert clean_blocked_by([], {**approving_head, "open_findings": 2}, review_request_vendor=True) == "overview_reports_open_findings"
+    assert clean_blocked_by(threads, approving_head, head_review_vendor=True) is None
+    assert clean_blocked_by([], approving_head, head_review_vendor=True) is None
+    assert clean_blocked_by([], None, head_review_vendor=True) == "no_review_for_head"
+    assert clean_blocked_by([], {**approving_head, "covers_head": False}, head_review_vendor=True) == "no_review_for_head"
+    assert clean_blocked_by([], {**approving_head, "complete": False, "open_findings": None}, head_review_vendor=True) == "overview_unparseable"
+    assert clean_blocked_by([], {**approving_head, "open_findings": 2}, head_review_vendor=True) == "overview_reports_open_findings"
     # Approval wording alone never matters: a complete head review reporting 0 is clean even if the heading is odd.
-    assert clean_blocked_by([], {**approving_head, "approving": False}, review_request_vendor=True) is None
+    assert clean_blocked_by([], {**approving_head, "approving": False}, head_review_vendor=True) is None
     # Comment vendors have no overview gate.
-    assert clean_blocked_by([], None, review_request_vendor=False) is None
+    assert clean_blocked_by([], None, head_review_vendor=False) is None
 
 
 def test_codex_and_gemini_severity_parsing_is_untouched():
@@ -344,13 +344,13 @@ def test_fewer_parsed_links_than_the_reported_count_blocks_clean():
             "finding_ids": ["11"], "unlinked_findings": 0}
 
     assert clean_blocked_by(
-        [], head, review_request_vendor=True, known_thread_ids={"11", "22"}
+        [], head, head_review_vendor=True, known_thread_ids={"11", "22"}
     ) == "overview_reports_open_findings"
 
     # The count and the links agreeing is still clean.
     agreed = {**head, "open_findings": 1}
     assert clean_blocked_by(
-        [], agreed, review_request_vendor=True, known_thread_ids={"11", "22"}
+        [], agreed, head_review_vendor=True, known_thread_ids={"11", "22"}
     ) is None
 
 
@@ -510,7 +510,7 @@ def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head()
     overview = latest_reviewer_overview(pr, COPILOT)
 
     assert overview["covers_head"] is False
-    assert clean_blocked_by([], overview, review_request_vendor=True) == "no_review_for_head"
+    assert clean_blocked_by([], overview, head_review_vendor=True) == "no_review_for_head"
 
 
 def test_absolute_discussion_links_are_parsed_too():

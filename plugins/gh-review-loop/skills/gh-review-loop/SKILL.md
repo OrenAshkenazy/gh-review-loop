@@ -1,6 +1,6 @@
 ---
 name: gh-review-loop
-description: Use after a GitHub PR is opened or to handle AI reviewer feedback (Codex, CodeRabbit, Copilot, or any reviewer bot) - fix reviewer comments, sweep sibling instances, verify, push, request re-review. Needs an open PR and authenticated gh; asks which bot if none is configured; stops at the cap.
+description: Use after a GitHub PR is opened or to handle AI reviewer feedback (Claude Code, Codex, Copilot, or any reviewer bot) - fix reviewer comments, sweep sibling instances, verify, push, request re-review. Needs an open PR and authenticated gh; asks which bot if none is configured; stops at the cap.
 ---
 
 # AI Reviewer PR Review Loop
@@ -38,7 +38,7 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 
 - **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
 - **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
-- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from recognized severity images (Codex/Gemini) or reviewer-leading plain-text `[P0]`–`[P3]` markers; unsupported formats remain `unknown`.
+- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from recognized severity images (Codex/Gemini), Claude's leading 🔴/🟡/🟣, or reviewer-leading plain-text `[P0]`–`[P3]` markers; unsupported formats remain `unknown`.
 
 ## Cycle Counting
 
@@ -100,7 +100,7 @@ At the cap still run cleanup, terminal classification, metrics, and the final su
 1. **Trigger by default after PR creation.** "Create the PR", "ship this", "run the review loop" all authorize the full loop.
 2. **Resolve the PR** — given URL/number, else `gh pr view --json number,url,headRefName,baseRefName`. No PR → report the blocker.
 3. **Select the reviewer** (persisted → continue silently; else see Reviewer Selection).
-4. **Wait for the first review.** `reviewerSelection.auto_reviews: false` (Codex, Copilot) and no review activity → post the trigger via `request_rereview.py` first, then wait with `--after`; waiting without pinging burns the whole timeout. Activity already present → skip the wait and fetch. Timeout → say so; never invent feedback.
+4. **Wait for the first review.** `reviewerSelection.auto_reviews: false` (Codex, Copilot, Claude) and no review activity → post the trigger via `request_rereview.py` first, then wait with `--after`; waiting without pinging burns the whole timeout. Activity already present → skip the wait and fetch. Timeout → say so; never invent feedback.
 5. **Check loop status** — count prior agent re-review requests; at or above the cap → Stopping Conditions.
 6. **Fetch, acknowledge, classify.** Default fetch (below). Summarize actionable findings grouped by file/behavior; none and `loopStatus.cleanBlockedBy` null → report clean and stop (set → not clean, see `references/reviewer-selection.md`). First run for the repo → profile decision NOW, before any edit (see Verification Profile), then relay the profile intro. Explanation requests get a reply draft, not a forced edit; conflicts or regression risk → stop and surface the tradeoff.
 7. **Fix + verify.** Scoped to feedback; read before editing; each change traceable to a feedback cluster; sweep per Pattern → Sweep → Converge. Verify via the profile runner; checks can't run → report why.
@@ -136,7 +136,7 @@ Default fetch (resolves stale threads, prints current feedback, ends with the pr
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" [--pr <URL>]
 ```
 
-**Delta mode.** Threads unchanged since the previous cycle collapse to one line (anchor, severity, URL) — not missing data; any change renders full automatically. On a resumed session or after context compaction, run one fetch with `--full` to re-establish the baseline. Full option catalog: `references/script-usage.md`. The script warns on stderr when a GraphQL page limit is hit.
+**Delta mode.** Threads unchanged since the previous cycle collapse to one line (anchor, severity, URL) — not missing data; any change renders full automatically. On a resumed session or after context compaction, run one fetch with `--full` to re-establish the baseline. Full option catalog: `references/script-usage.md`.
 
 ## GitHub Write Safety
 

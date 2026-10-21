@@ -566,6 +566,10 @@ def read_persisted_reviewer(repo: str, pr: int) -> dict[str, Any] | None:
     login = reviewer.get("login")
     if not isinstance(login, str) or not login:
         return None
+    # A login selected with --reviewer-vendor resolves to its vendor only
+    # once the stored binding is restored; without it the dispatch below
+    # would see an unknown reviewer with no safe trigger.
+    reviewer_resolver.bind_from_record(reviewer)
     return reviewer
 
 
@@ -804,6 +808,40 @@ def _all_reviews(repo: str, pr: int, runner: Any) -> list[dict[str, Any]] | None
     if not isinstance(reviews, list):
         return None
     return [review for review in reviews if isinstance(review, dict)]
+
+
+def head_already_reviewed(
+    repo: str,
+    pr: int,
+    vendor: review_vendors.ReviewVendor,
+    *,
+    head: str | None = None,
+    runner: Any = None,
+) -> str | None:
+    """The head sha when a standing ``vendor`` review already covers it, else None.
+
+    For comment vendors with head-anchored reviews. A read that fails returns
+    None too: without the dedupe the ping is still what it always was, and
+    the hosted Claude service drops a request made while it is already
+    reviewing the head, so an unreadable state costs at most one extra ping.
+    """
+    if runner is None:
+        runner = subprocess.run
+    if head is None:
+        head = current_head(repo, pr, runner=runner)
+    if not head:
+        return None
+    reviews = _all_reviews(repo, pr, runner)
+    if reviews is None:
+        return None
+    for review in reviews:
+        if review_vendors.vendor_for(_review_author(review)) is not vendor:
+            continue
+        if review.get("state") in ("PENDING", "DISMISSED"):
+            continue
+        if _review_commit(review) == head:
+            return head
+    return None
 
 
 def current_head(repo: str, pr: int, runner: Any = None) -> str | None:
@@ -2151,6 +2189,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reviewer login used in controlled stop messages.",
     )
     parser.add_argument(
+        "--reviewer-vendor",
+        default=None,
+        help=(
+            "Treat --reviewer-login as this known vendor (e.g. claude) when the "
+            "login is not the vendor's own, such as a CI job posting Claude's "
+            "review as github-actions[bot]. A persisted selection carries this."
+        ),
+    )
+    parser.add_argument(
         "--max-rereview-requests",
         type=int,
         default=None,
@@ -2205,6 +2252,15 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if args.reviewer_vendor:
+        if not args.reviewer_login:
+            print("error: --reviewer-vendor needs --reviewer-login.", file=sys.stderr)
+            return 2
+        try:
+            review_vendors.bind_login(args.reviewer_login, args.reviewer_vendor)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     if args.no_safe_trigger:
         reviewer_login = args.reviewer_login or (
@@ -2231,6 +2287,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # The comment path honors --expect-head too: the ping is what buys the
     # review, so it must not be posted against a head GitHub has not seen yet.
+    head: str | None = None
     if args.expect_head:
         head = current_head(args.repo, args.pr)
         if head is None:
@@ -2239,6 +2296,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if head != args.expect_head:
             _emit(head_mismatch_payload(args.repo, args.pr, args.expect_head, head),
+                  json_output=args.json_output)
+            return 0
+
+    # A comment vendor whose reviews name their commit (Claude) may already
+    # have reviewed this head on its own — a repository set to review every
+    # push answers before the loop asks. Pinging again would buy a second,
+    # redundant review, so the comment is skipped and the loop fetches.
+    if vendor is not None and vendor.head_reviews and not args.dry_run:
+        reviewed_head = head_already_reviewed(args.repo, args.pr, vendor, head=head)
+        if reviewed_head:
+            _emit(already_reviewed_payload(args.repo, args.pr, reviewer_login or vendor.login, reviewed_head),
                   json_output=args.json_output)
             return 0
 

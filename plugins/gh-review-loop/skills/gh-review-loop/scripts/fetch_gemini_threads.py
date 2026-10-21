@@ -149,6 +149,62 @@ CLEAN_BLOCKED_HINTS = {
 
 DISCUSSION_ANCHOR_RE = re.compile(r"#discussion_r(\d+)$")
 
+# Claude Code's hosted Code Review opens each inline finding with a severity
+# emoji: 🔴 Important (fix before merging), 🟡 Nit, 🟣 Pre-existing (not
+# introduced by the PR). Live: anthropics/claude-agent-sdk-python #1418 and
+# #1422, 2026-10-21 ("🟡 nit (optional): …", "🔴 If PyPI's …").
+CLAUDE_INLINE_SEVERITY_RE = re.compile(r"\A\s*[*_]{0,2}(🔴|🟡|🟣)")
+CLAUDE_INLINE_SEVERITIES = {"🔴": "high", "🟡": "low", "🟣": "low"}
+# Review summaries written by agents (Claude Code's /code-review run in CI,
+# and similar skills) grade a finding in a field ("**Severity**: Minor") or a
+# section heading ("### Minor: Unchecked error in test code"). The words are
+# normalized to the shared scale so --min-severity works unchanged.
+SEVERITY_WORDS = {
+    "critical": "critical", "blocker": "critical", "blocking": "critical",
+    "high": "high", "major": "high", "important": "high",
+    "medium": "medium", "moderate": "medium", "warning": "medium",
+    "low": "low", "minor": "low", "nit": "low", "suggestion": "low",
+    "trivial": "low", "info": "low", "informational": "low",
+}
+SEVERITY_FIELD_RE = re.compile(
+    r"\*\*Severity:?\*\*:?\s*\**\s*(?P<word>[A-Za-z]+)", re.IGNORECASE
+)
+SUMMARY_FINDING_HEADING_RE = re.compile(
+    r"^#{2,6}[ \t]+(?P<word>" + "|".join(SEVERITY_WORDS) + r")\b[ \t]*[:\-–—][ \t]*"
+    r"(?P<title>.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SUMMARY_FILE_FIELD_RE = re.compile(r"\*\*File\*\*:?\s*:?\s*`?(?P<token>[^`\s]+)", re.IGNORECASE)
+PATH_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:-\d+)?$")
+# Claude's hosted service ends every review body with its review id and, on
+# a re-review, lists the findings still open from earlier reviews in a
+# machine block whose severity words are the check run's (normal = Important):
+#   <!-- bughunter:open-items:v1 count=2
+#   r4331815546 nit 1175 src/claude_agent_sdk/_internal/sessions.py
+#   -->
+#   <!-- bhrv:5575f596c666a4d8 -->
+CLAUDE_OVERVIEW_MARKER_RE = re.compile(r"<!--\s*(?:bhrv:|bughunter)")
+CLAUDE_OPEN_ITEMS_RE = re.compile(
+    r"<!--\s*bughunter:open-items:v\d+\s+count=(?P<count>\d+)(?P<items>.*?)-->", re.DOTALL
+)
+CLAUDE_OPEN_ITEM_LINE_RE = re.compile(
+    r"^\s*r(?P<id>\d+)\s+(?P<severity>[a-z_]+)\s+(?P<line>\d+)\s+(?P<path>\S+)", re.MULTILINE
+)
+CLAUDE_OPEN_ITEM_SEVERITIES = {
+    "normal": "high", "important": "high", "nit": "low", "pre_existing": "low",
+}
+# Approval phrasing from the hosted service ("**Nothing blocking.**", "**No
+# new blocking issues.**", "I found no bugs in this version", "Code review
+# found no issues"), the action's code-review skill ("No issues found.
+# Checked for bugs and CLAUDE.md compliance.") and summary verdict lines.
+# Informational, as for Copilot: the clean gate reads open_findings.
+CLAUDE_APPROVING_RE = re.compile(
+    r"(?:\bno (?:new )?(?:blocking )?(?:issues|bugs|problems)(?: were)?(?: found)?\b"
+    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b"
+    r"|\*\*Verdict:?\*\*:?[^\n]*\bApprove[d]?\b|\*\*APPROVED\*\*)",
+    re.IGNORECASE,
+)
+
 # Page sizes embedded in QUERY below. Used by the pagination guard to detect
 # when we may be silently dropping data.
 PAGE_LIMIT_REVIEW_THREADS = 100
@@ -269,6 +325,9 @@ query($owner:String!, $repo:String!, $number:Int!) {
       headRefOid
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
+      commits(last:1) {
+        nodes { commit { committedDate } }
+      }
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
       }
@@ -375,6 +434,12 @@ query($owner:String!, $repo:String!, $number:Int!, $threadsAfter:String) {
             ... on Bot { login }
             ... on User { login }
           }
+        }
+      }
+      comments(last:100) {
+        nodes {
+          author { login __typename }
+          body
         }
       }
       reviewThreads(first:100, after:$threadsAfter) {
@@ -682,6 +747,7 @@ def fetch_reviewer_discovery(pr: PullRequest, *, max_pages: int = 20) -> dict[st
             extras = {
                 "reviews": {"nodes": review_authors["nodes"]},
                 "reviewRequests": pull_request.get("reviewRequests") or {"nodes": []},
+                "comments": pull_request.get("comments") or {"nodes": []},
             }
         nodes = review_threads.get("nodes") or []
         for thread in nodes:
@@ -866,16 +932,35 @@ def thread_severity(thread: dict[str, Any]) -> str:
     if isinstance(annotated, str) and annotated in SEVERITY_ORDER and annotated != "unknown":
         return annotated
     for comment in _iter_comments(thread):
-        body = comment.get("body") or ""
-        plain_match = PLAIN_PRIORITY_RE.match(body)
-        if plain_match:
-            return CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
-        match = SEVERITY_RE.search(body)
-        if match:
-            return match.group(1).lower()
-        codex_match = CODEX_PRIORITY_RE.search(body)
-        if codex_match:
-            return CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+        severity = severity_in_text(comment.get("body") or "")
+        if severity != "unknown":
+            return severity
+    return "unknown"
+
+
+def severity_in_text(body: str) -> str:
+    """The reviewer-assigned severity marked in ``body``, or 'unknown'.
+
+    Every recognized convention is unambiguous, so all are read regardless
+    of the selected reviewer: a leading plain ``[P0]``–``[P3]``, Gemini's
+    priority image, Codex's P0–P3 badge, Claude's leading 🔴/🟡/🟣, and a
+    ``**Severity**: <word>`` field in an agent-written summary.
+    """
+    plain_match = PLAIN_PRIORITY_RE.match(body)
+    if plain_match:
+        return CODEX_PRIORITY_TO_SEVERITY[plain_match.group(1).lower()]
+    match = SEVERITY_RE.search(body)
+    if match:
+        return match.group(1).lower()
+    codex_match = CODEX_PRIORITY_RE.search(body)
+    if codex_match:
+        return CODEX_PRIORITY_TO_SEVERITY[codex_match.group(1).lower()]
+    claude_match = CLAUDE_INLINE_SEVERITY_RE.match(body)
+    if claude_match:
+        return CLAUDE_INLINE_SEVERITIES[claude_match.group(1)]
+    field_match = SEVERITY_FIELD_RE.search(body)
+    if field_match:
+        return SEVERITY_WORDS.get(field_match.group("word").lower(), "unknown")
     return "unknown"
 
 
@@ -1247,6 +1332,246 @@ def review_body_findings(
     return findings
 
 
+def head_committed_at(pull_request: dict[str, Any]) -> str:
+    """The head commit's committedDate, or "" when the payload lacks it."""
+    nodes = (pull_request.get("commits") or {}).get("nodes") or []
+    for node in reversed(nodes):
+        if isinstance(node, dict):
+            committed = (node.get("commit") or {}).get("committedDate")
+            if isinstance(committed, str):
+                return committed
+    return ""
+
+
+def summary_review_comments(
+    pull_request: dict[str, Any], author: str
+) -> list[dict[str, Any]]:
+    """``author``'s finished review summaries posted as top-level PR comments, oldest first.
+
+    Only for a vendor that posts them (``summary_comments``), and only
+    comments carrying that vendor's review signal: the action's "Claude Code
+    is working…" tracking comment, a Linear link-back, or any other bot note
+    under the same login is not a review.
+    """
+    if not reviewer_resolver.summary_comments_for(author):
+        return []
+    vendor = review_vendors.vendor_for(author)
+    out = []
+    for comment in (pull_request.get("comments") or {}).get("nodes") or []:
+        if not isinstance(comment, dict):
+            continue
+        if (comment.get("author") or {}).get("login") != author:
+            continue
+        if review_vendors.summary_review_vendor(comment.get("body")) is not vendor:
+            continue
+        out.append(comment)
+    return sorted(out, key=lambda c: c.get("createdAt") or "")
+
+
+def _split_path_line(token: str) -> tuple[str, int | None]:
+    token = token.strip().rstrip("`,.;:)")
+    match = PATH_LINE_RE.match(token)
+    if match:
+        return match.group("path"), int(match.group("line"))
+    return token, None
+
+
+def _first_sentence(text: str) -> str:
+    text = " ".join(text.split())
+    cut = re.search(r"(?<=[.!?])\s", text)
+    return (text[: cut.start()] if cut else text)[:200]
+
+
+def _assessment_of(text: str) -> str:
+    """The first sentence of ``text``'s first non-empty line, markdown stripped."""
+    for line in text.splitlines():
+        plain = re.sub(r"[*_`]+", "", line)
+        plain = re.sub(r"^[#>\s]+", "", plain).strip()
+        if plain:
+            return _first_sentence(plain)
+    return ""
+
+
+def parse_summary_comment(body: Any) -> dict[str, Any] | None:
+    """Read a review summary posted as a PR comment; None when ``body`` is not one.
+
+    Findings are recognized in two shapes: graded sections (a heading that
+    opens with the grade, ``### Minor: …``, with a ``**File**: \\`path:line\\```
+    field or a blob link inside) and the code-review skill's numbered list
+    (an item of prose ending in a full-sha blob link). A summary with neither
+    shape and no approval phrasing is ``complete: False`` — the agent reads
+    it — rather than a guessed zero.
+    """
+    if review_vendors.summary_review_vendor(body) is None:
+        return None
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    approving = bool(CLAUDE_APPROVING_RE.search(text))
+    findings: list[dict[str, Any]] = []
+    headings = list(SUMMARY_FINDING_HEADING_RE.finditer(text))
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        section = text[heading.end():end]
+        next_heading = re.search(r"^#{1,6}[ \t]", section, re.MULTILINE)
+        if next_heading:
+            section = section[: next_heading.start()]
+        path, line = "(review comment)", None
+        file_match = SUMMARY_FILE_FIELD_RE.search(section)
+        if file_match:
+            path, line = _split_path_line(file_match.group("token"))
+        else:
+            anchor = BLOB_ANCHOR_RE.search(section)
+            if anchor:
+                path, line = anchor.group(1), int(anchor.group(2))
+        findings.append({
+            "severity": SEVERITY_WORDS.get(heading.group("word").lower(), "unknown"),
+            "title": heading.group("title").strip(),
+            "path": path,
+            "line": line,
+            "body": (heading.group(0).strip() + "\n\n" + section.strip()).strip(),
+        })
+    if not findings and not approving:
+        anchors = list(BLOB_ANCHOR_RE.finditer(text))
+        for index, anchor in enumerate(anchors):
+            start = anchors[index - 1].end() if index else 0
+            item = text[start:anchor.start()].strip()
+            lines = [line for line in item.splitlines() if line.strip()]
+            title = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", lines[-1]).strip() if lines else ""
+            findings.append({
+                "severity": severity_in_text(item),
+                "title": title[:200],
+                "path": anchor.group(1),
+                "line": int(anchor.group(2)),
+                "body": text[start:anchor.end()].strip(),
+            })
+    open_findings: int | None = len(findings) if (findings or approving) else None
+    return {
+        "assessment": _assessment_of(text),
+        "approving": approving,
+        "open_findings": open_findings,
+        "findings": findings,
+        "unlinked_findings": 0,
+        "complete": open_findings is not None,
+    }
+
+
+def _newest_review_at(pull_request: dict[str, Any], author: str) -> str:
+    return max(
+        (
+            review.get("submittedAt") or ""
+            for review in filter_reviews(pull_request, author)
+            if review.get("state") not in ("PENDING", "DISMISSED")
+        ),
+        default="",
+    )
+
+
+def _current_summary_comment(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
+    """The newest summary comment, unless a later review by ``author`` supersedes it."""
+    comments = summary_review_comments(pull_request, author)
+    if not comments:
+        return None
+    newest = comments[-1]
+    if (newest.get("createdAt") or "") < _newest_review_at(pull_request, author):
+        return None
+    return newest
+
+
+def summary_comment_findings(
+    pull_request: dict[str, Any], author: str
+) -> list[dict[str, Any]]:
+    """Findings a review summary comment reports, as synthetic current threads.
+
+    The counterpart of ``review_body_findings`` for a reviewer whose whole
+    review is one PR comment (a CI job running Claude Code's /code-review
+    with no inline-comment tool). Only the newest summary counts, and a
+    review posted after it supersedes it, so these entries go stale the same
+    way threads do. The grade the summary gives each finding is annotated
+    directly, so severity ordering and filters see it.
+    """
+    comment = _current_summary_comment(pull_request, author)
+    if comment is None:
+        return []
+    parsed = parse_summary_comment(comment.get("body"))
+    if not parsed or not parsed["findings"]:
+        return []
+    comment_id = comment.get("id") or hashlib.sha1(
+        (comment.get("body") or "").encode()
+    ).hexdigest()[:16]
+    findings = []
+    for index, finding in enumerate(parsed["findings"], start=1):
+        entry = {
+            "id": f"pr-comment:{comment_id}:{index}",
+            "isResolved": False,
+            "isOutdated": False,
+            "isReviewBodyFinding": True,
+            "isSummaryCommentFinding": True,
+            "path": finding["path"],
+            "line": finding["line"],
+            "startLine": None,
+            "originalLine": finding["line"],
+            "originalStartLine": None,
+            "comments": [{
+                "id": f"{comment_id}:{index}",
+                "author": {"login": author},
+                "body": finding["body"],
+                "createdAt": comment.get("createdAt"),
+                "updatedAt": comment.get("createdAt"),
+                "url": comment.get("url"),
+                "path": finding["path"],
+                "line": finding["line"],
+                "startLine": None,
+                "originalLine": finding["line"],
+                "originalStartLine": None,
+                "diffHunk": "",
+            }],
+        }
+        if finding["severity"] != "unknown":
+            entry["reviewerSeverity"] = finding["severity"]
+            entry["reviewerSeveritySource"] = {"review_url": comment.get("url"), "commit": None}
+        findings.append(entry)
+    return findings
+
+
+def summary_comment_overview(
+    pull_request: dict[str, Any], author: str
+) -> dict[str, Any] | None:
+    """The overview record a review summary comment amounts to, or None.
+
+    A comment names no commit, so it covers the head when it was posted
+    after the head commit was made (``commits.committedDate``); a payload
+    without that date takes the newest summary as current, which the
+    timestamp-anchored wait already guarantees for the loop's own cycles.
+    """
+    comment = _current_summary_comment(pull_request, author)
+    if comment is None:
+        return None
+    parsed = parse_summary_comment(comment.get("body"))
+    if parsed is None:
+        return None
+    head = pull_request.get("headRefOid") or ""
+    committed = head_committed_at(pull_request)
+    created = comment.get("createdAt") or ""
+    comment_id = comment.get("id") or hashlib.sha1(
+        (comment.get("body") or "").encode()
+    ).hexdigest()[:16]
+    return {
+        "assessment": parsed["assessment"],
+        "approving": parsed["approving"],
+        "open_findings": parsed["open_findings"],
+        "complete": parsed["complete"],
+        "covers_head": bool(head) and (not committed or created >= committed),
+        "commit": None,
+        "submitted_at": created,
+        "url": comment.get("url"),
+        "finding_ids": [
+            f"pr-comment:{comment_id}:{index}"
+            for index in range(1, len(parsed["findings"]) + 1)
+        ],
+        "unlinked_findings": parsed["unlinked_findings"],
+        "source": "comment",
+    }
+
+
 _PROVENANCE_UNSET = object()
 
 
@@ -1357,6 +1682,60 @@ def parse_copilot_overview(body: Any) -> dict[str, Any] | None:
     }
 
 
+def parse_claude_overview(body: Any) -> dict[str, Any] | None:
+    """Parse a Claude Code review body; None when ``body`` is not one.
+
+    The hosted service's findings are its inline threads (live state), so a
+    review body is ``complete`` as soon as it carries Claude's review marker:
+    ``open_findings`` is the "still open from earlier reviews" count when the
+    body lists one, else 0. A body-less review — the shape of each inline
+    comment the claude-code-action posts — is a complete review of its head
+    with no summary, for the same reason. Hosted severities come from the
+    open-items block (``normal`` is Important).
+    """
+    if not isinstance(body, str):
+        return None
+    if not body.strip():
+        return {
+            "assessment": "", "approving": False, "open_findings": 0,
+            "findings": [], "unlinked_findings": 0, "complete": True,
+        }
+    if not CLAUDE_OVERVIEW_MARKER_RE.search(body):
+        return None
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    text = re.sub(r"<details>.*?</details>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    assessment = _assessment_of(text)
+    open_findings = 0
+    findings: list[dict[str, Any]] = []
+    open_match = CLAUDE_OPEN_ITEMS_RE.search(body)
+    if open_match:
+        open_findings = int(open_match.group("count"))
+        for item in CLAUDE_OPEN_ITEM_LINE_RE.finditer(open_match.group("items")):
+            findings.append({
+                "severity": CLAUDE_OPEN_ITEM_SEVERITIES.get(item.group("severity"), "unknown"),
+                "discussion_id": item.group("id"),
+                "title": f"{item.group('path')}:{item.group('line')}",
+            })
+    return {
+        "assessment": assessment,
+        "approving": bool(CLAUDE_APPROVING_RE.search(text)),
+        "open_findings": open_findings,
+        "findings": findings,
+        "unlinked_findings": max(open_findings - len(findings), 0),
+        "complete": True,
+    }
+
+
+def parse_reviewer_overview(body: Any, author: str) -> dict[str, Any] | None:
+    """Parse ``author``'s review body in its vendor's overview format, or None."""
+    vendor = review_vendors.vendor_for(author)
+    if vendor is review_vendors.CLAUDE:
+        return parse_claude_overview(body)
+    if vendor is review_vendors.COPILOT:
+        return parse_copilot_overview(body)
+    return None
+
+
 def _reviews_oldest_first(pull_request: dict[str, Any], author: str) -> list[dict[str, Any]]:
     """``author``'s submitted reviews, oldest first.
 
@@ -1390,7 +1769,7 @@ def copilot_overview_severities(
     severities: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     for review in _reviews_oldest_first(pull_request, author):
-        parsed = parse_copilot_overview(review.get("body"))
+        parsed = parse_reviewer_overview(review.get("body"), author)
         if parsed is None:
             continue
         for finding in parsed["findings"]:
@@ -1448,14 +1827,25 @@ def _overview_record(review: dict[str, Any], parsed: dict[str, Any] | None, head
 
 
 def reviewer_overview_for(pull_request: dict[str, Any], author: str) -> dict[str, Any] | None:
-    """The reviewer overview, for a review-request vendor (Copilot) only.
+    """The reviewer overview, for vendors whose reviews name their head (Copilot, Claude).
 
-    Only Copilot writes an overview; for comment reviewers (Codex, Gemini)
-    a head review would otherwise come back as a fabricated, unparseable one.
+    For Codex and Gemini a head review would otherwise come back as a
+    fabricated, unparseable one. For a vendor whose verdict may be a
+    top-level comment (Claude), the newer of its head review and its newest
+    summary comment is the current verdict: the action's "No issues found"
+    note posted after the inline findings is what clears the PR.
     """
-    if reviewer_resolver.trigger_kind_for(author) != "review_request":
+    if not reviewer_resolver.head_reviews_for(author):
         return None
-    return latest_reviewer_overview(pull_request, author)
+    overview = latest_reviewer_overview(pull_request, author)
+    if reviewer_resolver.summary_comments_for(author):
+        summary = summary_comment_overview(pull_request, author)
+        if summary is not None and (
+            overview is None
+            or (summary.get("submitted_at") or "") > (overview.get("submitted_at") or "")
+        ):
+            return summary
+    return overview
 
 
 def latest_reviewer_overview(
@@ -1485,9 +1875,9 @@ def latest_reviewer_overview(
 
     for review in newest_first:
         if current(review):
-            return _overview_record(review, parse_copilot_overview(review.get("body")), head)
+            return _overview_record(review, parse_reviewer_overview(review.get("body"), author), head)
     for review in newest_first:
-        parsed = parse_copilot_overview(review.get("body"))
+        parsed = parse_reviewer_overview(review.get("body"), author)
         if parsed is not None:
             record = _overview_record(review, parsed, head)
             if record["covers_head"] and not current(review):
@@ -1513,22 +1903,23 @@ def clean_blocked_by(
     threads: list[dict[str, Any]],
     overview: dict[str, Any] | None,
     *,
-    review_request_vendor: bool,
+    head_review_vendor: bool,
     known_thread_ids: set[str] | None = None,
 ) -> str | None:
-    """Why zero actionable threads is *not yet* clean for a review-request vendor.
+    """Why zero actionable threads is *not yet* clean for a head-reviewing vendor.
 
     Threads always win: with any actionable thread the gate does not apply,
-    and the overview is never a reason to drop one. With none, a Copilot PR
-    is clean when a complete overview on the current head reports zero open
-    findings, or when every finding it does report has a thread on the PR
-    (``known_thread_ids``, any state): the overview is a snapshot taken at
-    review time, thread state is live, and the normal classification already
-    decided those threads (spec §5.3). A reported finding the fetch never saw
-    — no thread link, or a link to a thread that is not on the PR — still
-    blocks. Comment vendors have no overview gate.
+    and the overview is never a reason to drop one. With none, a Copilot or
+    Claude PR is clean when a complete overview on the current head reports
+    zero open findings, or when every finding it does report has a thread on
+    the PR (``known_thread_ids``, any state): the overview is a snapshot
+    taken at review time, thread state is live, and the normal
+    classification already decided those threads (spec §5.3). A reported
+    finding the fetch never saw — no thread link, or a link to a thread that
+    is not on the PR — still blocks. Vendors whose reviews name no commit
+    (Codex, Gemini) have no overview gate.
     """
-    if threads or not review_request_vendor:
+    if threads or not head_review_vendor:
         return None
     if overview is None or not overview.get("covers_head"):
         return "no_review_for_head"
@@ -1908,6 +2299,9 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
     the right reviewer and then never match its review, because review and
     thread filtering compare authors exactly against this value.
     """
+    # A login bound to a vendor (--reviewer-vendor) is known only through the
+    # record; restore the binding before any vendor lookup below.
+    reviewer_resolver.bind_from_record(record)
     login = reviewer_resolver.canonical_login(record["login"])
     known_display_name = reviewer_resolver.display_name_for(login)
     display_name = record.get("display_name") or known_display_name
@@ -1920,7 +2314,7 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
     review_trigger = None
     if trigger_kind == "comment":
         review_trigger = record.get("review_trigger") or reviewer_resolver.trigger_for(login)
-    return {
+    state = {
         "login": login,
         "display_name": display_name,
         "review_trigger": review_trigger,
@@ -1934,6 +2328,11 @@ def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str
         "configured": source not in {"default_unconfirmed", "none_configured"},
         "candidates_partial": False,
     }
+    # Which known vendor's trigger and formats apply when the login is not
+    # the vendor's own (a CI job posting Claude's review as github-actions).
+    if review_vendors.bound_login(login):
+        state["vendor"] = reviewer_resolver.vendor_key_for(login)
+    return state
 
 
 def resolve_reviewer_selection(args: argparse.Namespace, pr: PullRequest) -> dict[str, Any]:
@@ -1945,6 +2344,7 @@ def resolve_reviewer_selection(args: argparse.Namespace, pr: PullRequest) -> dic
             display_name=args.reviewer_name,
             review_trigger=args.review_trigger_mention,
             source=source,
+            vendor=args.reviewer_vendor,
         )
         save_reviewer_selection(pr, record)
         return reviewer_selection_state(record, source=source)
@@ -2272,6 +2672,11 @@ def _latest_submitted_after(
             for r in filter_reviews(pull_request, author)
             if isinstance(r.get("submittedAt"), str)
         ]
+        times.extend(
+            c.get("createdAt")
+            for c in summary_review_comments(pull_request, author)
+            if isinstance(c.get("createdAt"), str)
+        )
     except (AttributeError, TypeError):
         return None
     if after_iso:
@@ -3185,10 +3590,20 @@ def review_activity_fingerprint(
             )
         ]
 
-    if not reviews and not authored_threads:
+    # A vendor whose verdict can be a top-level comment (Claude's "no issues"
+    # note, a CI job's review summary) would otherwise leave a clean pass
+    # invisible here and burn the whole wait. The action's in-progress
+    # tracking comment is not a finished review and never counts.
+    summaries = summary_review_comments(pull_request, author)
+    if after_iso:
+        summaries = [c for c in summaries if (c.get("createdAt") or "") > after_iso]
+
+    if not reviews and not authored_threads and not summaries:
         return None
 
-    payload = {"reviews": reviews, "threads": authored_threads}
+    payload: dict[str, Any] = {"reviews": reviews, "threads": authored_threads}
+    if summaries:
+        payload["comments"] = summaries
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -3698,6 +4113,15 @@ def main() -> int:
         "--reviewer-name",
         default=None,
         help=f"Human-readable reviewer name for output. Default: {DEFAULT_PROVIDER_NAME!r}.",
+    )
+    parser.add_argument(
+        "--reviewer-vendor",
+        default=None,
+        help=(
+            "With --reviewer: treat that login as this known vendor (e.g. claude) "
+            "when it is not the vendor's own login, such as a CI job posting "
+            "Claude Code's review as github-actions[bot]. Persisted with the selection."
+        ),
     )
     parser.add_argument(
         "--review-trigger-mention",
@@ -4226,13 +4650,24 @@ def main() -> int:
                             " (requested, not yet reviewed)"
                             if candidate.source == "requested" else ""
                         )
+                        if candidate.vendor:
+                            note += (
+                                f" (select with --reviewer {candidate.login} "
+                                f"--reviewer-vendor {candidate.vendor})"
+                            )
                         print(f"- {candidate.display_name} `{candidate.login}` trigger={trigger}{note}")
                 elif partial:
                     print("[loop] Reviewer discovery incomplete; retry or select a reviewer manually.")
                 else:
                     print("[loop] No AI reviewer threads found on this PR.")
             return 0
-        reviewer_selection = resolve_reviewer_selection(args, pr)
+        try:
+            reviewer_selection = resolve_reviewer_selection(args, pr)
+        except ValueError as exc:
+            # --reviewer-vendor named an unknown vendor, or a login that is
+            # another vendor's own.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         args.author = reviewer_selection["login"]
         args.reviewer_name = reviewer_selection["display_name"]
         args.review_trigger_mention = reviewer_selection.get("review_trigger")
@@ -4411,6 +4846,10 @@ def main() -> int:
         # Findings the reviewer wrote into the review body have no thread to
         # fetch, so they are appended as synthetic current feedback.
         threads.extend(review_body_findings(pull_request, args.author))
+        # Likewise findings a reviewer reported in a summary posted as a PR
+        # comment (a CI job running Claude Code's /code-review).
+        summary_findings = summary_comment_findings(pull_request, args.author)
+        threads.extend(summary_findings)
         # Copilot grades findings in its overview, not inline; annotate before
         # sorting so severity ordering and filters see the grade. Additive:
         # an unparseable overview leaves every thread listed as `unknown`.
@@ -4423,9 +4862,17 @@ def main() -> int:
             reviewer_overview["warnings"] = overview_warnings
         for warning in overview_warnings:
             print(f"warning: {warning}", file=sys.stderr)
+        head_review_vendor = reviewer_resolver.head_reviews_for(args.author)
         review_request_vendor = (
             reviewer_resolver.trigger_kind_for(args.author) == "review_request"
         )
+        # Every finding the fetch can account for, in any state: thread
+        # discussion ids plus the synthetic ids of summary-comment findings,
+        # so a summary finding filtered out by --min-severity reads as
+        # dispositioned the way a filtered Copilot thread does.
+        known_finding_ids = discussion_ids_on_pr(pull_request) | {
+            finding["id"] for finding in summary_findings
+        }
         threads = sort_by_severity(threads)
         if not args.record_run and not args.stats:
             try:
@@ -4643,8 +5090,8 @@ def main() -> int:
                 gemini_confirmed=args.gemini_confirmed,
                 likely_fixed_remaining=likely_fixed_remaining,
                 clean_blocked=clean_blocked_by(
-                    threads, reviewer_overview, review_request_vendor=review_request_vendor,
-                    known_thread_ids=discussion_ids_on_pr(pull_request),
+                    threads, reviewer_overview, head_review_vendor=head_review_vendor,
+                    known_thread_ids=known_finding_ids,
                 ),
             )
             derived = derive_record_fields(
@@ -4966,8 +5413,8 @@ def main() -> int:
                         # clean (spec §5.3); null means no block from here.
                         "cleanBlockedBy": clean_blocked_by(
                             threads, reviewer_overview,
-                            review_request_vendor=review_request_vendor,
-                            known_thread_ids=discussion_ids_on_pr(pull_request),
+                            head_review_vendor=head_review_vendor,
+                            known_thread_ids=known_finding_ids,
                         ),
                         # Script-owned narration ordinal (#104): copy it into
                         # "session cycle N" lines; never model-compute it.
@@ -5053,7 +5500,7 @@ def main() -> int:
                 count_text = f"{count} open finding{'' if count == 1 else 's'}"
                 coverage = (
                     "covers head" if reviewer_overview["covers_head"]
-                    else f"stale: {(reviewer_overview['commit'] or '')[:7]}"
+                    else f"stale: {(reviewer_overview['commit'] or 'comment')[:7]}"
                 )
             print(
                 color_loop_block(
@@ -5064,8 +5511,8 @@ def main() -> int:
                 )
             )
         blocked = clean_blocked_by(
-            threads, reviewer_overview, review_request_vendor=review_request_vendor,
-            known_thread_ids=discussion_ids_on_pr(pull_request),
+            threads, reviewer_overview, head_review_vendor=head_review_vendor,
+            known_thread_ids=known_finding_ids,
         )
         if blocked:
             print(

@@ -94,6 +94,12 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
     --reviewer coderabbitai --reviewer-source confirmed --reviewer-name CodeRabbit \
     --review-trigger-mention @coderabbitai
 
+# A CI job that posts Claude Code's review summary under its own login
+# (discovery shows it as "Claude Code (as github-actions)", vendor: claude):
+# bind the login to Claude's trigger and formats. Stored with the selection.
+python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
+    --reviewer github-actions --reviewer-vendor claude --reviewer-source confirmed
+
 # Reset reviewer selection for this PR
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --reset-reviewer
 ```

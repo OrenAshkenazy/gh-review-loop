@@ -1,7 +1,7 @@
 {
   "name": "gh-review-loop",
   "version": "0.4.5",
-  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review \u2014 hard-capped at 3 re-review requests. Offers Codex first; any reviewer bot can be configured.",
+  "description": "Clears AI reviewer feedback on your PR: reads real review-thread state, sweeps the sibling instances the reviewer missed, gates every push on your repo's own tests, then requests re-review \u2014 hard-capped at 3 re-review requests. Claude Code, Codex, Gemini and Copilot built in; any reviewer bot can be configured.",
   "author": {
     "name": "Oren Ashkenazy",
     "email": "oren.as@gmail.com",
@@ -18,6 +18,7 @@
     "codex",
     "coderabbit",
     "copilot",
+    "claude-code-review",
     "review-bot",
     "gh-cli",
     "claude-code-plugin",
@@ -29,7 +30,7 @@
   "interface": {
     "displayName": "GH Review Loop",
     "shortDescription": "Capped AI PR review fix loop",
-    "longDescription": "Clears AI reviewer feedback on a GitHub PR without leaving your coding agent. Waits for the configured reviewer (Codex, CodeRabbit, Copilot, or any compatible bot), reads real review-thread state via GraphQL so resolved, outdated, and already-answered threads are skipped, then fixes what is actionable in severity order. Findings are clustered by kind, so a pattern flagged at two sites gets swept across the PR's changed files in one cycle instead of dripping back over three reviews. Every fix is gated on your repository's own tests and linters before it is pushed, and re-review requests are hard-capped (default 3) so the loop cannot spam the PR. Optional per-finding triage flags false positives before you spend a cycle on them, and each run leaves an audit trail plus local stats.",
+    "longDescription": "Clears AI reviewer feedback on a GitHub PR without leaving your coding agent. Waits for the configured reviewer (Claude Code, Codex, CodeRabbit, Copilot, or any compatible bot), reads real review-thread state via GraphQL so resolved, outdated, and already-answered threads are skipped, then fixes what is actionable in severity order. Findings are clustered by kind, so a pattern flagged at two sites gets swept across the PR's changed files in one cycle instead of dripping back over three reviews. Every fix is gated on your repository's own tests and linters before it is pushed, and re-review requests are hard-capped (default 3) so the loop cannot spam the PR. Optional per-finding triage flags false positives before you spend a cycle on them, and each run leaves an audit trail plus local stats.",
     "developerName": "Oren Ashkenazy",
     "category": "Developer Tools",
     "capabilities": [
