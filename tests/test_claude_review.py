@@ -138,15 +138,18 @@ def _thread(thread_id, discussion_id, body, path="src/a.py", author=CLAUDE):
     }
 
 
-def _pr(*, reviews=(), comments=(), threads=(), head=OLD_HEAD, committed=None):
+def _pr(*, reviews=(), comments=(), threads=(), head=OLD_HEAD, committed=None, checks=()):
     pr = {
         "headRefOid": head,
         "reviews": {"nodes": list(reviews)},
         "comments": {"nodes": list(comments)},
         "reviewThreads": {"nodes": list(threads)},
     }
-    if committed:
-        pr["commits"] = {"nodes": [{"commit": {"committedDate": committed}}]}
+    if committed or checks:
+        commit = {"committedDate": committed}
+        if checks:
+            commit["statusCheckRollup"] = {"contexts": {"nodes": list(checks)}}
+        pr["commits"] = {"nodes": [{"commit": commit}]}
     return pr
 
 
@@ -375,6 +378,29 @@ def test_the_code_review_skills_numbered_list_yields_a_finding_per_blob_link():
     assert parsed["findings"][1]["title"].startswith("Memory leak")
 
 
+def test_numbered_findings_survive_an_approving_verdict():
+    """A summary can approve and still list a finding; the verdict is not
+    evidence of a zero-finding review (PR #121 review)."""
+    parsed = parse_summary_comment(SKILL_LIST_SUMMARY.replace("## Code review", "## Code review\n\n**APPROVED** ✅"))
+
+    assert parsed["approving"] is True
+    assert parsed["open_findings"] == 2
+    assert [f["line"] for f in parsed["findings"]] == [67, 88]
+
+
+def test_a_blob_link_in_prose_is_not_a_finding():
+    body = (
+        "## Code review\n\n**What changed:** the session builder at\n"
+        "https://github.com/acme/widget/blob/abc123abc123abc123abc123abc123abc123abc1/src/auth.ts#L67-L72\n"
+        "now recovers results.\n\nNo issues found.\n\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert parsed["findings"] == []
+    assert parsed["approving"] is True
+    assert parsed["open_findings"] == 0
+
+
 def test_a_summary_with_neither_findings_nor_approval_is_incomplete_not_zero():
     parsed = parse_summary_comment("## Code review\n\nFound 3 issues, see the job log.\n\n<!-- review:complete -->")
 
@@ -507,6 +533,30 @@ def test_a_summary_older_than_the_head_commit_does_not_cover_the_head():
     assert reviewer_overview_for(_pr(comments=[stale_note], head=NEW_HEAD), CLAUDE)["covers_head"] is True
 
 
+def test_a_summary_posted_before_the_head_was_pushed_does_not_cover_it():
+    """Committed at 09:00, pushed at 11:00 (the head's first check suite):
+    a clean note at 10:00 reviewed the previous head (PR #121 review)."""
+    checks = [
+        {"__typename": "CheckRun", "startedAt": "2026-10-20T11:00:40Z",
+         "checkSuite": {"createdAt": "2026-10-20T11:00:05Z"}},
+        {"__typename": "StatusContext", "createdAt": "2026-10-20T11:02:00Z"},
+    ]
+    between = _comment(ACTION_CLEAN_NOTE, "2026-10-20T10:00:00Z")
+    after = _comment(ACTION_CLEAN_NOTE, "2026-10-20T11:30:00Z", comment_id="IC_2")
+
+    assert fgt.head_arrived_at(_pr(committed="2026-10-20T09:00:00Z", checks=checks)) == "2026-10-20T11:00:05Z"
+    assert reviewer_overview_for(
+        _pr(comments=[between], head=NEW_HEAD, committed="2026-10-20T09:00:00Z", checks=checks), CLAUDE
+    )["covers_head"] is False
+    assert reviewer_overview_for(
+        _pr(comments=[between, after], head=NEW_HEAD, committed="2026-10-20T09:00:00Z", checks=checks), CLAUDE
+    )["covers_head"] is True
+    # A check older than the commit (a rebased head keeps no such check, but
+    # a payload could) never moves the boundary backwards.
+    early = [{"__typename": "StatusContext", "createdAt": "2026-10-20T08:00:00Z"}]
+    assert fgt.head_arrived_at(_pr(committed="2026-10-20T09:00:00Z", checks=early)) == "2026-10-20T09:00:00Z"
+
+
 def test_claude_has_the_copilot_clean_gate_and_codex_does_not():
     head_review = _review(CLEAN_REVIEW, "2026-10-20T18:41:00Z", commit=NEW_HEAD)
     assert reviewer_overview_for(_pr(reviews=[head_review], head=NEW_HEAD), CLAUDE)["covers_head"] is True
@@ -558,6 +608,21 @@ def test_claudes_own_clean_note_is_discovered_without_a_binding():
 
     assert [(c.login, c.source, c.vendor) for c in candidates] == [("claude", "comment", None)]
     assert "vendor" not in candidates[0].to_dict()
+
+
+def test_a_login_seen_as_a_review_author_keeps_its_source_and_gains_the_vendor():
+    """A job that posts an inline review and a summary under one login is
+    still Claude's reviewer; the earlier, stronger source stays (PR #121 review)."""
+    pr = _pr(
+        reviews=[_review("", "2026-10-21T07:09:00Z", author="github-actions")],
+        comments=[_comment(CI_SUMMARY, "2026-10-21T07:09:01Z", author="github-actions", comment_id="IC_r")],
+    )
+
+    candidates = reviewer_resolver.discover_candidates(pr, self_login=None)
+
+    assert [(c.login, c.source, c.vendor, c.display_name, c.review_trigger) for c in candidates] == [
+        ("github-actions", "review", "claude", "Claude Code (as github-actions)", "@claude"),
+    ]
 
 
 def test_a_login_seen_in_a_thread_keeps_that_source():
@@ -623,6 +688,45 @@ def test_a_head_claude_already_reviewed_is_not_pinged_again(monkeypatch, capsys)
     assert payload["status"] == "already_reviewed_head"
     assert payload["posted"] is False
     assert payload["head"] == NEW_HEAD
+
+
+def test_the_dedupe_matches_the_selected_login_not_the_vendor(monkeypatch, capsys):
+    """Hosted Claude reviewed the head as claude[bot]; the selected reviewer is
+    the CI job bound as github-actions, which has not. The fetch filters by
+    that login, so the ping must go out (PR #121 review)."""
+    monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: NEW_HEAD)
+    monkeypatch.setattr(
+        request_rereview, "_all_reviews",
+        lambda *a, **k: [
+            {"user": {"login": "claude[bot]"}, "state": "COMMENTED", "commit_id": NEW_HEAD, "submitted_at": "2026-10-20T18:41:00Z"},
+        ],
+    )
+    posted = {}
+    monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
+        posted.update(phrase=phrase) or {"created_at": "2026-10-20T18:50:00Z", "repo": repo, "pr": pr, "phrase": phrase}
+    ))
+
+    assert request_rereview.main([
+        "--repo", "acme/widget", "--pr", "159",
+        "--reviewer-login", "github-actions", "--reviewer-vendor", "claude", "--json",
+    ]) == 0
+    assert posted["phrase"] == "@claude review"
+    capsys.readouterr()
+
+    # The job's own head review, under either REST spelling, does dedupe.
+    for spelling in ("github-actions[bot]", "GitHub-Actions"):
+        monkeypatch.setattr(
+            request_rereview, "_all_reviews",
+            lambda *a, _s=spelling, **k: [
+                {"user": {"login": _s}, "state": "COMMENTED", "commit_id": NEW_HEAD, "submitted_at": "2026-10-20T18:41:00Z"},
+            ],
+        )
+        monkeypatch.setattr(request_rereview, "post_rereview", lambda *a, **k: pytest.fail("already reviewed"))
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "159",
+            "--reviewer-login", "github-actions", "--reviewer-vendor", "claude", "--json",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "already_reviewed_head"
 
 
 def test_a_dismissed_or_stale_claude_review_does_not_block_the_ping(monkeypatch, capsys):

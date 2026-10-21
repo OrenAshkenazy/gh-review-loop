@@ -810,20 +810,41 @@ def _all_reviews(repo: str, pr: int, runner: Any) -> list[dict[str, Any]] | None
     return [review for review in reviews if isinstance(review, dict)]
 
 
+def _same_review_author(author: str | None, login: str | None) -> bool:
+    """Whether a review's author is ``login``, across API spellings.
+
+    REST writes ``claude[bot]`` where GraphQL writes ``claude``; logins are
+    case-insensitive.
+    """
+    def normalized(value: str | None) -> str:
+        value = (value or "").strip().lstrip("@")
+        if value.endswith("[bot]"):
+            value = value[: -len("[bot]")]
+        return value.casefold()
+
+    return bool(author) and bool(login) and normalized(author) == normalized(login)
+
+
 def head_already_reviewed(
     repo: str,
     pr: int,
     vendor: review_vendors.ReviewVendor,
     *,
+    login: str | None = None,
     head: str | None = None,
     runner: Any = None,
 ) -> str | None:
-    """The head sha when a standing ``vendor`` review already covers it, else None.
+    """The head sha when a standing review by ``login`` already covers it, else None.
 
-    For comment vendors with head-anchored reviews. A read that fails returns
-    None too: without the dedupe the ping is still what it always was, and
-    the hosted Claude service drops a request made while it is already
-    reviewing the head, so an unreadable state costs at most one extra ping.
+    For comment vendors with head-anchored reviews. The match is on the
+    selected login, not the vendor: a PR with both hosted Claude reviews and
+    a CI job bound as ``github-actions`` must not take a ``claude[bot]`` head
+    review as the job's, since the fetch filters by that login and would
+    keep reporting ``no_review_for_head`` (PR #121 review). ``login``
+    defaults to the vendor's own. A read that fails returns None too:
+    without the dedupe the ping is still what it always was, and the hosted
+    Claude service drops a request made while it is already reviewing the
+    head, so an unreadable state costs at most one extra ping.
     """
     if runner is None:
         runner = subprocess.run
@@ -835,7 +856,7 @@ def head_already_reviewed(
     if reviews is None:
         return None
     for review in reviews:
-        if review_vendors.vendor_for(_review_author(review)) is not vendor:
+        if not _same_review_author(_review_author(review), login or vendor.login):
             continue
         if review.get("state") in ("PENDING", "DISMISSED"):
             continue
@@ -2304,7 +2325,9 @@ def main(argv: list[str] | None = None) -> int:
     # push answers before the loop asks. Pinging again would buy a second,
     # redundant review, so the comment is skipped and the loop fetches.
     if vendor is not None and vendor.head_reviews and not args.dry_run:
-        reviewed_head = head_already_reviewed(args.repo, args.pr, vendor, head=head)
+        reviewed_head = head_already_reviewed(
+            args.repo, args.pr, vendor, login=reviewer_login, head=head
+        )
         if reviewed_head:
             _emit(already_reviewed_payload(args.repo, args.pr, reviewer_login or vendor.login, reviewed_head),
                   json_output=args.json_output)
