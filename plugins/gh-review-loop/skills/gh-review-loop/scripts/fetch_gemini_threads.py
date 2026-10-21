@@ -195,15 +195,46 @@ CLAUDE_OPEN_ITEM_SEVERITIES = {
 }
 # Approval phrasing from the hosted service ("**Nothing blocking.**", "**No
 # new blocking issues.**", "I found no bugs in this version", "Code review
-# found no issues"), the action's code-review skill ("No issues found.
-# Checked for bugs and CLAUDE.md compliance.") and summary verdict lines.
-# Informational, as for Copilot: the clean gate reads open_findings.
-CLAUDE_APPROVING_RE = re.compile(
+# found no issues") and the action's code-review skill ("No issues found.
+# Checked for bugs and CLAUDE.md compliance."). A summary's verdict line
+# ("**Verdict:** 0 Critical, 0 Warnings — Approve", "**APPROVED** ✅")
+# counts only when it is affirmative: "Do not approve" names the word and
+# means the opposite (PR #121 review). Informational beyond the summary
+# gate, as for Copilot: the clean gate reads open_findings.
+CLAUDE_CLEAN_PHRASE_RE = re.compile(
     r"(?:\bno (?:new )?(?:blocking )?(?:issues|bugs|problems)(?: were)?(?: found)?\b"
-    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b"
-    r"|\*\*Verdict:?\*\*:?[^\n]*\bApprove[d]?\b|\*\*APPROVED\*\*)",
+    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b)",
     re.IGNORECASE,
 )
+SUMMARY_VERDICT_LINE_RE = re.compile(r"\*\*Verdict:?\*\*:?[ \t]*(?P<text>[^\n]*)", re.IGNORECASE)
+SUMMARY_VERDICT_APPROVES_RE = re.compile(r"\bApproved?\b", re.IGNORECASE)
+SUMMARY_VERDICT_NEGATED_RE = re.compile(
+    r"\b(?:do not|don't|does not|doesn't|not|never|cannot|can't|no|reject(?:ed)?|"
+    r"request(?:s|ing|ed)? changes|block(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+SUMMARY_APPROVED_BADGE_RE = re.compile(r"\*\*APPROVED\*\*")
+
+
+def summary_approves(text: str) -> bool:
+    """Whether a review summary's own wording approves the change.
+
+    A clean phrase anywhere counts. A verdict line counts only when it says
+    approve and nothing on the line negates it, so "**Verdict:** Do not
+    approve" is not approval. A summary that approves nowhere and lists no
+    recognizable finding stays incomplete for the agent to read.
+    """
+    if CLAUDE_CLEAN_PHRASE_RE.search(text):
+        return True
+    for verdict in SUMMARY_VERDICT_LINE_RE.finditer(text):
+        line = verdict.group("text")
+        if SUMMARY_VERDICT_APPROVES_RE.search(line) and not SUMMARY_VERDICT_NEGATED_RE.search(line):
+            return True
+    return bool(SUMMARY_APPROVED_BADGE_RE.search(text))
+
+
+# Back-compat name: callers that only need "does this body approve".
+CLAUDE_APPROVING_RE = CLAUDE_CLEAN_PHRASE_RE
 
 # Page sizes embedded in QUERY below. Used by the pagination guard to detect
 # when we may be silently dropping data.
@@ -1441,7 +1472,7 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
     if review_vendors.summary_review_vendor(body) is None:
         return None
     text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    approving = bool(CLAUDE_APPROVING_RE.search(text))
+    approving = summary_approves(text)
     findings: list[dict[str, Any]] = []
     headings = list(SUMMARY_FINDING_HEADING_RE.finditer(text))
     for index, heading in enumerate(headings):
@@ -1764,7 +1795,7 @@ def parse_claude_overview(body: Any) -> dict[str, Any] | None:
             })
     return {
         "assessment": assessment,
-        "approving": bool(CLAUDE_APPROVING_RE.search(text)),
+        "approving": summary_approves(text),
         "open_findings": open_findings,
         "findings": findings,
         "unlinked_findings": max(open_findings - len(findings), 0),

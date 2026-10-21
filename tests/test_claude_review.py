@@ -401,6 +401,41 @@ def test_a_blob_link_in_prose_is_not_a_finding():
     assert parsed["open_findings"] == 0
 
 
+@pytest.mark.parametrize("verdict", [
+    "**Verdict:** Do not approve — the retry loop never backs off.",
+    "**Verdict:** Not approved. 1 Critical, 0 Warnings.",
+    "**Verdict:** Approve? No: the migration drops a column.",
+    "**Verdict:** Request changes before approval.",
+    "**NOT APPROVED** ❌",
+])
+def test_a_negated_verdict_is_not_approval_and_leaves_the_summary_incomplete(verdict):
+    """"Do not approve" names the word and means the opposite; with the
+    problems written as prose the summary must stay for the agent to read,
+    not become a zero-finding review (PR #121 review)."""
+    body = f"## Code review — PR #9\n\nThe retry loop in `net/retry.go` never backs off.\n\n{verdict}\n<!-- review:complete -->"
+    parsed = parse_summary_comment(body)
+
+    assert parsed["approving"] is False
+    assert parsed["findings"] == []
+    assert parsed["open_findings"] is None
+    assert parsed["complete"] is False
+
+
+@pytest.mark.parametrize("verdict", [
+    "**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve",
+    "**Verdict:** Approved",
+    "**Verdict**: approve",
+    "**APPROVED** ✅",
+])
+def test_an_affirmative_verdict_still_approves(verdict):
+    body = f"## Code review — PR #9\n\nLooks consistent.\n\n{verdict}\n<!-- review:complete -->"
+    parsed = parse_summary_comment(body)
+
+    assert parsed["approving"] is True
+    assert parsed["open_findings"] == 0
+    assert parsed["complete"] is True
+
+
 def test_a_summary_with_neither_findings_nor_approval_is_incomplete_not_zero():
     parsed = parse_summary_comment("## Code review\n\nFound 3 issues, see the job log.\n\n<!-- review:complete -->")
 
