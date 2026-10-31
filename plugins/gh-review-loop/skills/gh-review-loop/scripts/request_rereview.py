@@ -122,6 +122,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
           commit {
             committedDate
             statusCheckRollup {
+              state
               contexts(first:50) {
                 nodes {
                   __typename
@@ -961,6 +962,11 @@ def summary_review_state(
     and a trigger the action already answered with its own finished reply did
     not prompt the summary after it: without that, a loop that pings from its
     first fix would never see two unasked summaries.
+    ``push_reviewed``: the first summary covering the head came unasked, and
+    was not the PR's opening review (cycle 0, free): the push was the request.
+    ``checks_done``: every check on the head has finished (rollup state
+    SUCCESS, FAILURE or ERROR), so a push review not posted by now is not
+    coming; no rollup yet, or one still pending, is not done.
     """
     arrived = reviewer_resolver.head_arrived_at(pull_request)
     trigger = _trigger_re(vendor.mention)
@@ -968,7 +974,7 @@ def summary_review_state(
         (c for c in (pull_request.get("comments") or {}).get("nodes") or [] if isinstance(c, dict)),
         key=lambda c: c.get("createdAt") or "",
     )
-    covers_head, unprompted, prompted = False, 0, False
+    covers_head, push_reviewed, unprompted, prompted, seen = False, False, 0, False, 0
     for comment in comments:
         body = comment.get("body") or ""
         if _same_review_author((comment.get("author") or {}).get("login"), login):
@@ -977,17 +983,50 @@ def summary_review_state(
                     prompted = False
                 continue
             unprompted += 0 if prompted else 1
-            prompted = False
-            if arrived and (comment.get("createdAt") or "") >= arrived:
+            if arrived and not covers_head and (comment.get("createdAt") or "") >= arrived:
                 covers_head = True
+                push_reviewed = not prompted and seen > 0
+            seen += 1
+            prompted = False
         elif trigger.search(body):
             prompted = True
     return {
         "head": pull_request.get("headRefOid") or "",
         "arrived_at": arrived,
         "covers_head": covers_head,
+        "push_reviewed": push_reviewed,
         "reviews_on_push": unprompted >= 2,
+        "checks_done": _head_rollup_state(pull_request) in {"SUCCESS", "FAILURE", "ERROR"},
     }
+
+
+def _head_rollup_state(pull_request: dict[str, Any]) -> str | None:
+    nodes = (pull_request.get("commits") or {}).get("nodes") or []
+    for node in reversed(nodes):
+        if isinstance(node, dict):
+            rollup = (node.get("commit") or {}).get("statusCheckRollup") or {}
+            state = rollup.get("state") if isinstance(rollup, dict) else None
+            return state if isinstance(state, str) else None
+    return None
+
+
+def push_wait_expired(wait: dict[str, Any], now: str) -> bool:
+    """Has a push-review wait outlived the loop's own wait for it?
+
+    The skill waits ``--timeout 1800`` for the review; a retry after that
+    finds no review, so the push review is not coming (a job stuck queued, or
+    one whose check never reports). An unreadable time is expired: a wait
+    that cannot be dated must not hold the loop forever.
+    """
+    since, current = _parse_iso(wait.get("at") or ""), _parse_iso(now)
+    if since is None or current is None:
+        return True
+    return (current - since).total_seconds() > PUSH_REVIEW_WAIT_SECONDS
+
+
+# How long a push-review wait holds before the loop may ping instead: the
+# skill's own --wait --timeout for that review.
+PUSH_REVIEW_WAIT_SECONDS = 1800
 
 
 def recorded_push_waits(repo: str, pr: int, vendor: review_vendors.ReviewVendor) -> list[dict[str, Any]] | None:
@@ -995,11 +1034,12 @@ def recorded_push_waits(repo: str, pr: int, vendor: review_vendors.ReviewVendor)
 
 
 def record_push_review_wait(repo: str, pr: int, reviewer: str, head: str, at: str) -> None:
-    """Record waiting on the push review as this cycle's request, once per head.
+    """Record the push review as this cycle's request, once per head.
 
-    The wait stands where a ping would have been posted, so it closes the
-    cycle and counts toward the cap the same way; without it a repository
-    that reviews every push would leave the loop uncapped.
+    Whether the loop waits for it or it had already answered, the push review
+    stands where a ping would have been posted, so it closes the cycle and
+    counts toward the cap the same way; without it a repository that reviews
+    every push would leave the loop uncapped.
     """
     logged = loop_state.append_request_log(repo, pr, {
         "reviewer": reviewer, "at": at, "countable": True, "via": "push", "head": head,
@@ -2491,7 +2531,9 @@ def main(argv: list[str] | None = None) -> int:
     # Code) never submits a review the check above could see. Its summaries
     # answer the same question, and tell whether the repository reviews every
     # push, in which case the loop waits for that review instead of pinging.
-    # A torn local log leaves earlier waits uncountable: ping, as before.
+    # Either way the push review is the cycle's request and is recorded once
+    # per head. A torn local log leaves earlier waits uncountable: ping, as
+    # before.
     push_waits: list[dict[str, Any]] | None = None
     push_wait: dict[str, Any] | None = None
     if vendor is not None and vendor.summary_comments and not args.dry_run:
@@ -2499,16 +2541,25 @@ def main(argv: list[str] | None = None) -> int:
         pull = read_summary_pull_request(args.repo, args.pr)
         summary = summary_review_state(pull, vendor, login=reviewer_login or vendor.login) if pull else None
         if summary and summary["head"] and (head is None or summary["head"] == head):
+            reviewer = reviewer_login or vendor.login
+            earlier = [w for w in push_waits or [] if w.get("head") == summary["head"]]
             if summary["covers_head"]:
-                _emit(already_reviewed_payload(args.repo, args.pr, reviewer_login or vendor.login, summary["head"]),
+                if summary["push_reviewed"] and push_waits is not None and not earlier:
+                    record_push_review_wait(args.repo, args.pr, reviewer, summary["head"], utc_now_iso())
+                _emit(already_reviewed_payload(args.repo, args.pr, reviewer, summary["head"]),
                       json_output=args.json_output)
                 return 0
             if summary["reviews_on_push"] and summary["arrived_at"] and push_waits is not None:
-                push_wait = summary
-                if any(wait.get("head") == summary["head"] for wait in push_waits):
+                # The first request for a head always waits: right after a push
+                # the job's check may not exist yet. A retry waits only while
+                # the head's checks run and the wait is younger than the
+                # loop's own wait for it; otherwise nothing is coming: ping.
+                if not earlier:
+                    push_wait = summary
+                elif not summary["checks_done"] and not push_wait_expired(earlier[-1], utc_now_iso()):
                     # Already waiting on this head, and already counted.
                     _emit(push_review_pending_payload(
-                        args.repo, args.pr, reviewer_login or vendor.login, summary["head"], summary["arrived_at"],
+                        args.repo, args.pr, reviewer, summary["head"], summary["arrived_at"],
                     ), json_output=args.json_output)
                     return 0
 

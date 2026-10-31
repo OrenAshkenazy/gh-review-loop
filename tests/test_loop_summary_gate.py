@@ -210,6 +210,18 @@ class TestPushTarget:
     def test_the_push_runs_where_the_command_says(self, command, cwd, expected):
         assert push_target_dir(command, cwd) == expected
 
+    @pytest.mark.parametrize("command, cwd, expected", [
+        ("cd plugins && cd .. && git push", "/base", "/base"),
+        ("cd /a && cd b && git push", "/base", "/a/b"),
+        ("cd a && git -C b push", "/base", "/base/a/b"),
+        ("cd /a && cd - && git push", "/base", "/base"),
+    ])
+    def test_each_cd_moves_from_where_the_last_one_left(self, command, cwd, expected):
+        """Resolving only the last `cd` against the session's directory sent
+        `cd plugins && cd .. && git push` to the directory above the repo, so
+        the gate checked the wrong repo and let the push through."""
+        assert push_target_dir(command, cwd) == expected
+
     def test_a_tilde_target_is_expanded(self):
         assert push_target_dir("cd ~/clone && git push", None) == os.path.expanduser("~/clone")
 

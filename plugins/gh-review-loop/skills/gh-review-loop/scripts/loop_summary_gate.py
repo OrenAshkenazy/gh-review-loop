@@ -51,29 +51,39 @@ _GIT_PUSH_RE = re.compile(r"\bgit\s+(?:-C\s+" + _PATH_ARG + r"\s+)?push\b")
 _CD_RE = re.compile(r"(?:^|[;&|(\s])cd\s+" + _PATH_ARG)
 
 
+def _move(here: str | None, target: str) -> str:
+    if target[:1] in "\"'":
+        target = target[1:-1]
+    target = os.path.expanduser(target)
+    if here and not os.path.isabs(target):
+        target = os.path.join(here, target)
+    # Logical, as bash's own `cd` is: `plugins/..` is where it started.
+    return os.path.normpath(target)
+
+
 def push_target_dir(command: str, cwd: str | None) -> str | None:
     """The directory the command's ``git push`` runs in, when the command says.
 
-    ``git -C <dir> push``, else the last ``cd <dir>`` before the push, relative
-    to ``cwd``. None means the hook's own directory. Resolving only that one
-    let a session in another repo push the looped repo with ``cd <clone> &&
-    git push`` past this gate.
+    Every ``cd <dir>`` before the push moves from where the previous one left
+    (``cd -`` returns), starting at ``cwd``; ``git -C <dir> push`` then moves
+    once more. None means the hook's own directory. Resolving only the hook's
+    directory let a session in another repo push the looped repo with ``cd
+    <clone> && git push`` past this gate, and resolving only the last ``cd``
+    sent ``cd plugins && cd .. && git push`` above the repo.
     """
     push = _GIT_PUSH_RE.search(command)
     if push is None:
         return None
-    target = push.group(1)
-    if target is None:
-        cds = list(_CD_RE.finditer(command, 0, push.start()))
-        if not cds:
-            return None
-        target = cds[-1].group(1)
-    if target[:1] in "\"'":
-        target = target[1:-1]
-    target = os.path.expanduser(target)
-    if cwd and not os.path.isabs(target):
-        target = os.path.join(cwd, target)
-    return target
+    here, previous, moved = cwd, cwd, False
+    for cd in _CD_RE.finditer(command, 0, push.start()):
+        if cd.group(1) == "-":
+            here, previous = previous, here
+        else:
+            here, previous = _move(here, cd.group(1)), here
+        moved = True
+    if push.group(1) is not None:
+        here, moved = _move(here, push.group(1)), True
+    return here if moved else None
 
 BLOCK_TEMPLATE = (
     "[gh-review-loop] A review loop is active for {repo} and the "

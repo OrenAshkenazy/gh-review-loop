@@ -439,6 +439,73 @@ def test_graded_paragraphs_and_items_yield_a_finding_each_with_their_anchor():
     assert parsed["complete"] is True
 
 
+BLOB = "https://github.com/acme/widget/blob/abc123abc123abc123abc123abc123abc123abc1"
+
+
+def test_graded_and_blob_linked_items_in_one_summary_are_all_read():
+    """Reading a graded item stopped the blob-link parser: the second item was
+    dropped and the first lost its location, with no tally to catch it."""
+    body = (
+        "## Code review\n\nFound 2 issues:\n\n"
+        "1. **Warning:** Missing error handling for OAuth callback\n\n"
+        f"{BLOB}/src/auth.ts#L67-L72\n\n"
+        "2. Memory leak: OAuth state not cleaned up\n\n"
+        f"{BLOB}/src/auth.ts#L88-L95\n\n"
+        "<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [
+        ("medium", "src/auth.ts", 67), ("unknown", "src/auth.ts", 88),
+    ]
+    assert parsed["findings"][1]["title"].startswith("Memory leak")
+    assert parsed["open_findings"] == 2
+
+
+def test_graded_items_beside_graded_headings_are_all_read_and_none_twice():
+    body = (
+        "## Code review\n\n"
+        "### Warning: the retry loop never ends\n\n**File**: `src/retry.py:14`\n\n"
+        "`src/retry.py:14` — **Warning:** restated inside its own section.\n\n"
+        f"See {BLOB}/src/retry.py#L14\n\n"
+        "## Also\n\n"
+        "`src/cache.py:9` — **Suggestion:** the key omits the tenant.\n\n"
+        "<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [
+        ("medium", "src/retry.py", 14), ("low", "src/cache.py", 9),
+    ]
+
+
+def test_a_rating_beside_graded_sections_is_not_a_finding():
+    """A heading summary's "### Risks" section rates the PR with a bare
+    `**Low**:`; read beside its graded sections, that is not a finding."""
+    body = (
+        "## Findings\n\n### Minor: unchecked error\n\n**File**: `src/a_test.go:19`\n\n"
+        "## Analysis\n\n### Risks\n\n**Low**: This PR extends existing infrastructure.\n\n"
+        "## Verdict\n\n**APPROVED** ✅\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert [(f["path"], f["line"]) for f in parsed["findings"]] == [("src/a_test.go", 19)]
+
+
+def test_a_blob_link_inside_a_graded_item_is_that_item_not_a_second_finding():
+    body = (
+        "## Code review\n\n"
+        f"1. **Warning:** the token is logged ({BLOB}/src/log.py#L5)\n"
+        f"2. `src/db.py:3` — **Suggestion:** close the cursor ({BLOB}/src/db.py#L3)\n\n"
+        "<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [
+        ("medium", "src/log.py", 5), ("low", "src/db.py", 3),
+    ]
+
+
 def test_a_graded_finding_survives_an_approving_verdict():
     """The workflow's own rubric example is "0 Critical, 1 Warning, 2
     Suggestions — Approve": approval read as zero open findings would call a
@@ -935,13 +1002,13 @@ def _ping(created_at, comment_id, body="@claude review"):
             "author": {"login": "loop-agent", "__typename": "User"}}
 
 
-def _ci_request(monkeypatch, comments):
+def _ci_request(monkeypatch, comments, rollup_state=None):
     monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: NEW_HEAD)
     monkeypatch.setattr(request_rereview, "_all_reviews", lambda *a, **k: [])
-    monkeypatch.setattr(
-        request_rereview, "read_summary_pull_request",
-        lambda *a, **k: _pr(comments=comments, head=NEW_HEAD, committed="2026-01-05T12:00:24Z", checks=CHECKS),
-    )
+    pull = _pr(comments=comments, head=NEW_HEAD, committed="2026-01-05T12:00:24Z", checks=CHECKS)
+    if rollup_state:
+        pull["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = rollup_state
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: pull)
     posted = []
     monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
         posted.append(phrase) or {"created_at": "2026-01-05T12:01:00Z", "repo": repo, "pr": pr, "phrase": phrase}
@@ -1037,6 +1104,88 @@ def test_a_ping_the_action_answered_itself_did_not_prompt_the_next_summary(monke
     posted = _ci_request(monkeypatch, history)
     assert request_rereview.main(CI_ARGS) == 0
     assert posted == ["@claude review"]
+
+
+PUSH_HISTORY = [_ci_summary("2026-01-05T09:00:00Z", "IC_1"), _ci_summary("2026-01-05T10:00:00Z", "IC_2")]
+
+
+def _wait_on(head, at):
+    request_rereview.loop_state.append_request_log("acme/widget", 7, {
+        "reviewer": "github-actions", "at": at, "countable": True, "via": "push", "head": head,
+    })
+
+
+@pytest.mark.parametrize("state", ["SUCCESS", "FAILURE", "ERROR"])
+def test_a_push_review_that_never_came_is_pinged_once_the_heads_checks_finished(monkeypatch, capsys, state):
+    """The job failed, was cancelled or was skipped: every retry answered
+    review_pending for a review nothing was running, so none could start."""
+    posted = _ci_request(monkeypatch, PUSH_HISTORY, rollup_state=state)
+    _wait_on(NEW_HEAD, "2026-01-05T12:01:00Z")
+    monkeypatch.setattr(request_rereview, "utc_now_iso", lambda: "2026-01-05T12:16:00Z")
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert posted == ["@claude review"]
+    assert len(_push_waits()) == 1
+
+
+def test_the_first_request_waits_even_when_the_heads_checks_look_finished(monkeypatch, capsys):
+    """Right after a push the job's own check may not exist yet while another
+    check already passed: the first request for a head always waits."""
+    posted = _ci_request(monkeypatch, PUSH_HISTORY, rollup_state="SUCCESS")
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+    assert posted == []
+
+
+def test_a_push_review_wait_expires_after_the_loops_wait_timeout(monkeypatch, capsys):
+    posted = _ci_request(monkeypatch, PUSH_HISTORY, rollup_state="PENDING")
+    _wait_on(NEW_HEAD, "2026-01-05T12:01:00Z")
+
+    monkeypatch.setattr(request_rereview, "utc_now_iso", lambda: "2026-01-05T12:20:00Z")
+    assert request_rereview.main(CI_ARGS) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+    assert posted == []
+
+    monkeypatch.setattr(request_rereview, "utc_now_iso", lambda: "2026-01-05T12:31:01Z")
+    assert request_rereview.main(CI_ARGS) == 0
+    assert posted == ["@claude review"]
+
+
+def test_a_push_review_that_already_answered_counts_as_a_cycle(monkeypatch, capsys):
+    """A fast job reviews the push before the loop asks: the request answered
+    already_reviewed_head and recorded nothing, so cycles reviewed this way
+    never reached the cap (four heads against a cap of one)."""
+    posted = _ci_request(monkeypatch, [_ci_summary("2026-01-05T09:00:00Z", "IC_open"),
+                                       _ci_summary("2026-01-05T12:02:11Z", "IC_push")])
+    stamps = []
+    monkeypatch.setattr(request_rereview, "stamp_cycle", lambda repo, pr, request_id, **k: stamps.append(request_id))
+
+    for _ in range(2):
+        assert request_rereview.main(CI_ARGS) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "already_reviewed_head"
+
+    assert posted == []
+    assert [(w["reviewer"], w["head"], w["countable"]) for w in _push_waits()] == [("github-actions", NEW_HEAD, True)]
+    assert stamps == [None]
+
+
+@pytest.mark.parametrize("history", [
+    # The PR's opening review is cycle 0, free.
+    [_ci_summary("2026-01-05T12:02:11Z", "IC_open")],
+    # A review a ping asked for: the ping is what counts.
+    [_ci_summary("2026-01-05T09:00:00Z", "IC_open"), _ping("2026-01-05T12:01:00Z", "IC_p"),
+     _ci_summary("2026-01-05T12:02:11Z", "IC_asked")],
+])
+def test_the_opening_review_and_a_requested_review_are_not_push_cycles(monkeypatch, capsys, history):
+    _ci_request(monkeypatch, history)
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "already_reviewed_head"
+    assert _push_waits() == []
 
 
 def test_push_review_waits_count_toward_the_cap(monkeypatch, capsys):

@@ -53,6 +53,9 @@ All notable changes to this project will be documented in this file. The format 
   grade first, or as a numbered item) matched neither recognized shape, so
   every such summary read as zero findings, and an approving one as clean. Those paragraphs and items are now findings, graded by their
   label, anchored by their first `path:line` (`:~53` and `(also …)` included).
+  The three shapes are read together, each finding once: a summary mixing
+  graded items with `### <Grade>:` sections or blob-linked items loses none,
+  and a blob link under a graded item is that item's location.
   The verdict's own count (`0 Critical, 1 Warning, 2 Suggestions`) is checked
   against what was read: fewer leaves the overview incomplete for the agent
   to read, so an approving verdict can no longer hide an unread finding.
@@ -65,14 +68,18 @@ All notable changes to this project will be documented in this file. The format 
   arrived unasked at least twice answers `review_pending`
   (`reason: reviews_on_push`, wait `--after <pending_since>`) instead of
   pinging. That wait is recorded once per head and counts toward the cap like
-  a ping, in both the request script and the fetch's `reReviewRequests`.
+  a ping, in both the request script and the fetch's `reReviewRequests`; so is
+  a push review that answered before the loop asked (the PR's opening review
+  stays free). A retry pings once the head's checks have all finished or the
+  wait is over 30 minutes old, so a job that failed or never ran cannot hold
+  the loop.
   Details: `references/claude-reviewer.md`.
 
 - **The push gate checks the repo the push runs in.** `loop_summary_gate.py`
   resolved the repo from the session's directory, so `cd <clone> && git push`
   from another repo pushed loop cycles without a `--cycle-summary`, and
   `git -C <dir> push` was not recognized as a push at all. Both now resolve the
-  repo where the push runs.
+  repo where the push runs, each `cd` moving from where the previous one left.
 
 - **A review request GitHub accepts but does not register is refused, not
   stamped.** The first live run (an account without Copilot code review) showed
