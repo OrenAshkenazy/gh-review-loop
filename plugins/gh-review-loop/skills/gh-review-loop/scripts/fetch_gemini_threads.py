@@ -190,6 +190,7 @@ SUMMARY_GRADED_ITEM_RE = re.compile(
     r"\*\*(?P<word>" + "|".join(SEVERITY_WORDS) + r")(?:[ \t]*\([^)\n]*\))?(?::\*\*|\*\*:)",
     re.IGNORECASE,
 )
+SUMMARY_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:\d+[.)]|[-*])[ \t]+(?P<title>[^\n]*?\S)[ \t]*$", re.MULTILINE)
 SUMMARY_BLOCK_START_RE = re.compile(r"^[ \t]*(?:(?:\d+[.)]|[-*])[ \t]+|#)")
 SUMMARY_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 SUMMARY_LEADING_SPAN_RE = re.compile(r"\A\s*`([^`\n]+)`(?:[ \t]*\([^)\n]*\))?\s*(?:[—–-]+\s*)?")
@@ -1459,25 +1460,32 @@ def _summary_anchor(token: str) -> tuple[str, int | None] | None:
     return match.group("path"), int(line) if line else None
 
 
-def _summary_blocks(text: str) -> list[str]:
-    """Paragraphs and list items, each one block; a heading starts one too."""
-    blocks: list[str] = []
+def _summary_blocks(text: str) -> list[tuple[int, int, str]]:
+    """Paragraphs and list items, each one block with its ``(start, end)``
+    offsets in ``text``; a heading starts one too."""
+    blocks: list[tuple[int, int, str]] = []
     current: list[str] = []
-    for line in text.splitlines():
+    start = end = offset = 0
+    for line, raw in zip(text.splitlines(), text.splitlines(keepends=True)):
         if not line.strip() or SUMMARY_BLOCK_START_RE.match(line):
             if current:
-                blocks.append("\n".join(current))
-            current = [line] if line.strip() else []
-            continue
-        current.append(line)
+                blocks.append((start, end, "\n".join(current)))
+            current = []
+        if line.strip():
+            if not current:
+                start = offset
+            current.append(line)
+            end = offset + len(raw)
+        offset += len(raw)
     if current:
-        blocks.append("\n".join(current))
+        blocks.append((start, end, "\n".join(current)))
     return blocks
 
 
-def _graded_item_findings(text: str) -> list[dict[str, Any]]:
+def _graded_item_findings(text: str) -> list[tuple[int, int, dict[str, Any]]]:
+    """Graded paragraphs and list items, each with its block's offsets."""
     findings = []
-    for block in _summary_blocks(text):
+    for start, end, block in _summary_blocks(text):
         match = SUMMARY_GRADED_ITEM_RE.match(block)
         if not match:
             continue
@@ -1498,13 +1506,13 @@ def _graded_item_findings(text: str) -> list[dict[str, Any]]:
             (anchor for anchor in anchors if anchor[1] is not None),
             anchors[0] if anchors else ("(review comment)", None),
         )
-        findings.append({
+        findings.append((start, end, {
             "severity": SEVERITY_WORDS[match.group("word").lower()],
             "title": _first_sentence(rest),
             "path": path,
             "line": line,
             "body": block.strip(),
-        })
+        }))
     return findings
 
 
@@ -1543,7 +1551,12 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
         return None
     text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
     approving = summary_approves(text)
-    findings: list[dict[str, Any]] = []
+    # The three shapes are read together and can sit in one summary; a
+    # finding's text is read once, by the first shape that covers it: a
+    # graded item or blob link inside a graded section is that section, and a
+    # blob link inside (or right under) a graded item is that item's location.
+    located: list[tuple[int, dict[str, Any]]] = []
+    sections: list[tuple[int, int]] = []
     headings = list(SUMMARY_FINDING_HEADING_RE.finditer(text))
     for index, heading in enumerate(headings):
         end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
@@ -1551,6 +1564,7 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
         next_heading = re.search(r"^#{1,6}[ \t]", section, re.MULTILINE)
         if next_heading:
             section = section[: next_heading.start()]
+        sections.append((heading.start(), heading.end() + len(section)))
         path, line = "(review comment)", None
         file_match = SUMMARY_FILE_FIELD_RE.search(section)
         if file_match:
@@ -1559,38 +1573,59 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
             anchor = BLOB_ANCHOR_RE.search(section)
             if anchor:
                 path, line = anchor.group(1), int(anchor.group(2))
-        findings.append({
+        located.append((heading.start(), {
             "severity": SEVERITY_WORDS.get(heading.group("word").lower(), "unknown"),
             "title": heading.group("title").strip(),
             "path": path,
             "line": line,
             "body": (heading.group(0).strip() + "\n\n" + section.strip()).strip(),
-        })
-    if not findings:
-        findings = _graded_item_findings(text)
-    if not findings:
-        anchors = list(BLOB_ANCHOR_RE.finditer(text))
-        for index, anchor in enumerate(anchors):
-            start = anchors[index - 1].end() if index else 0
-            item = text[start:anchor.start()].strip()
-            lines = [line for line in item.splitlines() if line.strip()]
-            # The nearest list item above the link names the finding; a link
-            # with no list item above it is prose ("What changed", a verdict).
-            title = ""
-            for line in reversed(lines):
-                marker = re.match(r"^\s*(?:\d+[.)]|[-*])\s+(?P<title>.+?)\s*$", line)
-                if marker:
-                    title = marker.group("title")
-                    break
-            if not title:
-                continue
-            findings.append({
-                "severity": severity_in_text(item),
-                "title": title[:200],
-                "path": anchor.group(1),
-                "line": int(anchor.group(2)),
-                "body": text[start:anchor.end()].strip(),
-            })
+        }))
+
+    def within(position: int, spans: Any) -> bool:
+        return any(start <= position < end for start, end, *_ in spans)
+
+    graded = [item for item in _graded_item_findings(text) if not within(item[0], sections)]
+    linked: list[tuple[int, dict[str, Any]]] = []
+    anchors = list(BLOB_ANCHOR_RE.finditer(text))
+    for index, anchor in enumerate(anchors):
+        start = anchors[index - 1].end() if index else 0
+        item = text[start:anchor.start()]
+        # The nearest list item above the link names the finding; a link
+        # with no list item above it is prose ("What changed", a verdict).
+        markers = list(SUMMARY_LIST_ITEM_RE.finditer(item))
+        if not markers:
+            continue
+        marker_at = start + markers[-1].start("title")
+        if within(marker_at, sections) or within(anchor.start(), sections):
+            continue
+        owner = next(
+            (finding for g_start, g_end, finding in graded
+             if g_start <= marker_at < g_end or g_start <= anchor.start() < g_end),
+            None,
+        )
+        if owner is not None:
+            if owner["path"] == "(review comment)":
+                owner["path"], owner["line"] = anchor.group(1), int(anchor.group(2))
+            elif owner["line"] is None and owner["path"] == anchor.group(1):
+                owner["line"] = int(anchor.group(2))
+            continue
+        linked.append((marker_at, {
+            "severity": severity_in_text(item.strip()),
+            "title": markers[-1].group("title")[:200],
+            "path": anchor.group(1),
+            "line": int(anchor.group(2)),
+            "body": text[start:anchor.end()].strip(),
+        }))
+    # Beside graded sections or blob-linked findings, a graded line with no
+    # location is a rating ("### Risks" … "**Low**: …"), not a finding; only
+    # a summary made of graded items alone grades findings without one.
+    rated_only = bool(located) or bool(linked)
+    located.extend(
+        (start, finding) for start, _end, finding in graded
+        if not (rated_only and finding["path"] == "(review comment)")
+    )
+    located.extend(linked)
+    findings = [finding for _, finding in sorted(located, key=lambda pair: pair[0])]
     declared = summary_verdict_tally(text)
     open_findings: int | None
     if declared is not None:
