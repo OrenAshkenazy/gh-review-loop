@@ -44,6 +44,12 @@ def tool_command(payload: dict[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def hook_cwd(payload: dict[str, Any]) -> str | None:
+    """The session's working directory the hook payload reports, if any."""
+    value = payload.get("cwd")
+    return value if isinstance(value, str) and value else None
+
+
 def script_path(script_name: str) -> Path:
     """Return an absolute path to a sibling script in this plugin install."""
     return Path(__file__).resolve().with_name(script_name)

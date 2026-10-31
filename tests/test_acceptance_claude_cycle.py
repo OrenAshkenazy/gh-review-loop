@@ -28,7 +28,7 @@ FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "claude_cycle.json").read_text(encoding="utf-8")
 )
 PR = PullRequest(owner="acme", repo="widget", number=159)
-CI_PR = PullRequest(owner="acme", repo="widget", number=2885)
+CI_PR = PullRequest(owner="acme", repo="widget", number=42)
 AGENT = "loop-agent"
 CLAUDE = "claude"
 REREVIEW_AT = "2026-10-20T18:38:30Z"
@@ -51,6 +51,7 @@ def loop(tmp_path, monkeypatch):
     state = {"payload": FIXTURE["initial"], "pr": PR}
     monkeypatch.setattr(fgt, "resolve_pr", lambda arg: state["pr"])
     monkeypatch.setattr(fgt, "fetch_threads", lambda pr: state["payload"])
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: state["payload"])
     monkeypatch.setattr(
         fgt,
         "fetch_reviewer_discovery",
@@ -298,6 +299,52 @@ def test_the_ci_summary_login_is_discovered_bound_to_claude(loop, monkeypatch, c
     }]
 
 
+def test_an_unconfigured_fetch_names_the_reviewer_on_the_pr_not_the_suggestion(loop, monkeypatch, capsys):
+    """With nothing persisted the fetch ran as the suggested Codex and said
+    only "# Codex Threads … Author filter: chatgpt-codex-connector". An agent
+    read that as a configured reviewer and pinged @codex on a PR a CI job's
+    Claude review was covering."""
+    loop["payload"] = FIXTURE["ci_summary"]
+    loop["pr"] = CI_PR
+
+    selection = run_fetch(monkeypatch, capsys, pr=CI_PR)["reviewerSelection"]
+
+    assert selection["confirmation_required"] is True
+    assert selection["configured"] is False
+    assert [(c["login"], c.get("vendor")) for c in selection["candidates"]] == [("github-actions", "claude")]
+    assert "Claude Code (as github-actions)" in selection["message"]
+    assert "--reviewer github-actions --reviewer-vendor claude --reviewer-source confirmed" in selection["message"]
+
+
+def test_an_unconfigured_text_fetch_leads_with_the_selection_block(loop, monkeypatch, capsys):
+    loop["payload"] = FIXTURE["ci_summary"]
+    loop["pr"] = CI_PR
+    monkeypatch.setattr(sys, "argv", [
+        "fetch_gemini_threads.py", "--pr", CI_PR.url, "--no-color",
+        "--no-resolve-outdated", "--no-resolve-addressed-by-reply",
+    ])
+
+    assert fgt.main() == 0
+
+    out = capsys.readouterr().out
+    assert out.index("[loop] No reviewer is configured") < out.index(f"Threads for PR #{CI_PR.number}")
+    assert "--reviewer github-actions --reviewer-vendor claude --reviewer-source confirmed" in out
+    assert "# Codex Threads" not in out, "the suggestion must not read as a selection"
+
+
+def test_an_unconfigured_fetch_with_no_reviewer_on_the_pr_keeps_the_offer(loop, monkeypatch, capsys):
+    payload = copy.deepcopy(FIXTURE["ci_summary"])
+    payload["comments"]["nodes"] = []
+    loop["payload"] = payload
+    loop["pr"] = CI_PR
+
+    selection = run_fetch(monkeypatch, capsys, pr=CI_PR)["reviewerSelection"]
+
+    assert selection["candidates"] == []
+    assert selection["message"].startswith("No reviewer bot has commented on this PR")
+    assert selection["suggestion"]["review_trigger"] == "@codex"
+
+
 def test_a_ci_summary_cycle_surfaces_its_findings_then_clears(loop, monkeypatch, capsys):
     loop["payload"] = FIXTURE["ci_summary"]
     loop["pr"] = CI_PR
@@ -315,7 +362,7 @@ def test_a_ci_summary_cycle_surfaces_its_findings_then_clears(loop, monkeypatch,
     assert selection["display_name"] == "Claude Code (as github-actions)"
     assert selection["review_trigger"] == "@claude"
     assert [(t["path"], t["line"]) for t in first["threads"]] == [
-        ("wasm/modules/crowdstrike/resume_durable_test.go", 19),
+        ("src/jobs/resume_test.go", 19),
     ]
     assert first["threads"][0]["isSummaryCommentFinding"] is True
     assert thread_severity(first["threads"][0]) == "low"
@@ -331,14 +378,27 @@ def test_a_ci_summary_cycle_surfaces_its_findings_then_clears(loop, monkeypatch,
     assert again["reviewerSelection"]["review_trigger"] == "@claude"
     assert len(again["threads"]) == 1
 
-    # 3. Ping, wait for the job's new summary, re-fetch: clean.
+    # 3. The summary covers this head, so a ping now would buy a second
+    #    review of it: the job posts comments, not reviews, and the dedupe
+    #    reads its summaries.
     monkeypatch.setattr(request_rereview, "head_already_reviewed", lambda *a, **k: None)
     posted = {}
     monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
         posted.update(phrase=phrase)
         or {"created_at": "2026-10-21T07:39:00Z", "repo": repo, "pr": pr, "phrase": phrase, "posted": True}
     ))
-    assert request_rereview.main(["--repo", "acme/widget", "--pr", "2885", "--json"]) == 0
+    assert request_rereview.main(["--repo", "acme/widget", "--pr", "42", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "already_reviewed_head"
+    assert posted == {}
+
+    # 4. Push the fix (its check suite postdates the summary), ping, wait for
+    #    the job's new summary, re-fetch: clean.
+    pushed = copy.deepcopy(FIXTURE["ci_summary"])
+    pushed["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][0]["checkSuite"]["createdAt"] = (
+        "2026-10-21T07:30:00Z"
+    )
+    loop["payload"] = pushed
+    assert request_rereview.main(["--repo", "acme/widget", "--pr", "42", "--json"]) == 0
     capsys.readouterr()
     assert posted["phrase"] == "@claude review"
 
@@ -365,6 +425,21 @@ def test_a_ci_summary_cycle_surfaces_its_findings_then_clears(loop, monkeypatch,
     assert final["reviewerOverview"]["covers_head"] is True
     assert final["loopStatus"]["cleanBlockedBy"] is None
     assert final["loopStatus"]["reReviewRequests"] == 1
+
+
+def test_a_push_review_wait_counts_as_a_request_in_the_fetch(loop, monkeypatch, capsys):
+    loop["payload"] = FIXTURE["ci_summary"]
+    loop["pr"] = CI_PR
+    fgt.loop_state.append_request_log("acme/widget", 42, {
+        "reviewer": "github-actions", "at": "2026-10-21T07:30:05Z",
+        "countable": True, "via": "push", "head": "03d21e0d0000000000000000000000000003d21e",
+    })
+
+    result = run_fetch(
+        monkeypatch, capsys, "--reviewer", "github-actions", "--reviewer-vendor", "claude", pr=CI_PR,
+    )
+
+    assert result["loopStatus"]["reReviewRequests"] == 1
 
 
 def test_a_summary_finding_filtered_by_severity_does_not_block_clean(loop, monkeypatch, capsys):

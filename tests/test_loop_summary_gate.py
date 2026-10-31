@@ -14,8 +14,10 @@ import time
 
 from fetch_gemini_threads import save_sticky_state
 from loop_state import SENTINEL_TTL_SECONDS, sentinel_path, touch_sentinel
+import pytest
+
 from loop_summary_gate import main as summary_gate_main
-from loop_summary_gate import stale_summary_for_push
+from loop_summary_gate import push_target_dir, stale_summary_for_push
 
 
 class _UnreadableStdin:
@@ -177,7 +179,7 @@ class TestBlockMessage:
     ):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         _active_stale("o/r", number=7)
-        monkeypatch.setattr("loop_summary_gate.resolve_current_repo", lambda: "o/r")
+        monkeypatch.setattr("loop_summary_gate.resolve_current_repo", lambda cwd=None: "o/r")
         monkeypatch.setattr(
             "sys.stdin",
             io.StringIO(json.dumps(
@@ -192,3 +194,67 @@ class TestBlockMessage:
         assert "https://github.com/o/r/pull/7" in err
         assert "snapshot" not in err.lower()
         assert "Threads tracked" not in err
+
+
+class TestPushTarget:
+    @pytest.mark.parametrize("command, cwd, expected", [
+        ("git push origin HEAD", "/base", None),
+        ("cd /work/clone && git add -A && git commit -qm x && git push -q origin HEAD", "/base", "/work/clone"),
+        ("git -C /work/clone push origin", "/base", "/work/clone"),
+        ("cd sub && git push", "/base", "/base/sub"),
+        ('cd "/tmp/my clone" && git push', None, "/tmp/my clone"),
+        ("cd /a && make && cd /b && git push", None, "/b"),
+        ("(cd /a && git push)", None, "/a"),
+        ("git push && cd /a", None, None),
+    ])
+    def test_the_push_runs_where_the_command_says(self, command, cwd, expected):
+        assert push_target_dir(command, cwd) == expected
+
+    def test_a_tilde_target_is_expanded(self):
+        assert push_target_dir("cd ~/clone && git push", None) == os.path.expanduser("~/clone")
+
+    def _run(self, monkeypatch, command, cwd, repos):
+        seen = []
+
+        def resolve(cwd=None):
+            seen.append(cwd)
+            return repos.get(cwd, "o/session")
+
+        monkeypatch.setattr("loop_summary_gate.resolve_current_repo", resolve)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+            {"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": command}}
+        )))
+        return summary_gate_main(), seen
+
+    def test_a_push_into_the_looped_repo_from_another_cwd_is_gated(self, tmp_path, monkeypatch, capsys):
+        """The session ran from another repo and pushed with `cd <clone> &&
+        git push`; the gate resolved the session's repo, found no loop there,
+        and let cycles push without a summary."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _active_stale("o/looped", number=7)
+
+        rc, seen = self._run(
+            monkeypatch, "cd /work/clone && git commit -qm fix && git push -q origin HEAD",
+            "/work/session", {"/work/clone": "o/looped"},
+        )
+
+        assert rc == 2
+        assert seen == ["/work/clone"]
+        assert "https://github.com/o/looped/pull/7" in capsys.readouterr().err
+
+    def test_git_dash_c_is_a_push_and_is_gated(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _active_stale("o/looped", number=7)
+
+        rc, seen = self._run(monkeypatch, "git -C /work/clone push", "/work/session", {"/work/clone": "o/looped"})
+
+        assert rc == 2
+        assert seen == ["/work/clone"]
+
+    def test_a_push_of_another_repo_is_not_gated_by_the_sessions_loop(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _active_stale("o/session", number=7)
+
+        rc, _ = self._run(monkeypatch, "cd /work/other && git push", "/work/session", {"/work/other": "o/other"})
+
+        assert rc == 0

@@ -409,7 +409,7 @@ def test_finding_titles_may_contain_brackets():
 
 
 def test_the_open_count_is_read_when_copilot_calls_them_issues():
-    """Live Copilot (qizsecurity/local-dev#97, 2026-10-17) writes
+    """Live Copilot (2026-10-17) writes
     "<strong>14 open issues</strong>" where the October 7 fixtures said
     "open findings". The count is what the clean gate reads; missing it made
     every live overview "unparseable" (complete=False, open_findings=None)."""
@@ -436,7 +436,7 @@ MARKER = "<!-- ccr-overview-v2 -->\n\n"
 
 
 def test_a_clean_review_that_says_no_open_issues_counts_as_zero():
-    """Live Copilot (qizsecurity org, 2026-10-17) writes "**No open issues** 🎉"
+    """Live Copilot (2026-10-17) writes "**No open issues** 🎉"
     on a clean review, with no number at all. The clean gate needs a count,
     so this read as overview_unparseable on every clean head."""
     for noun in ("issues", "findings"):
@@ -514,15 +514,15 @@ def test_a_head_overview_older_than_the_newest_request_does_not_cover_the_head()
 
 
 def test_absolute_discussion_links_are_parsed_too():
-    """Live Copilot overview, qizsecurity/local-dev#97 (2026-10-16): the
+    """Live Copilot overview (2026-10-16): the
     finding links are absolute PR URLs, not bare `#discussion_r` fragments.
     Fragment-only matching left every finding unlinked and ungraded."""
     body = (
         "<!-- ccr-overview-v2 -->\n\n### 🟡 Changes recommended\n\n"
         "<summary><strong>2 open findings</strong></summary>\n\n"
         '- <picture><img alt="High severity" width="62"></picture> '
-        "[Build and push research-tool with the session image tag]"
-        "(https://github.com/qizsecurity/local-dev/pull/97#discussion_r4298740956) · New\n"
+        "[Build and push the worker with the session image tag]"
+        "(https://github.com/acme/widget/pull/97#discussion_r4298740956) · New\n"
         '- <picture><img alt="Medium severity" width="62"></picture> '
         "[Use portable sed output redirection](#discussion_r4298740999) · New\n"
     )

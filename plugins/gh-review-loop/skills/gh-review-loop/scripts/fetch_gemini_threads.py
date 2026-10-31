@@ -111,7 +111,7 @@ COPILOT_SEVERITY_ICON_RE = re.compile(
     r'alt="(critical|high|medium|low)\s+severity"', re.IGNORECASE
 )
 COPILOT_ASSESSMENT_RE = re.compile(r"^#{1,6}[ \t]+(?P<assessment>.+?)[ \t]*$", re.MULTILINE)
-# The open count, as Copilot has written it (live corpus, qizsecurity org,
+# The open count, as Copilot has written it (live corpus, one organization,
 # 2026-09..10): "**0 open findings**" / "<strong>2 open findings</strong>"
 # (October 7-16), "<strong>14 open issues</strong>" and "**No open issues** 🎉"
 # (October 17), and before that "<summary><strong>Open (1)</strong></summary>"
@@ -176,6 +176,28 @@ SUMMARY_FINDING_HEADING_RE = re.compile(
 )
 SUMMARY_FILE_FIELD_RE = re.compile(r"\*\*File\*\*:?\s*:?\s*`?(?P<token>[^`\s]+)", re.IGNORECASE)
 PATH_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:-\d+)?$")
+# A summary finding written as a paragraph or list item that opens with its
+# anchor and grade, in either order: "`path:line` — **Warning:** …",
+# "1. `path:line` **Suggestion:** …", "**Warning:** `path:line` — …".
+# The anchor may name several spans or carry a parenthetical
+# ("(also `other.yaml:90`)"), and so may the grade ("**Suggestion
+# (docs):**"). A bold label that is not a grade ("**Out of scope:**") is
+# not a finding.
+SUMMARY_GRADED_ITEM_RE = re.compile(
+    r"\A[ \t]*(?:(?:\d+[.)]|[-*])[ \t]+)?"
+    r"(?P<lead>(?:`[^`\n]+`(?:[ \t]*\([^)\n]*\))?[ \t,/]*)*)"
+    r"(?:[—–-]+[ \t]*)?"
+    r"\*\*(?P<word>" + "|".join(SEVERITY_WORDS) + r")(?:[ \t]*\([^)\n]*\))?(?::\*\*|\*\*:)",
+    re.IGNORECASE,
+)
+SUMMARY_BLOCK_START_RE = re.compile(r"^[ \t]*(?:(?:\d+[.)]|[-*])[ \t]+|#)")
+SUMMARY_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+SUMMARY_LEADING_SPAN_RE = re.compile(r"\A\s*`([^`\n]+)`(?:[ \t]*\([^)\n]*\))?\s*(?:[—–-]+\s*)?")
+# "path:line", "path:~53" (an approximate line), or a bare path; never a glob.
+SUMMARY_ANCHOR_RE = re.compile(r"^(?P<path>[\w.@+/-]+?)(?::~?(?P<line>\d+)(?:-\d+)?)?$")
+# "**Verdict:** 0 Critical, 2 Warnings, 3 Suggestions — Comment": the count a
+# summary claims, against which the findings actually read are checked.
+SUMMARY_TALLY_RE = re.compile(r"(?P<count>\d+)[ \t]+(?P<word>[A-Za-z]+)")
 # Claude's hosted service ends every review body with its review id and, on
 # a re-review, lists the findings still open from earlier reviews in a
 # machine block whose severity words are the check run's (normal = Important):
@@ -1376,36 +1398,8 @@ def review_body_findings(
     return findings
 
 
-def head_arrived_at(pull_request: dict[str, Any]) -> str:
-    """When the head commit can first be shown to have reached the PR, or "".
-
-    A commit's ``committedDate`` is when it was made, which can be hours
-    before it was pushed (PR #121 review): a clean summary posted in between
-    would otherwise read as covering a head the reviewer never saw. GitHub
-    creates a check suite or commit status only once a commit is pushed, so
-    the earliest one on the head is a boundary the push cannot postdate. The
-    later of the two is used; a head with no checks keeps ``committedDate``.
-    """
-    nodes = (pull_request.get("commits") or {}).get("nodes") or []
-    for node in reversed(nodes):
-        if not isinstance(node, dict):
-            continue
-        commit = node.get("commit") or {}
-        committed = commit.get("committedDate")
-        committed = committed if isinstance(committed, str) else ""
-        rollup = commit.get("statusCheckRollup") or {}
-        contexts = (rollup.get("contexts") or {}).get("nodes") or []
-        created: list[str] = []
-        for context in contexts:
-            if not isinstance(context, dict):
-                continue
-            suite = context.get("checkSuite") or {}
-            for value in (suite.get("createdAt"), context.get("startedAt"), context.get("createdAt")):
-                if isinstance(value, str) and value:
-                    created.append(value)
-                    break
-        return max(committed, min(created) if created else "")
-    return ""
+# Shared with request_rereview.py, which applies the same coverage rule.
+head_arrived_at = reviewer_resolver.head_arrived_at
 
 
 def summary_review_comments(
@@ -1457,17 +1451,93 @@ def _assessment_of(text: str) -> str:
     return ""
 
 
+def _summary_anchor(token: str) -> tuple[str, int | None] | None:
+    match = SUMMARY_ANCHOR_RE.match(token.strip())
+    if not match or not re.search(r"[./]", match.group("path")):
+        return None
+    line = match.group("line")
+    return match.group("path"), int(line) if line else None
+
+
+def _summary_blocks(text: str) -> list[str]:
+    """Paragraphs and list items, each one block; a heading starts one too."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or SUMMARY_BLOCK_START_RE.match(line):
+            if current:
+                blocks.append("\n".join(current))
+            current = [line] if line.strip() else []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _graded_item_findings(text: str) -> list[dict[str, Any]]:
+    findings = []
+    for block in _summary_blocks(text):
+        match = SUMMARY_GRADED_ITEM_RE.match(block)
+        if not match:
+            continue
+        rest = block[match.end():]
+        anchors = [
+            anchor
+            for anchor in map(_summary_anchor, SUMMARY_CODE_SPAN_RE.findall(match.group("lead")))
+            if anchor
+        ]
+        if not anchors:
+            # Grade first: the anchor is the span right after it.
+            leading = SUMMARY_LEADING_SPAN_RE.match(rest)
+            anchor = _summary_anchor(leading.group(1)) if leading else None
+            if anchor:
+                anchors = [anchor]
+                rest = rest[leading.end():]
+        path, line = next(
+            (anchor for anchor in anchors if anchor[1] is not None),
+            anchors[0] if anchors else ("(review comment)", None),
+        )
+        findings.append({
+            "severity": SEVERITY_WORDS[match.group("word").lower()],
+            "title": _first_sentence(rest),
+            "path": path,
+            "line": line,
+            "body": block.strip(),
+        })
+    return findings
+
+
+def summary_verdict_tally(text: str) -> int | None:
+    """The number of findings a summary's verdict line counts; None without one."""
+    for verdict in SUMMARY_VERDICT_LINE_RE.finditer(text):
+        total, counted = 0, False
+        for match in SUMMARY_TALLY_RE.finditer(verdict.group("text")):
+            word = match.group("word").lower()
+            if word not in SEVERITY_WORDS and word.endswith("s"):
+                word = word[:-1]
+            if word in SEVERITY_WORDS:
+                total += int(match.group("count"))
+                counted = True
+        if counted:
+            return total
+    return None
+
+
 def parse_summary_comment(body: Any) -> dict[str, Any] | None:
     """Read a review summary posted as a PR comment; None when ``body`` is not one.
 
-    Findings are recognized in two shapes: graded sections (a heading that
+    Findings are recognized in three shapes: graded sections (a heading that
     opens with the grade, ``### Minor: …``, with a ``**File**: \\`path:line\\```
-    field or a blob link inside) and the code-review skill's numbered list
-    (a list item of prose ending in a full-sha blob link; a link in plain
-    prose is not a finding). Approval phrasing never suppresses a finding —
-    a summary can approve and still list one (PR #121 review). A summary
-    with neither shape and no approval phrasing is ``complete: False`` — the
-    agent reads it — rather than a guessed zero.
+    field or a blob link inside), graded paragraphs or list items that open
+    with their anchor and grade (``\\`path:line\\` — **Warning:** …``), and the
+    code-review skill's numbered list (a list item of prose ending in a
+    full-sha blob link; a link in plain prose is not a finding). Approval
+    phrasing never suppresses a finding — a summary can approve and still
+    list one. A verdict that counts its findings ("0
+    Critical, 1 Warning, 2 Suggestions") is the summary's own total: fewer
+    findings read than counted, or neither a shape nor approval phrasing,
+    is ``complete: False`` — the agent reads it — rather than a short count.
     """
     if review_vendors.summary_review_vendor(body) is None:
         return None
@@ -1497,6 +1567,8 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
             "body": (heading.group(0).strip() + "\n\n" + section.strip()).strip(),
         })
     if not findings:
+        findings = _graded_item_findings(text)
+    if not findings:
         anchors = list(BLOB_ANCHOR_RE.finditer(text))
         for index, anchor in enumerate(anchors):
             start = anchors[index - 1].end() if index else 0
@@ -1519,7 +1591,12 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
                 "line": int(anchor.group(2)),
                 "body": text[start:anchor.end()].strip(),
             })
-    open_findings: int | None = len(findings) if (findings or approving) else None
+    declared = summary_verdict_tally(text)
+    open_findings: int | None
+    if declared is not None:
+        open_findings = len(findings) if len(findings) >= declared else None
+    else:
+        open_findings = len(findings) if (findings or approving) else None
     return {
         "assessment": _assessment_of(text),
         "approving": approving,
@@ -2082,11 +2159,14 @@ def rereview_requests(
     review_trigger_mention: str | None = DEFAULT_REVIEW_TRIGGER_MENTION,
     reviewer_login: str | None = None,
     loop_request_times: list[str] | None = None,
+    push_review_waits: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """The re-review requests the loop cap counts.
 
-    Comment vendors (Gemini, Codex): comments that mention the reviewer with
-    the word "review". Review-request vendors (Copilot): ReviewRequestedEvents
+    Comment vendors (Gemini, Codex, Claude): comments that mention the
+    reviewer with the word "review", plus the cycles the loop waited on a
+    push review instead of pinging (``push_review_waits``, the times
+    request_rereview.py recorded). Review-request vendors (Copilot): ReviewRequestedEvents
     for that vendor made after its first completed review — the shared rule in
     ``reviewer_resolver.counted_review_requests``, so this count can never
     disagree with request_rereview.py's. When agent_login is provided, only
@@ -2118,6 +2198,7 @@ def rereview_requests(
             if login != agent_login:
                 continue
         out.append(comment)
+    out.extend({"createdAt": at, "pushReviewWait": True} for at in push_review_waits or [])
     return out
 
 
@@ -2294,6 +2375,21 @@ def loop_request_times(pr: PullRequest, reviewer_login: str | None) -> list[str]
     )
 
 
+def push_review_wait_times(pr: PullRequest, reviewer_login: str | None) -> list[str]:
+    """When this loop waited on ``reviewer_login``'s push review instead of pinging.
+
+    Display and the ``capped`` outcome only: request_rereview.py enforces the
+    cap and treats a torn log as unknown, so here it reads as none.
+    """
+    vendor = review_vendors.vendor_for(reviewer_login) if reviewer_login else None
+    if vendor is None or not vendor.summary_comments:
+        return []
+    waits = reviewer_resolver.push_review_waits(
+        loop_state.read_request_log(f"{pr.owner}/{pr.repo}", pr.number), vendor
+    )
+    return sorted(wait.get("at") or "" for wait in waits or [])
+
+
 def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
     entry = load_sticky_state().get(_state_key(pr), {})
     reviewer = entry.get("reviewer") if isinstance(entry, dict) else None
@@ -2454,13 +2550,37 @@ def resolve_reviewer_selection(args: argparse.Namespace, pr: PullRequest) -> dic
         "review_trigger": SUGGESTED_REVIEW_TRIGGER_MENTION,
         "auto_reviews": reviewer_resolver.auto_reviews(SUGGESTED_AUTHOR),
     }
-    state["message"] = (
-        "No reviewer bot has commented on this PR and none is configured. "
-        "Ask the user to pick one, or to ping "
-        f"{SUGGESTED_REVIEW_TRIGGER_MENTION} to start a review. Do not wait on "
-        "an unconfirmed reviewer."
-    )
+    state["candidates"] = []
+    state["message"] = unconfigured_reviewer_message([])
     return state
+
+
+def unconfigured_reviewer_message(candidates: list[dict[str, Any]]) -> str:
+    """What an unconfigured fetch tells the agent, naming the reviewers seen.
+
+    Without the names, the only reviewer in the output was the suggestion the
+    filter fell back to, and an agent took it for the selection.
+    """
+    if not candidates:
+        return (
+            "No reviewer bot has commented on this PR and none is configured. "
+            "Ask the user to pick one, or to ping "
+            f"{SUGGESTED_REVIEW_TRIGGER_MENTION} to start a review. Do not wait on "
+            "an unconfirmed reviewer."
+        )
+    seen = "; ".join(
+        f"{candidate['display_name']} `{candidate['login']}` (select with "
+        f"--reviewer {candidate['login']}"
+        + (f" --reviewer-vendor {candidate['vendor']}" if candidate.get("vendor") else "")
+        + " --reviewer-source confirmed)"
+        for candidate in candidates
+    )
+    return (
+        "No reviewer is configured for this PR; the threads below are filtered by "
+        f"the unconfirmed suggestion, not a selection. Reviewers seen on this PR: {seen}. "
+        "Confirm one with the user before any edit or re-review request. Do not "
+        "wait on an unconfirmed reviewer."
+    )
 
 
 def update_run_tracking(
@@ -4094,6 +4214,7 @@ def render_markdown(
     full: bool = False,
     loop_requests: list[str] | None = None,
     agent_login: str | None = None,
+    push_waits: list[str] | None = None,
 ) -> str:
     reviews = filter_reviews(pr, author)
     # `loop_requests` is the local provenance record, supplied by the caller
@@ -4105,6 +4226,7 @@ def render_markdown(
         review_trigger_mention=review_trigger_mention,
         reviewer_login=author,
         loop_request_times=loop_requests,
+        push_review_waits=push_waits,
     )
     outdated = outdated_unresolved_threads(pr, author)
     deferred = addressed_by_reply_threads(pr, author)
@@ -4869,6 +4991,19 @@ def main() -> int:
                     "falling back to counting all re-review pings.",
                     file=sys.stderr,
                 )
+        unconfigured = reviewer_selection.get("source") == "none_configured"
+        if unconfigured:
+            # The payload already holds what discovery reads; name the
+            # reviewers on the PR so the suggestion is not taken for a choice.
+            reviewer_selection["candidates"] = [
+                candidate.to_dict()
+                for candidate in reviewer_resolver.discover_candidates(
+                    pull_request, self_login=agent_login
+                )
+            ]
+            reviewer_selection["message"] = unconfigured_reviewer_message(
+                reviewer_selection["candidates"]
+            )
         recorded_request_times = loop_request_times(pr, args.author)
         rereviews = rereview_requests(
             pull_request,
@@ -4876,6 +5011,7 @@ def main() -> int:
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=recorded_request_times,
+            push_review_waits=push_review_wait_times(pr, args.author),
         )
         # One decision for the stderr warning, the JSON flag and the
         # `capped` outcome: cycle 0 is free; an actor-fallback count is an
@@ -5109,6 +5245,7 @@ def main() -> int:
             review_trigger_mention=args.review_trigger_mention,
             reviewer_login=args.author,
             loop_request_times=recorded_request_times,
+            push_review_waits=push_review_wait_times(pr, args.author),
         )
         if _limit_reached:
             print(
@@ -5554,18 +5691,24 @@ def main() -> int:
                     f"[loop] session cycle {session_cycle_n}", enabled=color_enabled
                 )
             )
+        if unconfigured:
+            print(color_loop_block(f"[loop] {reviewer_selection['message']}", enabled=color_enabled))
         print(
             render_markdown(
                 pull_request,
                 threads,
                 args.author,
-                reviewer_name=args.reviewer_name,
+                reviewer_name=(
+                    f"{args.reviewer_name} (suggested, not configured)"
+                    if unconfigured else args.reviewer_name
+                ),
                 review_trigger_mention=args.review_trigger_mention,
                 judge_results=judge_results,
                 baseline=render_baseline,
                 full=args.full,
                 loop_requests=loop_request_times(pr, args.author),
                 agent_login=agent_login,
+                push_waits=push_review_wait_times(pr, args.author),
             ),
             end="",
         )

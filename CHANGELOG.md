@@ -38,6 +38,42 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **No reviewer configured means no ping.** With nothing persisted and no
+  reviewer named, `request_rereview.py` fell back to the suggested vendor and
+  posted `@codex review`, even on PRs a CI job's Claude review was covering.
+  It now posts nothing and answers
+  `reviewer_not_configured`. The fetch in that state no longer reads as a
+  Codex selection: it lists the reviewers seen on the PR in
+  `reviewerSelection.candidates` (text mode prints them, with the exact
+  `--reviewer … --reviewer-vendor …` to select one, before the threads) and
+  titles the threads as the unconfigured suggestion's.
+
+- **Claude summaries written as graded paragraphs are read.** A CI job's
+  summary that writes each finding as `` `path:line` — **Warning:** … `` (or
+  grade first, or as a numbered item) matched neither recognized shape, so
+  every such summary read as zero findings, and an approving one as clean. Those paragraphs and items are now findings, graded by their
+  label, anchored by their first `path:line` (`:~53` and `(also …)` included).
+  The verdict's own count (`0 Critical, 1 Warning, 2 Suggestions`) is checked
+  against what was read: fewer leaves the overview incomplete for the agent
+  to read, so an approving verdict can no longer hide an unread finding.
+
+- **A Claude CI job that reviews every push is not pinged.** The head dedupe
+  read only reviews, and the job posts comments, so `already_reviewed_head`
+  never fired and every cycle's `@claude review` started a second Claude run
+  beside the push review. A summary posted after the head
+  reached the PR now answers `already_reviewed_head`; a login whose summaries
+  arrived unasked at least twice answers `review_pending`
+  (`reason: reviews_on_push`, wait `--after <pending_since>`) instead of
+  pinging. That wait is recorded once per head and counts toward the cap like
+  a ping, in both the request script and the fetch's `reReviewRequests`.
+  Details: `references/claude-reviewer.md`.
+
+- **The push gate checks the repo the push runs in.** `loop_summary_gate.py`
+  resolved the repo from the session's directory, so `cd <clone> && git push`
+  from another repo pushed loop cycles without a `--cycle-summary`, and
+  `git -C <dir> push` was not recognized as a push at all. Both now resolve the
+  repo where the push runs.
+
 - **A review request GitHub accepts but does not register is refused, not
   stamped.** The first live run (an account without Copilot code review) showed
   the requested-reviewers POST returning 201 with no reviewer added, no pending

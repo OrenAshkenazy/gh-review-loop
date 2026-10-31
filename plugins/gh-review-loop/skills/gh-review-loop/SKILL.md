@@ -20,6 +20,7 @@ This file holds the every-cycle happy path. Read the referenced file **at the po
 | File | Load when |
 |---|---|
 | `references/reviewer-selection.md` | No persisted reviewer; discovery returns `none_configured`/`partial`/`confirmation_required`; reviewer switch/reset |
+| `references/claude-reviewer.md` | The selected reviewer is Claude Code |
 | `references/verification-profile.md` | First run for a repo (edit gate blocks until a profile decision); customize/un-skip/re-detect |
 | `references/sweep-internals.md` | Receipt shows a multi-site pattern (`count >= 2`), a multi-line ranged finding, or a `Clustering:` advisory |
 | `references/write-safety.md` | Resolving beyond the auto-resolve set; write constraints; is a push safe; what the bundled hooks enforce |
@@ -38,7 +39,7 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 
 - **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
 - **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
-- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown`, parsed from recognized severity images (Codex/Gemini), Claude's leading 🔴/🟡/🟣, or reviewer-leading plain-text `[P0]`–`[P3]` markers; unsupported formats remain `unknown`.
+- **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown` from each reviewer's severity markers; unrecognized formats remain `unknown`.
 
 ## Cycle Counting
 
@@ -104,7 +105,7 @@ At the cap still run cleanup, terminal classification, metrics, and the final su
 5. **Check loop status** — count prior agent re-review requests; at or above the cap → Stopping Conditions.
 6. **Fetch, acknowledge, classify.** Default fetch (below). Summarize actionable findings grouped by file/behavior; none and `loopStatus.cleanBlockedBy` null → report clean and stop (set → not clean, see `references/reviewer-selection.md`). First run for the repo → profile decision NOW, before any edit (see Verification Profile), then relay the profile intro. Explanation requests get a reply draft, not a forced edit; conflicts or regression risk → stop and surface the tradeoff.
 7. **Fix + verify.** Scoped to feedback; read before editing; each change traceable to a feedback cluster; sweep per Pattern → Sweep → Converge. Verify via the profile runner; checks can't run → report why.
-8. **Commit, push, re-review, wait, record.** Commit; `--cycle-summary` + relay pointer; push. Within the cap, post the re-review via `request_rereview.py --repo OWNER/REPO --pr N --expect-head "$(git rev-parse HEAD)" --json` (never hand-write the trigger: it also stamps the cycle boundary; a non-posting `status`: `review_pending` → wait; `already_reviewed_head`, `request_in_progress` → fetch; `head_mismatch` → confirm the push, retry once; `review_request_uncertain` → the POST may have landed: do not re-request; re-run in two minutes; `capped` → Stopping Condition 1; any other status (`uncountable_*`, `lock_unavailable`, `state_unwritable`, `unconfirmed_unreadable`, `review_request_rejected`, …) → stop and relay exactly), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
+8. **Commit, push, re-review, wait, record.** Commit; `--cycle-summary` + relay pointer; push. Within the cap, post the re-review via `request_rereview.py --repo OWNER/REPO --pr N --expect-head "$(git rev-parse HEAD)" --json` (never hand-write the trigger: it also stamps the cycle boundary; a non-posting `status`: `review_pending` → wait `--after <pending_since>`; `already_reviewed_head`, `request_in_progress` → fetch; `head_mismatch` → confirm the push, retry once; `review_request_uncertain` → the POST may have landed: do not re-request; re-run in two minutes; `capped` → Stopping Condition 1; any other status (`uncountable_*`, `lock_unavailable`, `state_unwritable`, `unconfirmed_unreadable`, `review_request_rejected`, …) → stop and relay exactly), capturing `created_at` as `REREVIEW_AT` only from a posted result. Then wait — primary (runtimes with background-task completion notifications, e.g. Claude Code): a **background** Bash task, one turn per wait:
    ```bash
    python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
      --wait --after "$REREVIEW_AT" --timeout 1800
