@@ -1,5 +1,5 @@
 {
-  "_source": "Shapes recorded from Claude Code reviews on anthropics/claude-agent-sdk-python#1418 and #1422 (hosted Code Review, 2026-10-21) and from a CI job running Claude Code's code-review skill that posts its summary as github-actions[bot] (qizsecurity/qiz#2885, 2026-10-21). Logins, paths and prose anonymized; markers and markup verbatim.",
+  "_source": "Shapes recorded from Claude Code reviews on anthropics/claude-agent-sdk-python#1418 and #1422 (hosted Code Review, 2026-10-21) and from a CI job running Claude Code's code-review skill that posts its summary as github-actions[bot] (a private repository, 2026-10-21). Logins, paths and prose anonymized; markers and markup verbatim.",
   "initial": {
     "number": 159,
     "url": "https://github.com/acme/widget/pull/159",
@@ -524,9 +524,9 @@
     }
   },
   "ci_summary": {
-    "number": 2885,
-    "url": "https://github.com/acme/widget/pull/2885",
-    "title": "Device walks resume after a restart",
+    "number": 42,
+    "url": "https://github.com/acme/widget/pull/42",
+    "title": "Jobs resume after a restart",
     "headRefOid": "03d21e0d0000000000000000000000000003d21e",
     "commits": {
       "nodes": [
@@ -558,9 +558,9 @@
             "login": "linear",
             "__typename": "Bot"
           },
-          "body": "<!-- linear-linkback -->\n<details>\n<summary><a href=\"https://linear.app/acme/issue/ACME-1\">ACME-1 Resume walks</a></summary>\n</details>",
+          "body": "<!-- linear-linkback -->\n<details>\n<summary><a href=\"https://linear.app/acme/issue/ACME-1\">ACME-1 Resume jobs</a></summary>\n</details>",
           "createdAt": "2026-10-21T06:56:00Z",
-          "url": "https://github.com/acme/widget/pull/2885#issuecomment-10"
+          "url": "https://github.com/acme/widget/pull/42#issuecomment-10"
         },
         {
           "id": "IC_review1",
@@ -568,9 +568,9 @@
             "login": "github-actions",
             "__typename": "Bot"
           },
-          "body": "# Code Review: PR #2885 - Device walks resume after a restart\n\n## Owners\n- **Author**: omri\n- **Reviewer**: asaf (review requested)\n\n## What Changed\n\nThis PR implements durable resume for device walks:\n\n1. **Cursor format v2**: carries the running findings count\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `wasm/modules/crowdstrike/resume_durable_test.go:19`\n**Severity**: Minor (test code only)\n\nThe `url.Parse` error is ignored:\n```go\nu, _ := url.Parse(rawURL)\n```\n\n**Suggested fix**: Check the error or add a comment explaining why it's safe to ignore.\n\n## Analysis\n\n### Correctness ✓\n\n1. **Cursor v2 format** is well-designed\n\n### Risks\n\n**Low**: This PR extends existing infrastructure.\n\n## Verdict\n\n**APPROVED** ✅\n\nThis is a well-designed, low-risk enhancement. The single minor lint issue does not block approval.\n\n<!-- review:complete -->",
+          "body": "# Code Review: PR #42 - Jobs resume after a restart\n\n## Owners\n- **Author**: dev-a\n- **Reviewer**: dev-b (review requested)\n\n## What Changed\n\nThis PR implements durable resume for jobs:\n\n1. **Cursor format v2**: carries the running findings count\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `src/jobs/resume_test.go:19`\n**Severity**: Minor (test code only)\n\nThe `url.Parse` error is ignored:\n```go\nu, _ := url.Parse(rawURL)\n```\n\n**Suggested fix**: Check the error or add a comment explaining why it's safe to ignore.\n\n## Analysis\n\n### Correctness ✓\n\n1. **Cursor v2 format** is well-designed\n\n### Risks\n\n**Low**: This PR extends existing infrastructure.\n\n## Verdict\n\n**APPROVED** ✅\n\nThis is a well-designed, low-risk enhancement. The single minor lint issue does not block approval.\n\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:09:01Z",
-          "url": "https://github.com/acme/widget/pull/2885#issuecomment-11"
+          "url": "https://github.com/acme/widget/pull/42#issuecomment-11"
         }
       ]
     },
@@ -588,9 +588,9 @@
     }
   },
   "ci_summary_clean": {
-    "number": 2885,
-    "url": "https://github.com/acme/widget/pull/2885",
-    "title": "Device walks resume after a restart",
+    "number": 42,
+    "url": "https://github.com/acme/widget/pull/42",
+    "title": "Jobs resume after a restart",
     "headRefOid": "449cdcdd0000000000000000000000000449cdcd",
     "commits": {
       "nodes": [
@@ -622,9 +622,9 @@
             "login": "github-actions",
             "__typename": "Bot"
           },
-          "body": "# Code Review: PR #2885 - Device walks resume after a restart\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `wasm/modules/crowdstrike/resume_durable_test.go:19`\n\nThe `url.Parse` error is ignored.\n\n## Verdict\n\n**APPROVED** ✅\n\n<!-- review:complete -->",
+          "body": "# Code Review: PR #42 - Jobs resume after a restart\n\n## Findings\n\n### Minor: Unchecked error in test code\n\n**File**: `src/jobs/resume_test.go:19`\n\nThe `url.Parse` error is ignored.\n\n## Verdict\n\n**APPROVED** ✅\n\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:09:01Z",
-          "url": "https://github.com/acme/widget/pull/2885#issuecomment-11"
+          "url": "https://github.com/acme/widget/pull/42#issuecomment-11"
         },
         {
           "id": "IC_ping1",
@@ -634,7 +634,7 @@
           },
           "body": "@claude review",
           "createdAt": "2026-10-21T07:39:00Z",
-          "url": "https://github.com/acme/widget/pull/2885#issuecomment-12"
+          "url": "https://github.com/acme/widget/pull/42#issuecomment-12"
         },
         {
           "id": "IC_review2",
@@ -642,9 +642,9 @@
             "login": "github-actions",
             "__typename": "Bot"
           },
-          "body": "## Code review — PR #2885\n\n**Zone owners:** asaf (c2/pkg/collector, 8 files) — already reviewed\n\n**What changed:**\n```text\n collector* ──▶ backend ──▶ ingest\n   (*changed: durable resume enabled)\n```\n\nNo issues found.\n\n**Blast radius:**\n```text\n  ✓ traced:   collector now cuts durable checkpoints\n```\n\n**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve\n<!-- review:complete -->",
+          "body": "## Code review — PR #42\n\n**Zone owners:** dev-b (pkg/worker, 8 files) — already reviewed\n\n**What changed:**\n```text\n worker* ──▶ backend ──▶ ingest\n   (*changed: durable resume enabled)\n```\n\nNo issues found.\n\n**Blast radius:**\n```text\n  ✓ traced:   worker now cuts durable checkpoints\n```\n\n**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve\n<!-- review:complete -->",
           "createdAt": "2026-10-21T07:51:54Z",
-          "url": "https://github.com/acme/widget/pull/2885#issuecomment-13"
+          "url": "https://github.com/acme/widget/pull/42#issuecomment-13"
         }
       ]
     },

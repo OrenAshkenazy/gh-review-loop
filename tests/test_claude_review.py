@@ -4,7 +4,7 @@ summary comments, login binding, discovery.
 Markup is recorded from live Claude Code reviews (hosted Code Review on
 anthropics/claude-agent-sdk-python#1418 and #1422, 2026-10-21) and from a CI
 job running Claude Code's code-review skill that posts its summary as
-github-actions[bot] (qizsecurity/qiz#2885, 2026-10-21), prose shortened.
+github-actions[bot] (2026-10-21), prose shortened, names and paths replaced.
 """
 
 from __future__ import annotations
@@ -41,6 +41,12 @@ def _cap_check_is_inert(monkeypatch):
     from conftest import stub_cap_check_known_under_cap
 
     stub_cap_check_known_under_cap(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _summary_state_is_unreadable_by_default(monkeypatch):
+    """An unreadable summary state pings as before; tests about it stub a PR."""
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: None)
 OLD_HEAD = "ff99634a0000000000000000000000000000ff99"
 NEW_HEAD = "e5d1c2c00000000000000000000000000000e5d1"
 
@@ -72,21 +78,21 @@ WORKING_COMMENT = (
     "I'll analyze this and get back to you."
 )
 CI_SUMMARY = (
-    "# Code Review: PR #2885 - Device walks resume after a restart\n\n"
-    "## Owners\n- **Author**: omri\n\n"
+    "# Code Review: PR #42 - Jobs resume after a restart\n\n"
+    "## Owners\n- **Author**: dev-a\n\n"
     "## Findings\n\n"
     "### Minor: Unchecked error in test code\n\n"
-    "**File**: `wasm/modules/crowdstrike/resume_durable_test.go:19`\n"
+    "**File**: `src/jobs/resume_test.go:19`\n"
     "**Severity**: Minor (test code only)\n\n"
     "The `url.Parse` error is ignored.\n\n"
     "### High: Cursor decode trusts the count\n\n"
-    "**File**: `wasm/modules/crowdstrike/resume.go:54`\n\n"
+    "**File**: `src/jobs/resume.go:54`\n\n"
     "A negative count is accepted.\n\n"
     "## Analysis\n\n### Correctness ✓\n\nFine.\n\n"
     "## Verdict\n\n**APPROVED** ✅\n\n<!-- review:complete -->"
 )
 CI_SUMMARY_CLEAN = (
-    "## Code review — PR #2885\n\n**What changed:**\n```text\ncollector ──▶ backend\n```\n\n"
+    "## Code review — PR #42\n\n**What changed:**\n```text\nworker ──▶ backend\n```\n\n"
     "No issues found.\n\n**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve\n"
     "<!-- review:complete -->"
 )
@@ -96,6 +102,28 @@ SKILL_LIST_SUMMARY = (
     "https://github.com/acme/widget/blob/abc123abc123abc123abc123abc123abc123abc1/src/auth.ts#L67-L72\n\n"
     "2. Memory leak: OAuth state not cleaned up\n\n"
     "https://github.com/acme/widget/blob/abc123abc123abc123abc123abc123abc123abc1/src/auth.ts#L88-L95\n\n"
+    "<!-- review:complete -->"
+)
+# A CI job's summary whose findings are paragraphs or numbered items opening
+# with their anchor and grade, closed by a verdict that counts them (every
+# shape seen live; paths and prose are stand-ins).
+GRADED_SUMMARY = (
+    "## Claude code review\n\n"
+    "Scope: build tooling only. The new `docs/RELEASING.md` is linked from the README.\n\n"
+    "1. `.github/workflows/release.yml:178` — **Warning:** The publish step copies `report.json` "
+    "unconditionally. Fix: copy it only if it exists.\n\n"
+    "2. `scripts/install-tools.sh:~53` — **Suggestion:** the usage string still reads "
+    "`Usage: $0 [--bin DIR]`. Fix: add `[--verbose]`.\n\n"
+    "**Warning:** `config/rules.json:65` — The ruleset requires results from "
+    "the `lint` tool (`ci.yml:268`).\n\n"
+    "`.github/workflows/audit.yml:256` **Warning:** `REPOS` include this repository.\n\n"
+    "`deploy/gateway.yaml:1` (also `deploy/routes.yaml:90`) — "
+    "**Warning:** Both shipped files name an internal host.\n\n"
+    "`scripts/*`, `.github/workflows/*` — **Suggestion:** none of these files ship.\n\n"
+    "**Suggestion (docs):** the README example is out of date.\n\n"
+    "Checked and fine:\n- **Secrets:** none in the diff.\n"
+    "- **Dependencies:** downloads are pinned by sha256.\n\n"
+    "**Verdict:** 0 Critical, 4 Warnings, 3 Suggestions — Request changes\n"
     "<!-- review:complete -->"
 )
 
@@ -349,13 +377,13 @@ def test_a_ci_summary_yields_graded_findings_with_their_file_and_line():
     assert parsed["approving"] is True
     assert parsed["open_findings"] == 2
     assert [(f["severity"], f["path"], f["line"], f["title"]) for f in parsed["findings"]] == [
-        ("low", "wasm/modules/crowdstrike/resume_durable_test.go", 19, "Unchecked error in test code"),
-        ("high", "wasm/modules/crowdstrike/resume.go", 54, "Cursor decode trusts the count"),
+        ("low", "src/jobs/resume_test.go", 19, "Unchecked error in test code"),
+        ("high", "src/jobs/resume.go", 54, "Cursor decode trusts the count"),
     ]
     assert parsed["findings"][0]["body"].startswith("### Minor: Unchecked error in test code")
     assert "url.Parse" in parsed["findings"][0]["body"]
     assert "Correctness" not in parsed["findings"][1]["body"], "the section ends at the next heading"
-    assert parsed["assessment"].startswith("Code Review: PR #2885")
+    assert parsed["assessment"].startswith("Code Review: PR #42")
 
 
 def test_a_clean_ci_summary_and_the_actions_clean_note_approve_with_zero_findings():
@@ -386,6 +414,85 @@ def test_numbered_findings_survive_an_approving_verdict():
     assert parsed["approving"] is True
     assert parsed["open_findings"] == 2
     assert [f["line"] for f in parsed["findings"]] == [67, 88]
+
+
+def test_graded_paragraphs_and_items_yield_a_finding_each_with_their_anchor():
+    """Every summary this CI job posted read as zero findings: no heading and
+    no blob link, so neither shape matched."""
+    parsed = parse_summary_comment(GRADED_SUMMARY)
+
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [
+        ("medium", ".github/workflows/release.yml", 178),
+        ("low", "scripts/install-tools.sh", 53),
+        ("medium", "config/rules.json", 65),
+        ("medium", ".github/workflows/audit.yml", 256),
+        ("medium", "deploy/gateway.yaml", 1),
+        ("low", "(review comment)", None),
+        ("low", "(review comment)", None),
+    ]
+    assert parsed["findings"][0]["title"] == "The publish step copies `report.json` unconditionally."
+    assert parsed["findings"][2]["title"].startswith("The ruleset requires results")
+    assert parsed["findings"][0]["body"].startswith("1. `.github/workflows/release.yml:178`")
+    assert "Fix: copy it only if it exists." in parsed["findings"][0]["body"]
+    assert parsed["approving"] is False
+    assert parsed["open_findings"] == 7
+    assert parsed["complete"] is True
+
+
+def test_a_graded_finding_survives_an_approving_verdict():
+    """The workflow's own rubric example is "0 Critical, 1 Warning, 2
+    Suggestions — Approve": approval read as zero open findings would call a
+    PR with an open Warning clean."""
+    body = (
+        "## Claude code review — PR #1\n\n"
+        "`ci/apply.sh:12` — **Warning:** the lookup always returns empty.\n\n"
+        "**Verdict:** 0 Critical, 1 Warning, 0 Suggestions — Approve\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert parsed["approving"] is True
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [("medium", "ci/apply.sh", 12)]
+    assert parsed["open_findings"] == 1
+    assert parsed["complete"] is True
+
+
+@pytest.mark.parametrize("verdict", [
+    "0 Critical, 0 Warnings, 1 Suggestion — Approve",
+    "0 Critical, 1 Warning, 0 Suggestions — Approve",
+    "1 Critical, 1 Warning, 3 Suggestions — Request changes",
+])
+def test_a_verdict_counting_findings_the_parser_missed_leaves_the_summary_incomplete(verdict):
+    """A summary that approved with one Suggestion the parser could not read
+    reported zero open findings: the verdict's count is
+    what the summary claims, so fewer parsed findings means read it."""
+    body = (
+        "## Claude code review — PR #1\n\nThe usage line in the installer still omits the new flag.\n\n"
+        f"**Verdict:** {verdict}\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert parsed["findings"] == []
+    assert parsed["open_findings"] is None
+    assert parsed["complete"] is False
+
+
+def test_a_verdict_counting_zero_is_a_complete_clean_summary_without_an_approve():
+    body = "## Claude code review — PR #1\n\nNothing to flag.\n\n**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Comment\n<!-- review:complete -->"
+    parsed = parse_summary_comment(body)
+
+    assert parsed["approving"] is False
+    assert parsed["open_findings"] == 0
+    assert parsed["complete"] is True
+
+
+def test_graded_summary_findings_become_threads_graded_for_the_severity_filter():
+    pr = _pr(comments=[_comment(GRADED_SUMMARY, "2026-01-05T10:30:00Z", author="github-actions", comment_id="IC_g")])
+    review_vendors.bind_login("github-actions", "claude")
+
+    threads = summary_comment_findings(pr, "github-actions")
+
+    assert [thread_severity(t) for t in threads] == ["medium", "low", "medium", "medium", "medium", "low", "low"]
+    assert all(t["isSummaryCommentFinding"] for t in threads)
 
 
 def test_a_blob_link_in_prose_is_not_a_finding():
@@ -476,8 +583,8 @@ def test_summary_findings_become_synthetic_threads_graded_by_the_summary():
 
     assert [f["id"] for f in findings] == ["pr-comment:IC_review1:1", "pr-comment:IC_review1:2"]
     assert [(f["path"], f["line"]) for f in findings] == [
-        ("wasm/modules/crowdstrike/resume_durable_test.go", 19),
-        ("wasm/modules/crowdstrike/resume.go", 54),
+        ("src/jobs/resume_test.go", 19),
+        ("src/jobs/resume.go", 54),
     ]
     assert [thread_severity(f) for f in findings] == ["low", "high"]
     assert all(f["isReviewBodyFinding"] and f["isSummaryCommentFinding"] for f in findings)
@@ -811,6 +918,157 @@ def test_codex_pings_never_read_reviews_for_a_head_dedupe(monkeypatch, capsys):
     assert posted["phrase"] == "@codex review"
 
 
+# --- a CI job that posts summaries: head dedupe and push reviews ---------------
+
+ARRIVED = "2026-01-05T12:00:40Z"
+CHECKS = [{"__typename": "CheckRun", "startedAt": ARRIVED, "checkSuite": {"createdAt": ARRIVED}}]
+CI_ARGS = ["--repo", "acme/widget", "--pr", "7", "--reviewer-login", "github-actions",
+           "--reviewer-vendor", "claude", "--expect-head", NEW_HEAD, "--json"]
+
+
+def _ci_summary(created_at, comment_id):
+    return _comment(CI_SUMMARY_CLEAN, created_at, author="github-actions", comment_id=comment_id)
+
+
+def _ping(created_at, comment_id, body="@claude review"):
+    return {**_comment(body, created_at, author="loop-agent", comment_id=comment_id),
+            "author": {"login": "loop-agent", "__typename": "User"}}
+
+
+def _ci_request(monkeypatch, comments):
+    monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: NEW_HEAD)
+    monkeypatch.setattr(request_rereview, "_all_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(
+        request_rereview, "read_summary_pull_request",
+        lambda *a, **k: _pr(comments=comments, head=NEW_HEAD, committed="2026-01-05T12:00:24Z", checks=CHECKS),
+    )
+    posted = []
+    monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
+        posted.append(phrase) or {"created_at": "2026-01-05T12:01:00Z", "repo": repo, "pr": pr, "phrase": phrase}
+    ))
+    return posted
+
+
+def _push_waits():
+    logged = request_rereview.loop_state.read_request_log("acme/widget", 7) or []
+    return [item for item in logged if item.get("via") == "push"]
+
+
+def test_a_ci_summary_covering_the_head_is_not_pinged_again(monkeypatch, capsys):
+    """The CI job posts comments, never reviews, so the head dedupe that read
+    only reviews could not fire: every cycle pinged a head the push-triggered
+    run had already reviewed."""
+    posted = _ci_request(monkeypatch, [_ci_summary("2026-01-05T12:02:11Z", "IC_new")])
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "already_reviewed_head"
+    assert payload["head"] == NEW_HEAD
+    assert posted == []
+
+
+def test_a_summary_of_the_previous_head_does_not_cover_the_new_one(monkeypatch, capsys):
+    posted = _ci_request(monkeypatch, [_ci_summary("2026-01-05T12:00:30Z", "IC_old")])
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert posted == ["@claude review"]
+    assert _push_waits() == []
+
+
+def test_a_ci_job_that_reviews_every_push_is_waited_for_not_pinged(monkeypatch, capsys):
+    """Two summaries no trigger asked for: the repository reviews every push.
+    A ping then only starts a second, interactive Claude run beside the push
+    review."""
+    history = [_ci_summary("2026-01-05T09:00:00Z", "IC_1"), _ci_summary("2026-01-05T10:00:00Z", "IC_2")]
+    posted = _ci_request(monkeypatch, history)
+
+    for _ in range(2):
+        assert request_rereview.main(CI_ARGS) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "review_pending"
+        assert payload["reason"] == "reviews_on_push"
+        assert payload["pending_since"] == ARRIVED
+        assert payload["posted"] is False
+        assert "--wait --after" in payload["message"]
+
+    assert posted == []
+    # One cap-countable cycle for the head, however often the agent asks.
+    assert [(w["reviewer"], w["head"], w["countable"]) for w in _push_waits()] == [("github-actions", NEW_HEAD, True)]
+
+
+def test_a_prompted_history_is_not_push_reviewing(monkeypatch, capsys):
+    history = [
+        _ci_summary("2026-01-05T09:00:00Z", "IC_1"),
+        _ping("2026-01-05T09:30:00Z", "IC_p"),
+        _ci_summary("2026-01-05T10:00:00Z", "IC_2"),
+        # The job's own "comment @claude to re-run" note is not a trigger.
+        _comment("⚠️ Review truncated. Comment `@claude` to re-run.", "2026-01-05T10:10:00Z",
+                 author="github-actions", comment_id="IC_note"),
+    ]
+    posted = _ci_request(monkeypatch, history)
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert posted == ["@claude review"]
+
+
+def test_a_ping_the_action_answered_itself_did_not_prompt_the_next_summary(monkeypatch, capsys):
+    """A loop that pings from its first fix never sees two unasked summaries:
+    each push review follows a ping. But the ping was answered by the
+    action's own finished reply, and the summary after it came from the push."""
+    finished = "**Claude finished @loop-agent's task in 1m 02s** —— [View job](https://example.invalid)"
+    history = [
+        _ci_summary("2026-01-04T08:00:00Z", "IC_open"),
+        _ping("2026-01-04T09:00:18Z", "IC_p"),
+        _comment(finished, "2026-01-04T09:00:33Z", author="github-actions", comment_id="IC_reply"),
+        _ci_summary("2026-01-04T09:01:17Z", "IC_push"),
+    ]
+    posted = _ci_request(monkeypatch, history)
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    assert json.loads(capsys.readouterr().out)["reason"] == "reviews_on_push"
+    assert posted == []
+
+    # Still running ("Claude Code is working…"): not an answer yet.
+    history[2] = _comment(WORKING_COMMENT, "2026-01-04T09:00:33Z", author="github-actions", comment_id="IC_reply")
+    posted = _ci_request(monkeypatch, history)
+    assert request_rereview.main(CI_ARGS) == 0
+    assert posted == ["@claude review"]
+
+
+def test_push_review_waits_count_toward_the_cap(monkeypatch, capsys):
+    history = [_ci_summary("2026-01-05T09:00:00Z", "IC_1"), _ci_summary("2026-01-05T10:00:00Z", "IC_2")]
+    _ci_request(monkeypatch, history)
+    monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
+    monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: 1)
+    for index, head in enumerate((OLD_HEAD, "c0ffee" + "0" * 34)):
+        request_rereview.loop_state.append_request_log("acme/widget", 7, {
+            "reviewer": "github-actions", "at": f"2026-01-05T0{index}:00:00Z",
+            "countable": True, "via": "push", "head": head,
+        })
+
+    assert request_rereview.main(CI_ARGS) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "capped"
+    assert payload["rereviews_used"] == 3
+
+
+def test_the_fetch_counts_push_review_waits_like_requests():
+    pr = _pr(comments=[_ping("2026-01-05T09:30:00Z", "IC_p")])
+    review_vendors.bind_login("github-actions", "claude")
+
+    counted = fgt.rereview_requests(
+        pr, "loop-agent", review_trigger_mention="@claude", reviewer_login="github-actions",
+        push_review_waits=["2026-01-05T12:00:41Z"],
+    )
+
+    assert len(counted) == 2
+
+
 def test_a_bound_login_given_on_the_command_line_posts_claudes_command(monkeypatch, capsys):
     monkeypatch.setattr(request_rereview, "head_already_reviewed", lambda *a, **k: None)
     posted = {}
@@ -819,7 +1077,7 @@ def test_a_bound_login_given_on_the_command_line_posts_claudes_command(monkeypat
     ))
 
     assert request_rereview.main([
-        "--repo", "acme/widget", "--pr", "2885",
+        "--repo", "acme/widget", "--pr", "42",
         "--reviewer-login", "github-actions", "--reviewer-vendor", "claude", "--json",
     ]) == 0
     assert posted["phrase"] == "@claude review"
@@ -828,7 +1086,7 @@ def test_a_bound_login_given_on_the_command_line_posts_claudes_command(monkeypat
 def test_the_persisted_binding_is_restored_by_the_request_script(monkeypatch, capsys, tmp_path):
     record = reviewer_resolver.make_reviewer_record("github-actions", source="confirmed", vendor="claude")
     review_vendors.unbind_all()
-    state = {"acme/widget#2885": {"reviewer": record}}
+    state = {"acme/widget#42": {"reviewer": record}}
     (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
     monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(request_rereview, "head_already_reviewed", lambda *a, **k: None)
@@ -837,7 +1095,7 @@ def test_the_persisted_binding_is_restored_by_the_request_script(monkeypatch, ca
         posted.update(phrase=phrase) or {"created_at": "2026-10-21T07:39:00Z", "repo": repo, "pr": pr, "phrase": phrase}
     ))
 
-    assert request_rereview.main(["--repo", "acme/widget", "--pr", "2885", "--json"]) == 0
+    assert request_rereview.main(["--repo", "acme/widget", "--pr", "42", "--json"]) == 0
     assert posted["phrase"] == "@claude review"
 
 

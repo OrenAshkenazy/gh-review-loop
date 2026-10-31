@@ -38,6 +38,9 @@ import reviewer_resolver
 import loop_state  # noqa: E402 — sibling module, stdlib-only
 
 
+# The vendor the loop may *suggest* (review_vendors.SUGGESTED_VENDOR). Never a
+# fallback: with no reviewer named and none persisted the script refuses with
+# ``reviewer_not_configured`` instead of pinging a bot nobody chose.
 DEFAULT_REVIEWER_MENTION = review_vendors.DEFAULT_VENDOR.mention
 DEFAULT_REVIEWER_LOGIN = review_vendors.DEFAULT_VENDOR.login
 
@@ -65,6 +68,20 @@ def no_safe_trigger_payload(reviewer_login: str) -> dict[str, Any]:
     }
 
 
+def reviewer_not_configured_payload(repo: str, pr: int) -> dict[str, Any]:
+    return {
+        "status": "reviewer_not_configured",
+        "posted": False,
+        "repo": repo,
+        "pr": pr,
+        "message": (
+            "No reviewer is configured for this PR, so nothing was posted. Run "
+            "fetch_gemini_threads.py --list-reviewers, confirm the reviewer with "
+            "the user and persist it with --reviewer, or pass --reviewer-login."
+        ),
+    }
+
+
 # A pending review request older than this with no review for the head is
 # treated as abandoned and re-requested. Observed Copilot latency on public
 # PRs is 4 s to ~8 min (spec §9, LV-5).
@@ -85,6 +102,39 @@ query($owner:String!, $repo:String!, $number:Int!) {
       headRefOid
       reviewRequests(first:50) {
         nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } } }
+      }
+    }
+  }
+}
+"""
+
+
+# What a reviewer that posts its verdict as a PR comment (a CI job running
+# Claude Code) has said about the head: when the head reached the PR, and the
+# recent comments, which hold both its summaries and the triggers before them.
+SUMMARY_STATE_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      headRefOid
+      commits(last:1) {
+        nodes {
+          commit {
+            committedDate
+            statusCheckRollup {
+              contexts(first:50) {
+                nodes {
+                  __typename
+                  ... on CheckRun { startedAt checkSuite { createdAt } }
+                  ... on StatusContext { createdAt }
+                }
+              }
+            }
+          }
+        }
+      }
+      comments(last:100) {
+        nodes { author { login } body createdAt }
       }
     }
   }
@@ -185,6 +235,18 @@ def review_pending_payload(repo: str, pr: int, reviewer: str, pending_since: str
             "posted (a second request would produce a second review). Wait for it."
         ),
     }
+
+
+def push_review_pending_payload(repo: str, pr: int, reviewer: str, head: str, pending_since: str) -> dict[str, Any]:
+    payload = review_pending_payload(repo, pr, reviewer, pending_since)
+    payload["reason"] = "reviews_on_push"
+    payload["head"] = head
+    payload["message"] = (
+        f"`{reviewer}` reviews every push and has not reviewed head {head[:7]} yet; "
+        "no request was posted (a ping would start a second review). Wait with "
+        f"--wait --after {pending_since}. The wait counts as a re-review cycle."
+    )
+    return payload
 
 
 def head_mismatch_payload(repo: str, pr: int, expected_head: str, head: str) -> dict[str, Any]:
@@ -621,7 +683,8 @@ def resolve_review_trigger(
     if reviewer_login:
         return reviewer_resolver.trigger_for(reviewer_login), reviewer_login
 
-    return DEFAULT_REVIEWER_MENTION, DEFAULT_REVIEWER_LOGIN
+    # No reviewer: never the suggested vendor's trigger (main() refuses first).
+    return None, None
 
 
 DEFAULT_REREVIEW_LIMIT = 3
@@ -863,6 +926,88 @@ def head_already_reviewed(
         if _review_commit(review) == head:
             return head
     return None
+
+
+def read_summary_pull_request(repo: str, pr: int, runner: Any = None) -> dict[str, Any] | None:
+    """The PR as ``SUMMARY_STATE_QUERY`` reads it; None when unreadable."""
+    if runner is None:
+        runner = subprocess.run
+    owner, repo_name = parse_repo(repo)
+    data = _gh_json(
+        ["gh", "api", "graphql", "-f", f"query={SUMMARY_STATE_QUERY}",
+         "-F", f"owner={owner}", "-F", f"repo={repo_name}", "-F", f"number={pr}"],
+        runner,
+    )
+    try:
+        pull = data["data"]["repository"]["pullRequest"]
+    except (KeyError, TypeError):
+        return None
+    return pull if isinstance(pull, dict) else None
+
+
+def summary_review_state(
+    pull_request: dict[str, Any], vendor: review_vendors.ReviewVendor, *, login: str
+) -> dict[str, Any]:
+    """What ``login``'s review summaries (PR comments) say about the head.
+
+    ``covers_head``: a finished summary was posted after the head reached the
+    PR, the fetch's own coverage rule (``reviewer_resolver.head_arrived_at``);
+    without an arrival time nothing can be shown to cover it. The CI job posts
+    comments, never reviews, so the review-based dedupe could not see this.
+    ``reviews_on_push``: at least two summaries arrived with no trigger
+    comment since the summary before, so the repository reviews every push and
+    a ping only starts a second Claude run beside the push review. The
+    job's own notes are not triggers,
+    and a trigger the action already answered with its own finished reply did
+    not prompt the summary after it: without that, a loop that pings from its
+    first fix would never see two unasked summaries.
+    """
+    arrived = reviewer_resolver.head_arrived_at(pull_request)
+    trigger = _trigger_re(vendor.mention)
+    comments = sorted(
+        (c for c in (pull_request.get("comments") or {}).get("nodes") or [] if isinstance(c, dict)),
+        key=lambda c: c.get("createdAt") or "",
+    )
+    covers_head, unprompted, prompted = False, 0, False
+    for comment in comments:
+        body = comment.get("body") or ""
+        if _same_review_author((comment.get("author") or {}).get("login"), login):
+            if review_vendors.summary_review_vendor(body) is not vendor:
+                if not review_vendors.CLAUDE_IN_PROGRESS_RE.search(body):
+                    prompted = False
+                continue
+            unprompted += 0 if prompted else 1
+            prompted = False
+            if arrived and (comment.get("createdAt") or "") >= arrived:
+                covers_head = True
+        elif trigger.search(body):
+            prompted = True
+    return {
+        "head": pull_request.get("headRefOid") or "",
+        "arrived_at": arrived,
+        "covers_head": covers_head,
+        "reviews_on_push": unprompted >= 2,
+    }
+
+
+def recorded_push_waits(repo: str, pr: int, vendor: review_vendors.ReviewVendor) -> list[dict[str, Any]] | None:
+    return reviewer_resolver.push_review_waits(loop_state.read_request_log(repo, pr), vendor)
+
+
+def record_push_review_wait(repo: str, pr: int, reviewer: str, head: str, at: str) -> None:
+    """Record waiting on the push review as this cycle's request, once per head.
+
+    The wait stands where a ping would have been posted, so it closes the
+    cycle and counts toward the cap the same way; without it a repository
+    that reviews every push would leave the loop uncapped.
+    """
+    logged = loop_state.append_request_log(repo, pr, {
+        "reviewer": reviewer, "at": at, "countable": True, "via": "push", "head": head,
+    })
+    if not logged:
+        print("warning: could not record the push-review wait for the cap", file=sys.stderr)
+        loop_state.mark_provenance_incomplete(repo, pr)
+    stamp_cycle(repo, pr, None)
 
 
 def current_head(repo: str, pr: int, runner: Any = None) -> str | None:
@@ -2192,7 +2337,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phrase",
         default=None,
-        help=f"Review request phrase. Default: {DEFAULT_PHRASE!r}",
+        help=(
+            "Review request phrase. Default: the selected reviewer's own phrase "
+            "(e.g. '@claude review')."
+        ),
     )
     parser.add_argument(
         "--reviewer-mention",
@@ -2200,8 +2348,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="reviewer_mention",
         default=None,
         help=(
-            "Reviewer mention used when --phrase is omitted. "
-            f"Default: {DEFAULT_REVIEWER_MENTION!r}."
+            "Reviewer mention used when --phrase is omitted. Default: the "
+            "persisted reviewer's; with none persisted nothing is posted."
         ),
     )
     parser.add_argument(
@@ -2302,6 +2450,12 @@ def main(argv: list[str] | None = None) -> int:
         reviewer_login=args.reviewer_login,
         reviewer_mention=args.reviewer_mention,
     )
+    if reviewer_login is None and args.phrase is None:
+        # Nothing named and nothing persisted. The loop has no default
+        # reviewer; pinging the suggested one tagged Codex on PRs Claude was
+        # reviewing.
+        _emit(reviewer_not_configured_payload(args.repo, args.pr), json_output=args.json_output)
+        return 0
     vendor = review_vendors.vendor_for(reviewer_login)
     if vendor is not None and vendor.trigger_kind == "review_request":
         return run_review_request(args, vendor)
@@ -2332,6 +2486,31 @@ def main(argv: list[str] | None = None) -> int:
             _emit(already_reviewed_payload(args.repo, args.pr, reviewer_login or vendor.login, reviewed_head),
                   json_output=args.json_output)
             return 0
+
+    # A vendor whose verdict can be a PR comment (a CI job running Claude
+    # Code) never submits a review the check above could see. Its summaries
+    # answer the same question, and tell whether the repository reviews every
+    # push, in which case the loop waits for that review instead of pinging.
+    # A torn local log leaves earlier waits uncountable: ping, as before.
+    push_waits: list[dict[str, Any]] | None = None
+    push_wait: dict[str, Any] | None = None
+    if vendor is not None and vendor.summary_comments and not args.dry_run:
+        push_waits = recorded_push_waits(args.repo, args.pr, vendor)
+        pull = read_summary_pull_request(args.repo, args.pr)
+        summary = summary_review_state(pull, vendor, login=reviewer_login or vendor.login) if pull else None
+        if summary and summary["head"] and (head is None or summary["head"] == head):
+            if summary["covers_head"]:
+                _emit(already_reviewed_payload(args.repo, args.pr, reviewer_login or vendor.login, summary["head"]),
+                      json_output=args.json_output)
+                return 0
+            if summary["reviews_on_push"] and summary["arrived_at"] and push_waits is not None:
+                push_wait = summary
+                if any(wait.get("head") == summary["head"] for wait in push_waits):
+                    # Already waiting on this head, and already counted.
+                    _emit(push_review_pending_payload(
+                        args.repo, args.pr, reviewer_login or vendor.login, summary["head"], summary["arrived_at"],
+                    ), json_output=args.json_output)
+                    return 0
 
     try:
         trigger = None
@@ -2386,6 +2565,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[loop] {payload['message']}")
                 return 0
             used = count_agent_pings(args.repo, args.pr, countable, gh_login())
+            if used is not None and push_waits:
+                used += len(push_waits)
             if used is None:
                 # The count could not be established (gh login unresolved, the
                 # comments query failed, or its output was unparseable). Posting
@@ -2404,6 +2585,13 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"[loop] {payload['message']}")
                 return 0
+        if push_wait is not None:
+            reviewer = reviewer_login or vendor.login
+            record_push_review_wait(args.repo, args.pr, reviewer, push_wait["head"], utc_now_iso())
+            _emit(push_review_pending_payload(
+                args.repo, args.pr, reviewer, push_wait["head"], push_wait["arrived_at"],
+            ), json_output=args.json_output)
+            return 0
         payload = post_rereview(args.repo, args.pr, phrase, dry_run=args.dry_run)
         # A dry run posts nothing, so it closes no cycle.
         if payload.get("posted") is not False and not payload.get("dry_run"):

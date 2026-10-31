@@ -48,7 +48,7 @@ Source for the documented rows: code.claude.com/docs/en/code-review and
 | Tracking comment (interactive / `track_progress`) | created at start: `Claude Code is working… <img …>` + "I'll analyze this and get back to you.", edited in place |
 | Severity | none in the skill's inline comments |
 
-### 1.3 Custom CI job (the requesting organization, `qizsecurity/qiz#2885`)
+### 1.3 Custom CI job (a private repository)
 
 `claude-code-review.yml`: `anthropics/claude-code-action@v1` with
 `github_token: GITHUB_TOKEN` and an org skill; the review is written to a file

@@ -349,6 +349,59 @@ def loop_request_times_from_entry(
     return sorted(out)
 
 
+def push_review_waits(
+    logged: list[dict[str, Any]] | None,
+    vendor: review_vendors.ReviewVendor,
+) -> list[dict[str, Any]] | None:
+    """The cycles the loop waited on ``vendor``'s push review instead of pinging.
+
+    A repository that reviews every push answers the push itself, so the loop
+    records the wait (``via: "push"``, one per head) where a ping would have
+    left a comment; the cap counts these like requests. None when the log is
+    incomplete: a torn record could be one of them.
+    """
+    if logged and any(isinstance(item, dict) and item.get("incomplete") for item in logged):
+        return None
+    return [
+        item for item in logged or []
+        if isinstance(item, dict)
+        and item.get("via") == "push"
+        and review_vendors.vendor_for(item.get("reviewer")) is vendor
+    ]
+
+
+def head_arrived_at(pull_request: dict[str, Any]) -> str:
+    """When the head commit can first be shown to have reached the PR, or "".
+
+    A commit's ``committedDate`` is when it was made, which can be hours
+    before it was pushed: a clean summary posted in between
+    would otherwise read as covering a head the reviewer never saw. GitHub
+    creates a check suite or commit status only once a commit is pushed, so
+    the earliest one on the head is a boundary the push cannot postdate. The
+    later of the two is used; a head with no checks keeps ``committedDate``.
+    """
+    nodes = (pull_request.get("commits") or {}).get("nodes") or []
+    for node in reversed(nodes):
+        if not isinstance(node, dict):
+            continue
+        commit = node.get("commit") or {}
+        committed = commit.get("committedDate")
+        committed = committed if isinstance(committed, str) else ""
+        rollup = commit.get("statusCheckRollup") or {}
+        contexts = (rollup.get("contexts") or {}).get("nodes") or []
+        created: list[str] = []
+        for context in contexts:
+            if not isinstance(context, dict):
+                continue
+            suite = context.get("checkSuite") or {}
+            for value in (suite.get("createdAt"), context.get("startedAt"), context.get("createdAt")):
+                if isinstance(value, str) and value:
+                    created.append(value)
+                    break
+        return max(committed, min(created) if created else "")
+    return ""
+
+
 def _parse_instant(value: str) -> _dt.datetime | None:
     try:
         return _dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(

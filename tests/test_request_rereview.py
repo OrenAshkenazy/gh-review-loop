@@ -84,6 +84,7 @@ def test_json_stdout_parses_as_json_and_has_no_ansi(monkeypatch, capsys):
         "OrenAshkenazy/AegisLocal",
         "--pr",
         "11",
+        "--reviewer-login", "chatgpt-codex-connector",
         "--json",
     ])
 
@@ -114,10 +115,49 @@ def test_human_mode_includes_timestamp(monkeypatch, capsys):
         },
     )
 
-    rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11"])
+    rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11", "--reviewer-login", "chatgpt-codex-connector"])
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == f"[loop] Re-review requested at {CREATED_AT}"
+
+
+def test_no_configured_reviewer_posts_nothing(monkeypatch, capsys):
+    """Nothing persisted and no reviewer named: the loop has no default
+    reviewer, so the script refuses rather than guess one. Falling back to
+    the suggested vendor posted `@codex review` on PRs that Claude was
+    reviewing."""
+    monkeypatch.setattr(
+        request_rereview, "post_rereview",
+        lambda *a, **k: pytest.fail("no reviewer is configured; nothing may be posted"),
+    )
+
+    rc = request_rereview.main(["--repo", "acme/widget", "--pr", "7", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["status"] == "reviewer_not_configured"
+    assert payload["posted"] is False
+    assert "--list-reviewers" in payload["message"]
+
+
+def test_no_configured_reviewer_refuses_in_text_mode_and_on_a_dry_run(capsys):
+    for extra in ([], ["--dry-run"]):
+        rc = request_rereview.main(["--repo", "acme/widget", "--pr", "7", *extra])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.startswith("[loop] No reviewer is configured")
+        assert "@codex" not in out
+
+
+def test_an_explicit_phrase_still_posts_without_a_selection(monkeypatch, capsys):
+    posted = {}
+    monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
+        posted.update(phrase=phrase) or {"created_at": CREATED_AT, "repo": repo, "pr": pr, "phrase": phrase}
+    ))
+
+    assert request_rereview.main(["--repo", "acme/widget", "--pr", "7", "--phrase", "@codex review"]) == 0
+    assert posted["phrase"] == "@codex review"
 
 
 def test_invalid_repo_format_fails(capsys):
@@ -154,7 +194,7 @@ def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
 
     request_rereview.post_rereview = failing_post
     try:
-        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11"])
+        rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11", "--reviewer-login", "chatgpt-codex-connector"])
     finally:
         request_rereview.post_rereview = original
 
@@ -165,7 +205,7 @@ def test_gh_failure_exits_nonzero_and_writes_clear_stderr(capsys):
     assert "permission denied" in captured.err
 
 
-def test_default_phrase_is_used_when_omitted(monkeypatch, capsys):
+def test_a_named_codex_reviewer_gets_its_exact_phrase(monkeypatch, capsys):
     captured = {}
 
     def fake_post(repo, pr, phrase, **kwargs):
@@ -179,7 +219,7 @@ def test_default_phrase_is_used_when_omitted(monkeypatch, capsys):
 
     monkeypatch.setattr(request_rereview, "post_rereview", fake_post)
 
-    rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11"])
+    rc = request_rereview.main(["--repo", "OrenAshkenazy/AegisLocal", "--pr", "11", "--reviewer-login", "chatgpt-codex-connector"])
 
     capsys.readouterr()
     assert rc == 0
@@ -559,7 +599,7 @@ class TestCapEnforcement:
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
 
         rc = request_rereview.main(
-            ["--repo", "acme/widget", "--pr", "159", "--json"]
+            ["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "chatgpt-codex-connector", "--json"]
         )
 
         payload = json.loads(capsys.readouterr().out)
@@ -582,7 +622,7 @@ class TestCapEnforcement:
         monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: 2)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
 
-        assert request_rereview.main(["--repo", "acme/widget", "--pr", "159"]) == 0
+        assert request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "chatgpt-codex-connector"]) == 0
         capsys.readouterr()
         assert posted == ["@codex review"]
 
@@ -696,7 +736,7 @@ class TestMentionExtraction:
         monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
         monkeypatch.setattr(request_rereview, "effective_cap", lambda *a: 3)
 
-        rc = request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--json"])
+        rc = request_rereview.main(["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "chatgpt-codex-connector", "--json"])
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         assert posted == []
@@ -717,7 +757,7 @@ class TestMentionExtraction:
         monkeypatch.setattr(request_rereview, "count_agent_pings", lambda *a, **k: None)
 
         rc = request_rereview.main(
-            ["--repo", "acme/widget", "--pr", "159", "--no-cap-check"]
+            ["--repo", "acme/widget", "--pr", "159", "--reviewer-login", "chatgpt-codex-connector", "--no-cap-check"]
         )
         capsys.readouterr()
         assert rc == 0

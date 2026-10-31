@@ -784,7 +784,7 @@ Spec §11. README (prerequisites bullet, table row for Copilot above the configu
 
 ### Task 10: Live validation (first real run)
 
-Requires a Copilot-enabled repo the `gh` session can write to. Preferred: a scratch repo under `OrenAshkenazy` once a Copilot Pro/Pro+/Max plan is active (same account as the `gh` token, no SSO). Fallback: `qizsecurity/k8s-deploy#37` after SSO authorization. If neither is available, stop and report; do not substitute.
+Requires a Copilot-enabled repo the `gh` session can write to. Preferred: a scratch repo under `OrenAshkenazy` once a Copilot Pro/Pro+/Max plan is active (same account as the `gh` token, no SSO). Fallback: an organization repository with Copilot code review, after SSO authorization. If neither is available, stop and report; do not substitute.
 
 - [ ] Discovery: `fetch_gemini_threads.py --pr <url> --list-reviewers --format json` → Copilot candidate with `trigger_kind: review_request`.
 - [ ] `request_rereview.py --repo O/R --pr N --reviewer-login copilot-pull-request-reviewer --dry-run --json` → `would_post` or a state stop.

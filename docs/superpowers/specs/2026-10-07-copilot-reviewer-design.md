@@ -353,7 +353,7 @@ Raw query output is kept at `docs/superpowers/specs/evidence/2026-10-10-copilot-
 Protocol (owner runs, or the agent after SSO), on PR 37:
 
 ```bash
-R=qizsecurity/k8s-deploy; N=37
+R=OWNER/REPO; N=PR_NUMBER
 gh api repos/$R/pulls/$N --jq '{head:.head.sha, requested:[.requested_reviewers[].login]}'
 gh api --paginate repos/$R/pulls/$N/reviews --jq '.[]|select(.user.type=="Bot")|{login:.user.login,state,commit:.commit_id[0:7],at:.submitted_at}'
 # push a trivial commit to the PR branch, then:
@@ -361,7 +361,7 @@ date -u +%Y-%m-%dT%H:%M:%SZ
 gh api -X POST repos/$R/pulls/$N/requested_reviewers -f 'reviewers[]=copilot-pull-request-reviewer[bot]' --jq '{requested:[.requested_reviewers[].login]}'
 # every 30s for up to 10 min (LV-3 while it runs, LV-1 at the end):
 gh api repos/$R/pulls/$N --jq '{head:.head.sha[0:7], requested:[.requested_reviewers[].login]}'
-gh api graphql -f query='query{repository(owner:"qizsecurity",name:"k8s-deploy"){pullRequest(number:37){headRefOid reviews(last:5){nodes{author{login} state submittedAt commit{abbreviatedOid}}} timelineItems(last:10,itemTypes:[REVIEW_REQUESTED_EVENT]){nodes{... on ReviewRequestedEvent{createdAt actor{login} requestedReviewer{... on Bot{login}}}}}}}}'
+gh api graphql -f query='query{repository(owner:"OWNER",name:"REPO"){pullRequest(number:PR_NUMBER){headRefOid reviews(last:5){nodes{author{login} state submittedAt commit{abbreviatedOid}}} timelineItems(last:10,itemTypes:[REVIEW_REQUESTED_EVENT]){nodes{... on ReviewRequestedEvent{createdAt actor{login} requestedReviewer{... on Bot{login}}}}}}}}'
 # LV-2: repeat the POST without pushing; LV-6: POST twice within 10s.
 ```
 

@@ -189,6 +189,7 @@ def test_request_rereview_json_stdout_is_json_only(monkeypatch, capsys):
         "OrenAshkenazy/AegisLocal",
         "--pr",
         "11",
+        "--reviewer-login", "chatgpt-codex-connector",
         "--json",
     ])
 
@@ -210,6 +211,7 @@ def test_request_rereview_json_failure_has_stderr_and_no_stdout(monkeypatch, cap
         "OrenAshkenazy/AegisLocal",
         "--pr",
         "11",
+        "--reviewer-login", "chatgpt-codex-connector",
         "--json",
     ])
 

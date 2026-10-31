@@ -427,14 +427,15 @@ def summary_is_stale(run: dict[str, Any]) -> bool:
     return safe_int(run.get("update_seq")) > safe_int(run.get("last_summary_seq"))
 
 
-def resolve_current_repo() -> str:
-    """Return 'owner/repo' for the current dir without needing an open PR."""
+def resolve_current_repo(cwd: str | None = None) -> str:
+    """Return 'owner/repo' for ``cwd`` (default: the current dir) without needing an open PR."""
     proc = subprocess.run(
         ["gh", "repo", "view", "--json", "nameWithOwner"],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=cwd,
     )
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip()

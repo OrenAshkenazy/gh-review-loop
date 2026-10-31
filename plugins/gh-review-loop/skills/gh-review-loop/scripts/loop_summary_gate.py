@@ -39,13 +39,41 @@ from loop_state import (  # noqa: E402 — slim, stdlib-only (see #83)
     summary_is_stale,
 )
 from hook_runtime import (  # noqa: E402
+    hook_cwd,
     load_hook_payload,
     python_script_command,
     tool_command,
     tool_name,
 )
 
-_GIT_PUSH_RE = re.compile(r"\bgit\s+push\b")
+_PATH_ARG = r"""("[^"]*"|'[^']*'|[^\s;&|()]+)"""
+_GIT_PUSH_RE = re.compile(r"\bgit\s+(?:-C\s+" + _PATH_ARG + r"\s+)?push\b")
+_CD_RE = re.compile(r"(?:^|[;&|(\s])cd\s+" + _PATH_ARG)
+
+
+def push_target_dir(command: str, cwd: str | None) -> str | None:
+    """The directory the command's ``git push`` runs in, when the command says.
+
+    ``git -C <dir> push``, else the last ``cd <dir>`` before the push, relative
+    to ``cwd``. None means the hook's own directory. Resolving only that one
+    let a session in another repo push the looped repo with ``cd <clone> &&
+    git push`` past this gate.
+    """
+    push = _GIT_PUSH_RE.search(command)
+    if push is None:
+        return None
+    target = push.group(1)
+    if target is None:
+        cds = list(_CD_RE.finditer(command, 0, push.start()))
+        if not cds:
+            return None
+        target = cds[-1].group(1)
+    if target[:1] in "\"'":
+        target = target[1:-1]
+    target = os.path.expanduser(target)
+    if cwd and not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return target
 
 BLOCK_TEMPLATE = (
     "[gh-review-loop] A review loop is active for {repo} and the "
@@ -106,7 +134,7 @@ def main() -> int:
     try:
         if not any_active_run():
             return 0
-        repo = resolve_current_repo()
+        repo = resolve_current_repo(push_target_dir(command, hook_cwd(payload)))
         info = stale_summary_for_push(repo)
     except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
         return 0  # not a gh repo, no remote, or corrupt state -> allow
