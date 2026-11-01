@@ -55,7 +55,9 @@ All notable changes to this project will be documented in this file. The format 
   label, anchored by their first `path:line` (`:~53` and `(also …)` included).
   The three shapes are read together, each finding once: a summary mixing
   graded items with `### <Grade>:` sections or blob-linked items loses none,
-  and a blob link under a graded item is that item's location.
+  and a blob link under a graded item is that item's location. Under a risk
+  heading, a graded line with no location (`### Risks` → `**Low**:`) is a
+  rating, not a finding.
   The verdict's own count (`0 Critical, 1 Warning, 2 Suggestions`) is checked
   against what was read: fewer leaves the overview incomplete for the agent
   to read, so an approving verdict can no longer hide an unread finding.
@@ -79,7 +81,8 @@ All notable changes to this project will be documented in this file. The format 
   resolved the repo from the session's directory, so `cd <clone> && git push`
   from another repo pushed loop cycles without a `--cycle-summary`, and
   `git -C <dir> push` was not recognized as a push at all. Both now resolve the
-  repo where the push runs, each `cd` moving from where the previous one left.
+  repo where the push runs, each `cd` moving from where the previous one left;
+  a quoted argument that says "cd" (a commit message) is not a `cd`.
 
 - **A review request GitHub accepts but does not register is refused, not
   stamped.** The first live run (an account without Copilot code review) showed

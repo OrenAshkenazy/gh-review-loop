@@ -191,6 +191,8 @@ SUMMARY_GRADED_ITEM_RE = re.compile(
     re.IGNORECASE,
 )
 SUMMARY_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:\d+[.)]|[-*])[ \t]+(?P<title>[^\n]*?\S)[ \t]*$", re.MULTILINE)
+SUMMARY_ANY_HEADING_RE = re.compile(r"^#{1,6}[ \t]+(.*)$", re.MULTILINE)
+SUMMARY_RISK_HEADING_RE = re.compile(r"\brisks?\b", re.IGNORECASE)
 SUMMARY_BLOCK_START_RE = re.compile(r"^[ \t]*(?:(?:\d+[.)]|[-*])[ \t]+|#)")
 SUMMARY_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 SUMMARY_LEADING_SPAN_RE = re.compile(r"\A\s*`([^`\n]+)`(?:[ \t]*\([^)\n]*\))?\s*(?:[—–-]+\s*)?")
@@ -1616,13 +1618,17 @@ def parse_summary_comment(body: Any) -> dict[str, Any] | None:
             "line": int(anchor.group(2)),
             "body": text[start:anchor.end()].strip(),
         }))
-    # Beside graded sections or blob-linked findings, a graded line with no
-    # location is a rating ("### Risks" … "**Low**: …"), not a finding; only
-    # a summary made of graded items alone grades findings without one.
-    rated_only = bool(located) or bool(linked)
+    # Under a risk heading, a graded line with no location rates the PR
+    # ("### Risks" … "**Low**: …"); it is not a finding. A located one is.
+    headings_at = [(h.start(), h.group(1)) for h in SUMMARY_ANY_HEADING_RE.finditer(text)]
+
+    def rates_risk(position: int) -> bool:
+        above = [title for at, title in headings_at if at < position]
+        return bool(above) and bool(SUMMARY_RISK_HEADING_RE.search(above[-1]))
+
     located.extend(
         (start, finding) for start, _end, finding in graded
-        if not (rated_only and finding["path"] == "(review comment)")
+        if not (finding["path"] == "(review comment)" and rates_risk(start))
     )
     located.extend(linked)
     findings = [finding for _, finding in sorted(located, key=lambda pair: pair[0])]
