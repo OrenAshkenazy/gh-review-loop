@@ -17,7 +17,7 @@ from loop_state import SENTINEL_TTL_SECONDS, sentinel_path, touch_sentinel
 import pytest
 
 from loop_summary_gate import main as summary_gate_main
-from loop_summary_gate import push_target_dir, stale_summary_for_push
+from loop_summary_gate import push_target_dir, push_target_dirs, stale_summary_for_push
 
 
 class _UnreadableStdin:
@@ -246,6 +246,29 @@ class TestPushTarget:
         push` quoted in a commit message was taken for the push: both sent the
         gate to /tmp, whose failed repo lookup let the push through."""
         assert push_target_dir(command, cwd) == expected
+
+    @pytest.mark.parametrize("command, cwd, expected", [
+        ("cd /work/other && git push && cd /work/session && git push", "/base", ["/work/other", "/work/session"]),
+        ("git push; git -C sub push", "/base", [None, "/base/sub"]),
+        ('bash -c "git push"', "/base", []),
+    ])
+    def test_every_push_in_the_command_has_its_target(self, command, cwd, expected):
+        assert push_target_dirs(command, cwd) == expected
+
+    def test_a_later_push_in_the_same_command_is_gated_too(self, tmp_path, monkeypatch, capsys):
+        """Only the first push was checked: pushing another repo first let
+        the looped repo's push after it through."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _active_stale("o/session", number=7)
+
+        rc, seen = self._run(
+            monkeypatch, "cd /work/other && git push && cd /work/session && git push",
+            "/work/session", {"/work/other": "o/other", "/work/session": "o/session"},
+        )
+
+        assert rc == 2
+        assert seen == ["/work/other", "/work/session"]
+        assert "https://github.com/o/session/pull/7" in capsys.readouterr().err
 
     def test_a_target_that_is_not_a_repo_checks_the_sessions_repo(self, tmp_path, monkeypatch, capsys):
         """Any directory misread off the command fell open in the repo lookup;

@@ -137,19 +137,21 @@ def _move(here: str | None, target: str) -> str:
     return os.path.normpath(target)
 
 
-def push_target_dir(command: str, cwd: str | None) -> str | None:
-    """The directory the command's push runs in, when the command says.
+def push_target_dirs(command: str, cwd: str | None) -> list[str | None]:
+    """Where each push in the command runs, in order; None is the hook's own
+    directory.
 
-    The command is read as the shell runs it: the push is the first ``git
-    [-C <dir>] push`` command (never text quoted in another one, such as a
-    commit message), and every ``cd <dir>`` command before it moves from where
-    the previous one left (``cd -`` returns), starting at ``cwd``, except one
-    inside a subshell that closed before the push. ``-C`` then moves once
-    more. None means the hook's own directory, including when no push is
-    found outside quotes (a push inside ``bash -c "…"``). Resolving only the
-    hook's directory let a session in another repo push the looped repo from
-    ``cd <clone> && …`` past this gate.
+    The command is read as the shell runs it: a push is a ``git [-C <dir>]
+    push`` command (never text quoted in another one, such as a commit
+    message), and every ``cd <dir>`` command before it moves from where the
+    previous one left (``cd -`` returns), starting at ``cwd``, except one
+    inside a subshell that closed before the push. ``-C`` moves that push
+    only. No push found outside quotes (one inside ``bash -c "…"``) is an
+    empty list. Resolving only the hook's directory let a session in another
+    repo push the looped repo from ``cd <clone> && …`` past this gate, and
+    checking only the first push let a second one through.
     """
+    targets: list[str | None] = []
     here, previous, moved = cwd, cwd, False
     scopes: list[tuple[str | None, str | None, bool]] = []
     for part in _shell_parts(command):
@@ -171,10 +173,33 @@ def push_target_dir(command: str, cwd: str | None) -> str | None:
             continue
         dirs = _push_dirs(part)
         if dirs is not None:
+            pushed, pushed_moved = here, moved
             for directory in dirs:
-                here, moved = _move(here, directory), True
-            return here if moved else None
-    return None
+                pushed, pushed_moved = _move(pushed, directory), True
+            targets.append(pushed if pushed_moved else None)
+    return targets
+
+
+def push_target_dir(command: str, cwd: str | None) -> str | None:
+    """Where the command's first push runs (see ``push_target_dirs``)."""
+    targets = push_target_dirs(command, cwd)
+    return targets[0] if targets else None
+
+
+def _push_repo(target: str | None, cwd: str | None) -> str | None:
+    """The repo a push target is in; None when it cannot be resolved."""
+    try:
+        return resolve_current_repo(target)
+    except (RuntimeError, OSError, ValueError):
+        if target is None:
+            return None
+    # A directory read off the command that is no repo (a misread, a typo)
+    # checks the session's repo, as before the push target was read, rather
+    # than letting the push through unchecked.
+    try:
+        return resolve_current_repo(cwd)
+    except (RuntimeError, OSError, ValueError):
+        return None
 
 BLOCK_TEMPLATE = (
     "[gh-review-loop] A review loop is active for {repo} and the "
@@ -236,17 +261,16 @@ def main() -> int:
         if not any_active_run():
             return 0
         cwd = hook_cwd(payload)
-        target = push_target_dir(command, cwd)
-        try:
-            repo = resolve_current_repo(target)
-        except (RuntimeError, OSError, ValueError):
-            if target is None:
-                raise
-            # A directory read off the command that is no repo (a misread,
-            # a typo) checks the session's repo, as before the push target
-            # was read, rather than letting the push through unchecked.
-            repo = resolve_current_repo(cwd)
-        info = stale_summary_for_push(repo)
+        # Every push in the command is checked; any one with a stale
+        # summary blocks the whole command.
+        repo, info = None, None
+        for target in dict.fromkeys(push_target_dirs(command, cwd) or [None]):
+            repo = _push_repo(target, cwd)
+            if repo is None:
+                continue
+            info = stale_summary_for_push(repo)
+            if info is not None:
+                break
     except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
         return 0  # not a gh repo, no remote, or corrupt state -> allow
 

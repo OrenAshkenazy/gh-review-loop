@@ -85,7 +85,7 @@ All notable changes to this project will be documented in this file. The format 
   moves from where the previous one left, a `cd` inside a subshell stays
   there, and quoted text (a commit message mentioning `cd` or a push) is
   neither. A directory read off the command that is no repo falls back to the
-  session's, never to no check.
+  session's, never to no check, and every push in one command is checked.
 
 - **A review request GitHub accepts but does not register is refused, not
   stamped.** The first live run (an account without Copilot code review) showed
