@@ -81,8 +81,11 @@ All notable changes to this project will be documented in this file. The format 
   resolved the repo from the session's directory, so `cd <clone> && git push`
   from another repo pushed loop cycles without a `--cycle-summary`, and
   `git -C <dir> push` was not recognized as a push at all. Both now resolve the
-  repo where the push runs, each `cd` moving from where the previous one left;
-  a quoted argument that says "cd" (a commit message) is not a `cd`.
+  repo where the push runs, read as the shell runs the command: each `cd`
+  moves from where the previous one left, a `cd` inside a subshell stays
+  there, and quoted text (a commit message mentioning `cd` or a push) is
+  neither. A directory read off the command that is no repo falls back to the
+  session's, never to no check.
 
 - **A review request GitHub accepts but does not register is refused, not
   stamped.** The first live run (an account without Copilot code review) showed

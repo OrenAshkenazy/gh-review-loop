@@ -233,6 +233,41 @@ class TestPushTarget:
         the repo lookup failed on it, and the gate let the push through."""
         assert push_target_dir(command, cwd) == expected
 
+    @pytest.mark.parametrize("command, cwd, expected", [
+        ("(cd /tmp && printf done); git push", "/base", None),
+        ("cd /a && (cd /b; make) && git push", None, "/a"),
+        ("git commit -m 'fix git -C /tmp push gating' && git push", "/base", None),
+        ('git commit -m "cd /x && git push" && cd /a && git push', None, "/a"),
+        ("git -c core.x=1 -C /a push", None, "/a"),
+        ('bash -c "git push"', "/base", None),
+    ])
+    def test_the_push_and_its_cds_are_read_only_where_the_shell_runs_them(self, command, cwd, expected):
+        """A subshell's `cd` leaked to the push after it, and a `git -C <dir>
+        push` quoted in a commit message was taken for the push: both sent the
+        gate to /tmp, whose failed repo lookup let the push through."""
+        assert push_target_dir(command, cwd) == expected
+
+    def test_a_target_that_is_not_a_repo_checks_the_sessions_repo(self, tmp_path, monkeypatch, capsys):
+        """Any directory misread off the command fell open in the repo lookup;
+        it now checks the session's repo, as before the target was read."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        _active_stale("o/session", number=7)
+        seen = []
+
+        def resolve(cwd=None):
+            seen.append(cwd)
+            if cwd == "/nowhere":
+                raise RuntimeError("not a git repository")
+            return "o/session"
+
+        monkeypatch.setattr("loop_summary_gate.resolve_current_repo", resolve)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+            {"tool_name": "Bash", "cwd": "/work/session", "tool_input": {"command": "cd /nowhere && git push"}}
+        )))
+
+        assert summary_gate_main() == 2
+        assert seen == ["/nowhere", "/work/session"]
+
     def test_a_tilde_target_is_expanded(self):
         assert push_target_dir("cd ~/clone && git push", None) == os.path.expanduser("~/clone")
 

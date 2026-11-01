@@ -20,7 +20,7 @@ Three hooks (`hooks/hooks.json`) make the most-skipped obligations mechanical on
 
 | Event | Script | Guarantees |
 |---|---|---|
-| `PreToolUse` (`Bash`) | `loop_summary_gate.py` | Blocks `git push` while a loop is active and the summary is stale; exit 2 names the exact `--cycle-summary` to run. The repo is the one the push runs in: `git -C <dir> push`, else the last `cd <dir>` before it, else the session's directory. |
+| `PreToolUse` (`Bash`) | `loop_summary_gate.py` | Blocks `git push` while a loop is active and the summary is stale; exit 2 names the exact `--cycle-summary` to run. The repo is the one the push runs in, read as the shell runs the command (quoted text and closed subshells never count): each `cd <dir>` before it, then `git -C <dir>`; a directory that is no repo falls back to the session's. |
 | `PreToolUse` (`Edit`/`Write`/`MultiEdit`) | `loop_profile_gate.py` | Blocks edits while a loop is active and no verification profile is saved. Any saved profile — including `Skip` — clears it. |
 | `Stop` | `loop_summary_hook.py` | If a loop advanced this turn without a summary, emits the authoritative `--cycle-summary`. Dedup-aware; read-only. |
 

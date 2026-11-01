@@ -46,36 +46,39 @@ from hook_runtime import (  # noqa: E402
     tool_name,
 )
 
+# Deliberately broad: any mention of a push, quoted or not (one inside
+# `bash -c "…"` too), wakes the gate; push_target_dir reads where it runs.
 _PATH_ARG = r"""("[^"]*"|'[^']*'|[^\s;&|()]+)"""
 _GIT_PUSH_RE = re.compile(r"\bgit\s+(?:-C\s+" + _PATH_ARG + r"\s+)?push\b")
 _SEPARATORS = ";&|()\n"
 
 
-def _simple_commands(command: str, end: int) -> list[list[str]]:
-    """The simple commands in ``command[:end]``, each as its shell words.
+def _shell_parts(command: str) -> list[list[str] | str]:
+    """The command's simple commands, each as its shell words, with the "("
+    and ")" of a subshell kept as markers between them.
 
     Quotes and backslashes are honored, so a quoted argument (a commit
     message saying "fix cd handling") is one word and never starts a command.
     """
-    commands: list[list[str]] = []
+    parts: list[list[str] | str] = []
     words: list[str] = []
     word: list[str] = []
     in_word = False
     quote = ""
     index = 0
-    while index < end:
+    while index < len(command):
         char = command[index]
         if quote:
             if char == quote:
                 quote = ""
-            elif char == "\\" and quote == '"' and index + 1 < end:
+            elif char == "\\" and quote == '"' and index + 1 < len(command):
                 index += 1
                 word.append(command[index])
             else:
                 word.append(char)
         elif char in "'\"":
             quote, in_word = char, True
-        elif char == "\\" and index + 1 < end:
+        elif char == "\\" and index + 1 < len(command):
             index += 1
             word.append(command[index])
             in_word = True
@@ -83,9 +86,12 @@ def _simple_commands(command: str, end: int) -> list[list[str]]:
             if in_word:
                 words.append("".join(word))
                 word, in_word = [], False
-            if char in _SEPARATORS and words:
-                commands.append(words)
-                words = []
+            if char in _SEPARATORS:
+                if words:
+                    parts.append(words)
+                    words = []
+                if char in "()":
+                    parts.append(char)
         else:
             word.append(char)
             in_word = True
@@ -93,8 +99,8 @@ def _simple_commands(command: str, end: int) -> list[list[str]]:
     if in_word:
         words.append("".join(word))
     if words:
-        commands.append(words)
-    return commands
+        parts.append(words)
+    return parts
 
 
 def _cd_target(words: list[str]) -> str | None:
@@ -107,9 +113,23 @@ def _cd_target(words: list[str]) -> str | None:
     return args[0] if args else None
 
 
+def _push_dirs(words: list[str]) -> list[str] | None:
+    """The ``-C`` directories of a ``git … push`` command, or None for any
+    other command. ``-c <key=value>`` and other global options are skipped."""
+    if not words or words[0] != "git":
+        return None
+    dirs: list[str] = []
+    index = 1
+    while index < len(words) and words[index].startswith("-"):
+        if words[index] in ("-C", "-c") and index + 1 < len(words):
+            if words[index] == "-C":
+                dirs.append(words[index + 1])
+            index += 1
+        index += 1
+    return dirs if index < len(words) and words[index] == "push" else None
+
+
 def _move(here: str | None, target: str) -> str:
-    if target[:1] in "\"'":
-        target = target[1:-1]
     target = os.path.expanduser(target)
     if here and not os.path.isabs(target):
         target = os.path.join(here, target)
@@ -118,32 +138,43 @@ def _move(here: str | None, target: str) -> str:
 
 
 def push_target_dir(command: str, cwd: str | None) -> str | None:
-    """The directory the command's ``git push`` runs in, when the command says.
+    """The directory the command's push runs in, when the command says.
 
-    Every ``cd <dir>`` command before the push (never a quoted argument that
-    merely says "cd") moves from where the previous one left (``cd -``
-    returns), starting at ``cwd``; ``git -C <dir> push`` then moves
-    once more. None means the hook's own directory. Resolving only the hook's
-    directory let a session in another repo push the looped repo with ``cd
-    <clone> && git push`` past this gate, and resolving only the last ``cd``
-    sent ``cd plugins && cd .. && git push`` above the repo.
+    The command is read as the shell runs it: the push is the first ``git
+    [-C <dir>] push`` command (never text quoted in another one, such as a
+    commit message), and every ``cd <dir>`` command before it moves from where
+    the previous one left (``cd -`` returns), starting at ``cwd``, except one
+    inside a subshell that closed before the push. ``-C`` then moves once
+    more. None means the hook's own directory, including when no push is
+    found outside quotes (a push inside ``bash -c "…"``). Resolving only the
+    hook's directory let a session in another repo push the looped repo from
+    ``cd <clone> && …`` past this gate.
     """
-    push = _GIT_PUSH_RE.search(command)
-    if push is None:
-        return None
     here, previous, moved = cwd, cwd, False
-    for words in _simple_commands(command, push.start()):
-        target = _cd_target(words)
-        if target is None:
+    scopes: list[tuple[str | None, str | None, bool]] = []
+    for part in _shell_parts(command):
+        if part == "(":
+            scopes.append((here, previous, moved))
             continue
-        if target == "-":
-            here, previous = previous, here
-        else:
-            here, previous = _move(here, target), here
-        moved = True
-    if push.group(1) is not None:
-        here, moved = _move(here, push.group(1)), True
-    return here if moved else None
+        if part == ")":
+            if scopes:
+                here, previous, moved = scopes.pop()
+            continue
+        assert isinstance(part, list)
+        target = _cd_target(part)
+        if target is not None:
+            if target == "-":
+                here, previous = previous, here
+            else:
+                here, previous = _move(here, target), here
+            moved = True
+            continue
+        dirs = _push_dirs(part)
+        if dirs is not None:
+            for directory in dirs:
+                here, moved = _move(here, directory), True
+            return here if moved else None
+    return None
 
 BLOCK_TEMPLATE = (
     "[gh-review-loop] A review loop is active for {repo} and the "
@@ -204,7 +235,17 @@ def main() -> int:
     try:
         if not any_active_run():
             return 0
-        repo = resolve_current_repo(push_target_dir(command, hook_cwd(payload)))
+        cwd = hook_cwd(payload)
+        target = push_target_dir(command, cwd)
+        try:
+            repo = resolve_current_repo(target)
+        except (RuntimeError, OSError, ValueError):
+            if target is None:
+                raise
+            # A directory read off the command that is no repo (a misread,
+            # a typo) checks the session's repo, as before the push target
+            # was read, rather than letting the push through unchecked.
+            repo = resolve_current_repo(cwd)
         info = stale_summary_for_push(repo)
     except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
         return 0  # not a gh repo, no remote, or corrupt state -> allow
