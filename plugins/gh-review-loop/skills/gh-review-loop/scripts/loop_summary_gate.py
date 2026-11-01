@@ -48,7 +48,63 @@ from hook_runtime import (  # noqa: E402
 
 _PATH_ARG = r"""("[^"]*"|'[^']*'|[^\s;&|()]+)"""
 _GIT_PUSH_RE = re.compile(r"\bgit\s+(?:-C\s+" + _PATH_ARG + r"\s+)?push\b")
-_CD_RE = re.compile(r"(?:^|[;&|(\s])cd\s+" + _PATH_ARG)
+_SEPARATORS = ";&|()\n"
+
+
+def _simple_commands(command: str, end: int) -> list[list[str]]:
+    """The simple commands in ``command[:end]``, each as its shell words.
+
+    Quotes and backslashes are honored, so a quoted argument (a commit
+    message saying "fix cd handling") is one word and never starts a command.
+    """
+    commands: list[list[str]] = []
+    words: list[str] = []
+    word: list[str] = []
+    in_word = False
+    quote = ""
+    index = 0
+    while index < end:
+        char = command[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            elif char == "\\" and quote == '"' and index + 1 < end:
+                index += 1
+                word.append(command[index])
+            else:
+                word.append(char)
+        elif char in "'\"":
+            quote, in_word = char, True
+        elif char == "\\" and index + 1 < end:
+            index += 1
+            word.append(command[index])
+            in_word = True
+        elif char in _SEPARATORS or char.isspace():
+            if in_word:
+                words.append("".join(word))
+                word, in_word = [], False
+            if char in _SEPARATORS and words:
+                commands.append(words)
+                words = []
+        else:
+            word.append(char)
+            in_word = True
+        index += 1
+    if in_word:
+        words.append("".join(word))
+    if words:
+        commands.append(words)
+    return commands
+
+
+def _cd_target(words: list[str]) -> str | None:
+    """The directory a ``cd`` command moves to (options skipped), or None."""
+    if not words or words[0] != "cd":
+        return None
+    args = words[1:]
+    while args and args[0].startswith("-") and args[0] != "-":
+        args.pop(0)
+    return args[0] if args else None
 
 
 def _move(here: str | None, target: str) -> str:
@@ -64,8 +120,9 @@ def _move(here: str | None, target: str) -> str:
 def push_target_dir(command: str, cwd: str | None) -> str | None:
     """The directory the command's ``git push`` runs in, when the command says.
 
-    Every ``cd <dir>`` before the push moves from where the previous one left
-    (``cd -`` returns), starting at ``cwd``; ``git -C <dir> push`` then moves
+    Every ``cd <dir>`` command before the push (never a quoted argument that
+    merely says "cd") moves from where the previous one left (``cd -``
+    returns), starting at ``cwd``; ``git -C <dir> push`` then moves
     once more. None means the hook's own directory. Resolving only the hook's
     directory let a session in another repo push the looped repo with ``cd
     <clone> && git push`` past this gate, and resolving only the last ``cd``
@@ -75,11 +132,14 @@ def push_target_dir(command: str, cwd: str | None) -> str | None:
     if push is None:
         return None
     here, previous, moved = cwd, cwd, False
-    for cd in _CD_RE.finditer(command, 0, push.start()):
-        if cd.group(1) == "-":
+    for words in _simple_commands(command, push.start()):
+        target = _cd_target(words)
+        if target is None:
+            continue
+        if target == "-":
             here, previous = previous, here
         else:
-            here, previous = _move(here, cd.group(1)), here
+            here, previous = _move(here, target), here
         moved = True
     if push.group(1) is not None:
         here, moved = _move(here, push.group(1)), True

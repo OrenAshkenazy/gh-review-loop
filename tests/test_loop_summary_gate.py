@@ -222,6 +222,17 @@ class TestPushTarget:
         the gate checked the wrong repo and let the push through."""
         assert push_target_dir(command, cwd) == expected
 
+    @pytest.mark.parametrize("command, cwd, expected", [
+        ('git commit -m "fix cd handling" && git push', "/base", None),
+        ("git commit -m 'cd /x; done' && cd /a && git push", None, "/a"),
+        ('cd "my clone" && git push', "/base", "/base/my clone"),
+        ("cd -P /a && git push", None, "/a"),
+    ])
+    def test_a_cd_inside_a_quoted_argument_is_not_a_directory_change(self, command, cwd, expected):
+        """`cd handling` inside a commit message was read as a directory change,
+        the repo lookup failed on it, and the gate let the push through."""
+        assert push_target_dir(command, cwd) == expected
+
     def test_a_tilde_target_is_expanded(self):
         assert push_target_dir("cd ~/clone && git push", None) == os.path.expanduser("~/clone")
 

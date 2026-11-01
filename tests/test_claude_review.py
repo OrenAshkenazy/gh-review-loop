@@ -492,6 +492,35 @@ def test_a_rating_beside_graded_sections_is_not_a_finding():
     assert [(f["path"], f["line"]) for f in parsed["findings"]] == [("src/a_test.go", 19)]
 
 
+def test_a_risk_rating_in_a_clean_summary_is_not_a_finding():
+    """With nothing else parsed, `### Risks` → `**Low**:` became a finding and
+    a zero-count verdict could not end the loop clean."""
+    body = (
+        "## Code review\n\nNothing to flag.\n\n### Risks\n\n**Low**: This PR extends existing infrastructure.\n\n"
+        "**Verdict:** 0 Critical, 0 Warnings, 0 Suggestions — Approve\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert parsed["findings"] == []
+    assert parsed["open_findings"] == 0
+    assert parsed["complete"] is True
+
+
+def test_a_located_finding_under_risks_and_a_bare_one_elsewhere_are_findings():
+    """Ratings are told apart by their section, not by what else was parsed."""
+    body = (
+        "## Findings\n\n### Minor: unchecked error\n\n**File**: `src/a_test.go:19`\n\n"
+        "## Notes\n\n**Suggestion:** the README example is out of date.\n\n"
+        "## Risks\n\n- `src/lock.py:8` — **Warning:** the lock is never released.\n\n"
+        "**Low**: a small change.\n\n<!-- review:complete -->"
+    )
+    parsed = parse_summary_comment(body)
+
+    assert [(f["severity"], f["path"], f["line"]) for f in parsed["findings"]] == [
+        ("low", "src/a_test.go", 19), ("low", "(review comment)", None), ("medium", "src/lock.py", 8),
+    ]
+
+
 def test_a_blob_link_inside_a_graded_item_is_that_item_not_a_second_finding():
     body = (
         "## Code review\n\n"
