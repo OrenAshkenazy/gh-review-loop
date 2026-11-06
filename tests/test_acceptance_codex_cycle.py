@@ -41,6 +41,9 @@ def loop(tmp_path, monkeypatch):
 
     state = {"payload": FIXTURE["initial"]}
     monkeypatch.setattr(fgt, "fetch_threads", lambda pr: state["payload"])
+    # Codex's clean verdict can be a receipt comment, so the re-review helper
+    # reads the PR's comments before pinging; serve it the same payload.
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: state["payload"])
     monkeypatch.setattr(
         fgt,
         "fetch_reviewer_discovery",

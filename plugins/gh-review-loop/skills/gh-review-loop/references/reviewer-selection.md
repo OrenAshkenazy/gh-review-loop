@@ -23,7 +23,7 @@ When a JSON fetch reports `reviewerSelection.confirmation_required: true`, stop 
 | Reviewer | Login | Trigger posted | Priority format | Reviews unprompted |
 |---|---|---|---|---|
 | Gemini Code Assist | `gemini-code-assist` | `@gemini-code-assist please review the latest changes.` | `![high]` alt text | yes |
-| Codex | `chatgpt-codex-connector` | exactly `@codex review` | `![P0]`–`![P3]` badges | **no** |
+| Codex | `chatgpt-codex-connector` | exactly `@codex review` | `![P0]`–`![P3]` badges; a clean pass is a top-level receipt comment | **no** |
 | GitHub Copilot | `copilot-pull-request-reviewer` | none — a review request via the GitHub API (`request_rereview.py` does it) | overview `alt="High severity"` list, per head | **no** |
 | Claude Code | `claude` (REST: `claude[bot]`) | exactly `@claude review` | leading 🔴 Important / 🟡 Nit / 🟣 Pre-existing inline; graded summary comments | per-repo setting the loop cannot read: **treated as no** |
 
