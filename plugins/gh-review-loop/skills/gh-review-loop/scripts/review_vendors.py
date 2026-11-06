@@ -73,6 +73,11 @@ CODEX = ReviewVendor(
     mention="@codex",
     rereview_phrase="@codex review",
     auto_reviews=False,
+    # A clean verdict is a top-level comment ("Codex Review: Didn't find any
+    # major issues", marked ``<!-- codex-review-receipt:v1 -->``), not a
+    # review: without this the waiter never saw it and timed out (PR #123,
+    # live, 2026-11-06).
+    summary_comments=True,
 )
 
 # Copilot does not react to an @copilot comment. It reviews when it is added
@@ -241,6 +246,9 @@ CLAUDE_SUMMARY_SIGNAL_RE = re.compile(
 )
 # A comment the action posts while it is still running: never a verdict.
 CLAUDE_IN_PROGRESS_RE = re.compile(r"Claude Code is working", re.IGNORECASE)
+# Codex's review receipt: the top-level comment it posts when a requested
+# review found nothing to flag inline (live, PR #123, 2026-11-06).
+CODEX_SUMMARY_SIGNAL_RE = re.compile(r"<!--\s*codex-review-receipt:", re.IGNORECASE)
 
 
 def summary_review_vendor(body: str | None) -> ReviewVendor | None:
@@ -249,4 +257,6 @@ def summary_review_vendor(body: str | None) -> ReviewVendor | None:
         return None
     if CLAUDE_SUMMARY_SIGNAL_RE.search(body):
         return CLAUDE
+    if CODEX_SUMMARY_SIGNAL_RE.search(body):
+        return CODEX
     return None

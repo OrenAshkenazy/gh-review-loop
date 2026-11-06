@@ -229,7 +229,9 @@ CLAUDE_OPEN_ITEM_SEVERITIES = {
 # gate, as for Copilot: the clean gate reads open_findings.
 CLAUDE_CLEAN_PHRASE_RE = re.compile(
     r"(?:\bno (?:new )?(?:blocking )?(?:issues|bugs|problems)(?: were)?(?: found)?\b"
-    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b)",
+    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b"
+    # Codex's clean receipt wording.
+    r"|\bdidn't find any (?:major )?issues\b)",
     re.IGNORECASE,
 )
 SUMMARY_VERDICT_LINE_RE = re.compile(r"\*\*Verdict:?\*\*:?[ \t]*(?P<text>[^\n]*)", re.IGNORECASE)

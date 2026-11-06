@@ -28,6 +28,11 @@ All notable changes to this project will be documented in this file. The format 
   with no local run for the PR and a RUNNING receipt adopts it, so another
   machine or a wiped state dir continues at cycle N. JSON:
   `loopStatus.resumedFromReceipt`. (`references/resume-and-recovery.md`)
+- **Codex's clean receipt ends the wait.** Codex answers a re-review that
+  found nothing with a top-level comment (`<!-- codex-review-receipt:v1 -->`,
+  "Didn't find any major issues"), not a review; the waiter now reads it as
+  the reviewer's answer instead of timing out, and `request_rereview.py`
+  answers `already_reviewed_head` for a head it covers.
 - **Churn detection.** The fetch records the head it saw; the next fetch
   diffs it against the new head and tags new findings anchored inside those
   hunks as fix-induced (`· on lines this loop changed` in the receipt,

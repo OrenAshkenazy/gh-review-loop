@@ -811,3 +811,49 @@ class TestCodexReviewPr123:
             [thread], new_fingerprints={finding_fingerprint(thread)},
             ranges=parse_changed_line_ranges(diff),
         ) == {finding_fingerprint(thread)}
+
+
+class TestCodexCleanReceiptEndsTheWait:
+    """Live, PR #123: Codex answered a re-review request three minutes later
+    with a top-level comment and no review, and the wait timed out."""
+
+    RECEIPT = (
+        "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major "
+        "issues. Already looking forward to the next diff.\n"
+    )
+    CODEX = "chatgpt-codex-connector"
+
+    def test_the_receipt_is_codex_summary_and_approves(self):
+        import review_vendors
+
+        assert review_vendors.summary_review_vendor(self.RECEIPT) is review_vendors.CODEX
+        assert review_vendors.CODEX.summary_comments is True
+        assert fgt.summary_approves(self.RECEIPT)
+        assert fgt.summary_review_comments(
+            {"comments": {"nodes": [
+                {"author": {"login": self.CODEX}, "body": self.RECEIPT, "createdAt": "2026-11-06T15:47:43Z"},
+                {"author": {"login": self.CODEX}, "body": "some other bot note", "createdAt": "2026-11-06T15:48:00Z"},
+            ]}},
+            self.CODEX,
+        )[0]["createdAt"] == "2026-11-06T15:47:43Z"
+
+    def test_wait_ends_on_the_receipt_posted_after_the_request(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        payload = {
+            "headRefOid": "c" * 40, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+            "comments": {"nodes": [
+                {"author": {"login": "OrenAshkenazy"}, "body": "@codex review", "createdAt": "2026-11-06T15:44:43Z"},
+                {"author": {"login": self.CODEX}, "body": self.RECEIPT, "createdAt": "2026-11-06T15:47:43Z"},
+            ]},
+        }
+        monkeypatch.setattr(fgt, "fetch_threads", lambda pr: payload)
+        settled = fgt.wait_for_stable_review(
+            PR, author=self.CODEX, timeout_seconds=10**9, interval_seconds=1,
+            quiet_seconds=0, after_iso="2026-11-06T15:44:43Z",
+        )
+        assert settled is payload
+        # An older receipt (before the request) does not end a new wait.
+        assert fgt.wait_activity_fingerprint(payload, self.CODEX, "2026-11-06T15:48:00Z") is None
+        # The clean receipt reports no synthetic findings.
+        assert fgt.summary_comment_findings(payload, self.CODEX) == []

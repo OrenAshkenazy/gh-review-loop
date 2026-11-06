@@ -172,6 +172,13 @@ def test_judge_preferences_json_is_serializable_without_stdout(
     json.loads(json.dumps(prefs))
 
 
+@pytest.fixture(autouse=True)
+def _no_summary_read(monkeypatch):
+    # Codex may answer with a receipt comment; the helper reads the PR's
+    # comments before pinging. Not what these stdout tests are about.
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: None)
+
+
 def test_request_rereview_json_stdout_is_json_only(monkeypatch, capsys):
     monkeypatch.setattr(
         request_rereview,
