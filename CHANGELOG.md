@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- **Checks on the head are feedback.** The fetch reads the head commit's
+  `statusCheckRollup` (check names, conclusions, `isRequired`, details URLs)
+  and prints a `[loop] CI:` block when a check failed or is still running,
+  with a `gh run view <id> --repo … --log-failed` command for each failing
+  GitHub Actions check. Default `fix_ci: off`: the loop reports the failure
+  and, when nothing else is left, stops with the new outcome `ci_failed`.
+  `--fix-ci` (or `fix_ci: true` in `preferences.json`) opts in to fixing the
+  failing check as a finding in the same cycle. JSON: `loopStatus.ci`,
+  `loopStatus.fixCi`. (`references/ci-and-human-threads.md`)
+- **Human review threads are surfaced, never fixed.** Unresolved threads a
+  person opened (not the reviewer, not a `[bot]`, not the agent's own login)
+  are listed in a `[loop] Human review threads` block with an excerpt and
+  whether the agent's reply is pending; the agent drafts a reply and asks.
+  Threads the agent's login opened are skipped, so the loop cannot read its
+  own replies as new feedback. JSON: `humanThreads`,
+  `loopStatus.humanThreadCount`; run records carry `human_threads`.
+- **Resume from the PR receipt.** Every non-terminal sticky receipt embeds
+  the run state (`<!-- gh-review-loop:state v1 … -->`: cycle ordinal,
+  seen/fixed/swept fingerprints, last head) as base64 JSON. A real fetch
+  with no local run for the PR and a RUNNING receipt adopts it, so another
+  machine or a wiped state dir continues at cycle N. JSON:
+  `loopStatus.resumedFromReceipt`. (`references/resume-and-recovery.md`)
+- **Churn detection.** The fetch records the head it saw; the next fetch
+  diffs it against the new head and tags new findings anchored inside those
+  hunks as fix-induced (`· on lines this loop changed` in the receipt,
+  `fix_induced` in the record, `loopStatus.fixInduced` in JSON). When every
+  new finding on cycle 2+ is fix-induced the script prints `[loop] churn:`
+  and the loop stops with the new outcome `churn`. (`references/churn.md`)
+
 - **Claude Code is a first-class reviewer.** One vendor (`claude`, REST
   `claude[bot]`) covers the three ways Claude reviews a PR through the Claude
   GitHub App: the hosted Code Review service, the claude-code-action running
