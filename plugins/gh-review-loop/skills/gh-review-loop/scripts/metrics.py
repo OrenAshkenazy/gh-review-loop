@@ -603,7 +603,19 @@ def format_ci_block(ci: dict[str, Any] | None, *, fix_ci: bool = False) -> str:
     failing = [c for c in ci.get("failing") or [] if isinstance(c, dict)]
     pending = _count(ci.get("pending"))
     total = _count(ci.get("total"))
+    state = ci.get("state")
     if not failing and not pending:
+        # The rollup's own verdict and the page limit both outrank an empty
+        # list: a full page of 50 green contexts can hide the one red check
+        # (Codex, PR #123). Say so instead of reading it as green.
+        if ci.get("truncated") or (isinstance(state, str) and state != "SUCCESS"):
+            return (
+                f"[loop] CI: results incomplete — the head rollup state is "
+                f"{state or 'unknown'} but the fetched contexts ({total}, page of 50"
+                f"{' full' if ci.get('truncated') else ''}) show no failing or "
+                "pending check. Open the PR's checks tab before calling this PR "
+                "clean; do not read this as green."
+            )
         return ""
     lines: list[str] = []
     if failing:

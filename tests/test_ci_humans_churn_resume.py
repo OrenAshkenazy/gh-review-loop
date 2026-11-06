@@ -643,3 +643,112 @@ class TestFetchSurfacesAll:
         assert "outcome ci_failed" in result.out
         assert parse_embedded_run_state(bodies[-1]) is None
         assert "CI failing on head: tests" in bodies[-1]
+
+
+# ---------------------------------------------------------------------------
+# Codex review of PR #123
+# ---------------------------------------------------------------------------
+
+class TestCodexReviewPr123:
+    def test_hydrate_rebases_the_rereview_counters_on_the_local_stamp_log(self, tmp_path, monkeypatch):
+        # The other machine was at cycle 3 with baseline 2; this machine has
+        # no stamps. Without a rebase the ordinal would stall until the local
+        # count exceeded 2.
+        import loop_state
+
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        run = {"started_at": "2026-11-06T10:00:00Z", "session_cycle": 3, "update_seq": 7,
+               "rereviews_posted": 0, "rereviews_posted_at_cycle_start": 2}
+        block = embed_run_state(run)
+        assert "rereviews_posted" not in json.dumps(parse_embedded_run_state(block))
+        body = build_receipt_comment_body(["x"], status="RUNNING", state_block=block)
+        assert hydrate_run_from_receipt(PR, {"comments": {"nodes": [{"body": body}]}})
+        local = read_run_tracking(PR)
+        assert local["rereviews_posted"] == 0
+        assert local["rereviews_posted_at_cycle_start"] == 0
+        # Fetch, summary, one local re-review request → the ordinal advances.
+        update_run_tracking(PR, [("t1", "a.py")])
+        fgt.stamp_summary_emitted(PR)
+        loop_state.append_cycle_stamp("acme/widget", 7, {"at": "2026-11-06T11:00:00Z"})
+        update_run_tracking(PR, [("t1", "a.py")])
+        assert read_run_tracking(PR)["session_cycle"] == 4
+
+    def test_incomplete_ci_results_are_named_not_read_as_green(self):
+        full_page = _pr_with_checks(*[_check(f"c{i}", "SUCCESS") for i in range(50)], state="FAILURE")
+        block = metrics.format_ci_block(ci_status(full_page))
+        assert block.startswith("[loop] CI: results incomplete — the head rollup state is FAILURE")
+        assert "page of 50 full" in block
+        assert "do not read this as green" in block
+        # A non-success rollup with an empty, short page is incomplete too.
+        odd = ci_status(_pr_with_checks(_check("c", "SUCCESS"), state="PENDING"))
+        assert "results incomplete" in metrics.format_ci_block(odd)
+        # No checks at all, no rollup state: nothing to say.
+        assert metrics.format_ci_block(ci_status({})) == ""
+        green = ci_status(_pr_with_checks(_check("c", "SUCCESS"), state="SUCCESS"))
+        assert metrics.format_ci_block(green) == ""
+
+    def test_left_side_threads_are_never_fix_induced(self):
+        left = {"id": "t1", "path": "src/x.py", "line": 11, "diffSide": "LEFT",
+                "comments": [{"author": {"login": BOT}, "body": "deleted line"}]}
+        right = {"id": "t2", "path": "src/x.py", "line": 11, "diffSide": "RIGHT",
+                 "comments": [{"author": {"login": BOT}, "body": "added line"}]}
+        new = {finding_fingerprint(left), finding_fingerprint(right)}
+        induced = fix_induced_findings([left, right], new_fingerprints=new,
+                                       ranges={"src/x.py": [(10, 12)]})
+        assert induced == {finding_fingerprint(right)}
+
+    def _red_payload(self):
+        url = "https://github.com/acme/widget/actions/runs/9/job/1"
+        pr = _pr_with_checks(_check("tests", "FAILURE", required=True, url=url))
+        pr.update({"reviews": {"nodes": []}, "comments": {"nodes": []},
+                   "reviewThreads": {"nodes": []}, "headRefOid": "c" * 40})
+        return pr
+
+    def test_chunked_wait_exits_carry_the_heads_checks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(fgt, "fetch_threads", lambda pr: self._red_payload())
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        chunk = fgt.run_wait_chunk(
+            PR, BOT, timeout_seconds=10**9, interval_seconds=1, quiet_seconds=1,
+            after_iso="2026-11-06T10:00:00Z", chunk_seconds=0,
+        )
+        assert chunk["status"] == "waiting"
+        assert chunk["ci"]["failing"][0]["name"] == "tests"
+        timed = fgt.run_wait_chunk(
+            PR, BOT, timeout_seconds=0, interval_seconds=1, quiet_seconds=1,
+            after_iso="2026-11-06T10:00:00Z", chunk_seconds=1,
+        )
+        assert timed["status"] == "timed_out"
+        assert timed["ci"]["failing"][0]["log_command"] == "gh run view 9 --repo acme/widget --log-failed"
+
+    def test_blocking_wait_timeout_surfaces_the_ci_block(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(fgt, "gh_authenticated_login", lambda: AGENT)
+        monkeypatch.setattr(fgt, "resolve_pr", lambda arg: PR)
+        monkeypatch.setattr(fgt, "fetch_threads", lambda pr: self._red_payload())
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        base = ["fetch_gemini_threads.py", "--pr", PR.url, "--reviewer", BOT,
+                "--reviewer-source", "confirmed", "--wait", "--timeout", "0",
+                "--after", "2026-11-06T10:00:00Z"]
+        monkeypatch.setattr(sys, "argv", base)
+        assert fgt.main() == 0
+        out = capsys.readouterr()
+        assert "timed out" in out.out.lower()
+        assert "[loop] CI: 1 failing check(s) on the head, 1 required (1 total)." in out.out
+        assert "log: gh run view 9 --repo acme/widget --log-failed" in out.out
+        monkeypatch.setattr(sys, "argv", base + ["--format", "json"])
+        assert fgt.main() == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["wait"]["status"] == "timed_out"
+        assert payload["wait"]["ci"]["failing"][0]["name"] == "tests"
+
+    def test_wait_heartbeat_names_failing_checks(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(fgt, "fetch_threads", lambda pr: self._red_payload())
+        monkeypatch.setattr("fetch_gemini_threads.time.sleep", lambda _s: None)
+        with pytest.raises(fgt.WaitTimedOut) as info:
+            fgt.wait_for_stable_review(PR, author=BOT, timeout_seconds=0,
+                                       interval_seconds=1, quiet_seconds=1,
+                                       after_iso="2026-11-06T10:00:00Z")
+        assert info.value.pull_request["headRefOid"] == "c" * 40
+        assert "CI: 1 failing check(s) on the head (tests)" in capsys.readouterr().err

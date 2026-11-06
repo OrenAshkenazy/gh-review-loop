@@ -1311,11 +1311,16 @@ class WaitTimedOut(Exception):
     and a network error must not masquerade as a timeout.
     """
 
-    def __init__(self, elapsed_seconds: int) -> None:
+    def __init__(
+        self, elapsed_seconds: int, pull_request: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(
             f"Timed out waiting for stable review activity after {elapsed_seconds} seconds."
         )
         self.elapsed_seconds = elapsed_seconds
+        # The last payload polled, so the CLI can surface the head's checks:
+        # a reviewer that runs only after CI never arrives on a red head.
+        self.pull_request = pull_request
 
 
 def reviewer_refusal(
@@ -2989,6 +2994,7 @@ def run_wait_chunk(
                 "author": author,
                 "elapsed_seconds": elapsed,
                 "checks": wait["checks"],
+                "ci": ci_status(pull_request),
             }
             save_wait_snapshot(pr, snapshot)
             return {**snapshot, "pull_request": None}
@@ -3001,6 +3007,9 @@ def run_wait_chunk(
                 "elapsed_seconds": elapsed,
                 "checks": wait["checks"],
                 "next_wait_seconds": next_wait,
+                # The head's checks ride with every non-ready exit: a failing
+                # check may be why the reviewer never comes (Codex, PR #123).
+                "ci": ci_status(pull_request),
             }
             if fingerprint is not None:
                 snapshot["quiet_period_remaining_seconds"] = quiet_remaining
@@ -4012,9 +4021,10 @@ def wait_for_stable_review(
                     waiting_for = f"Waiting for {author} review of {head7}..."
                 else:
                     waiting_for = f"Waiting for {author} review activity..."
+                ci_note = _ci_heartbeat_note(ci_status(pull_request))
                 print(
                     f"{waiting_for} "
-                    f"({int(now - start)}s elapsed, timeout {timeout_seconds}s)",
+                    f"({int(now - start)}s elapsed, timeout {timeout_seconds}s){ci_note}",
                     file=sys.stderr,
                 )
                 last_heartbeat = now
@@ -4035,7 +4045,7 @@ def wait_for_stable_review(
             return pull_request
 
         if now >= deadline:
-            raise WaitTimedOut(int(now - start))
+            raise WaitTimedOut(int(now - start), pull_request)
 
         time.sleep(min(interval_seconds, max(0.0, deadline - now)))
 
@@ -4351,6 +4361,16 @@ def _check_log_command(url: Any) -> str | None:
     return f"gh run view {run_id} --repo {owner}/{repo} --log-failed"
 
 
+def _ci_heartbeat_note(ci: dict[str, Any]) -> str:
+    """Suffix for a wait heartbeat line naming failing head checks, or ''."""
+    failing = [c for c in ci.get("failing") or [] if isinstance(c, dict)]
+    if not failing:
+        return ""
+    names = ", ".join(str(c.get("name") or "?") for c in failing[:3])
+    more = f", +{len(failing) - 3} more" if len(failing) > 3 else ""
+    return f" — CI: {len(failing)} failing check(s) on the head ({names}{more})"
+
+
 def ci_status(pull_request: dict[str, Any]) -> dict[str, Any]:
     """Summarize the head commit's checks from ``statusCheckRollup``.
 
@@ -4501,8 +4521,6 @@ EMBEDDED_RUN_KEYS = (
     "started_at",
     "session_cycle",
     "update_seq",
-    "rereviews_posted",
-    "rereviews_posted_at_cycle_start",
     "finding_ids",
     "finding_paths",
     "seen_finding_fps",
@@ -4577,6 +4595,15 @@ def hydrate_run_from_receipt(
     if run is None:
         return None
     run["last_summary_seq"] = _safe_int(run.get("update_seq", 0))
+    # The re-review counters are machine-local: ``update_run_tracking``
+    # advances the ordinal when this machine's cycle-stamp log grows past
+    # the baseline. A baseline from another machine (Codex, PR #123) would
+    # stall the ordinal until the local count caught up, so rebase it on the
+    # local log now — the next request this machine posts advances it.
+    run["rereviews_posted"] = 0
+    run["rereviews_posted_at_cycle_start"] = loop_state.count_cycle_stamps(
+        f"{pr.owner}/{pr.repo}", pr.number
+    )
     state = load_sticky_state()
     key = _state_key(pr)
     entry = state.get(key)
@@ -4645,6 +4672,11 @@ def changed_line_ranges(
 
 
 def _thread_anchor_lines(thread: dict[str, Any]) -> tuple[int, int] | None:
+    # A LEFT-side thread's line numbers are the base file's; the changed
+    # ranges are new-side lines of the current head, so the two cannot be
+    # compared (Codex, PR #123). Such a finding is never fix-induced.
+    if thread.get("diffSide") == "LEFT":
+        return None
     line = thread.get("line")
     if line is None:
         line = thread.get("originalLine")
@@ -5406,6 +5438,11 @@ def main() -> int:
                             enabled=color_enabled,
                         )
                     )
+                    wait_ci_block = metrics.format_ci_block(
+                        chunk.get("ci"), fix_ci=bool(args.fix_ci or prefs.get("fix_ci"))
+                    )
+                    if wait_ci_block:
+                        print(color_loop_block(wait_ci_block, enabled=color_enabled))
                 return 0
             pull_request = chunk["pull_request"]
         elif args.wait:
@@ -5430,12 +5467,16 @@ def main() -> int:
                 # Mirror the chunked-mode timed_out contract: deterministic
                 # relayable output, exit 0. Matters most when this wait ran as
                 # a background task and this is the tail of its captured log.
+                # The head's checks come with it: a red check may be the
+                # reason the reviewer never came.
+                timed_out_ci = ci_status(timed_out.pull_request or {})
                 if args.format == "json":
                     print(
                         json.dumps(
                             {"wait": {
                                 "status": "timed_out",
                                 "elapsed_seconds": timed_out.elapsed_seconds,
+                                "ci": timed_out_ci,
                             }},
                             indent=2,
                             sort_keys=True,
@@ -5452,6 +5493,11 @@ def main() -> int:
                             enabled=color_enabled,
                         )
                     )
+                    wait_ci_block = metrics.format_ci_block(
+                        timed_out_ci, fix_ci=bool(args.fix_ci or prefs.get("fix_ci"))
+                    )
+                    if wait_ci_block:
+                        print(color_loop_block(wait_ci_block, enabled=color_enabled))
                 return 0
         else:
             pull_request = fetch_threads(pr)
