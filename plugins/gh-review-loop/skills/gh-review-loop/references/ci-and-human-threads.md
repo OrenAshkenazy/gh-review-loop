@@ -12,7 +12,9 @@ The fetch reads the head commit's `statusCheckRollup` and prints one block when 
 
 **Pending checks.** `[loop] CI: N check(s) still running` is informational: a reviewer that waits for CI (a CI job running Claude Code, Copilot after required checks) has not seen the head yet. Wait before calling the PR clean; do not re-request.
 
-A `truncated: true` rollup (50+ contexts) may hide a check; say so when reporting clean.
+**Incomplete results.** When the rollup's own state is not `SUCCESS` (or the 50-context page is full) but no failing or pending check was fetched, the block says `results incomplete` instead of staying silent: open the PR's checks tab before calling the PR clean.
+
+**During a wait.** Every non-ready wait exit (`waiting`, `settling`, `timed_out`, in both wait modes) prints the same CI block after the heartbeat (JSON: `wait.ci`), and the blocking wait's stderr heartbeat names failing checks. A reviewer that runs only after CI never arrives on a red head — read the block before re-running the wait.
 
 ## `[loop] Human review threads` — threads a person opened
 
