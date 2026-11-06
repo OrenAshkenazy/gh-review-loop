@@ -424,10 +424,12 @@ class TestChangedLineRanges:
         ).stdout.strip()
         git("init", "-q")
         (repo / "a.py").write_text("1\n2\n3\n4\n")
-        git("add", "."); git("commit", "-q", "-m", "one")
+        git("add", ".")
+        git("commit", "-q", "-m", "one")
         first = git("rev-parse", "HEAD")
         (repo / "a.py").write_text("1\nchanged\n3\n4\n5\n")
-        git("add", "."); git("commit", "-q", "-m", "two")
+        git("add", ".")
+        git("commit", "-q", "-m", "two")
         second = git("rev-parse", "HEAD")
 
         assert changed_line_ranges(first, second, cwd=repo) == {"a.py": [(2, 2), (5, 5)]}
