@@ -15,6 +15,10 @@ A bumped cap (priority 1) wins even when unpushed work also exists. Cases 2 and 
 
 > **Follow-up (deterministic detection).** Cases 2 and 3 are prose-detected for now and MUST become deterministic: case 2 needs a local-vs-remote SHA comparison (`git rev-parse HEAD` vs `@{u}`); case 3 needs a GitHub check that the latest pushed SHA has no following agent-posted re-review comment. Tracked in `docs/superpowers/specs/2026-06-06-pr37-followup-design.md`.
 
+## Recovery: another machine, or a wiped state dir
+
+Every non-terminal receipt carries the run state in a hidden block (`<!-- gh-review-loop:state v1 … -->`: session cycle, seen/fixed/swept fingerprints, the last head, the start time). A real fetch that finds **no local run** for the PR and a **RUNNING** receipt on it adopts that block before counting the cycle, and prints `[loop] resumed run state from the PR receipt (session cycle N)` to stderr; JSON sets `loopStatus.resumedFromReceipt`. So a teammate, a second checkout, or a session after `rm -rf ~/.config/gh-review-loop` continues cycle N instead of starting at 1 with every finding "new". Nothing to do — run the normal fetch (`--full` on a fresh context, as below). A `DONE`/`STOPPED` receipt is never adopted: that run ended. The re-review cap is still counted from the PR's own comments (and, for Copilot, the local request log — see `references/write-safety.md`), not from the receipt.
+
 ## Recovery: missed initial trigger
 
 The skill auto-triggers after `gh pr create`. If that was missed, invoke retroactively at the next opportunity:

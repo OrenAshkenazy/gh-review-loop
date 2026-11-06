@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import datetime as _dt
 import hashlib
@@ -386,11 +387,19 @@ query($owner:String!, $repo:String!, $number:Int!) {
           commit {
             committedDate
             statusCheckRollup {
+              state
               contexts(first:50) {
                 nodes {
                   __typename
-                  ... on CheckRun { startedAt checkSuite { createdAt } }
-                  ... on StatusContext { createdAt }
+                  ... on CheckRun {
+                    name status conclusion detailsUrl startedAt
+                    isRequired(pullRequestNumber:$number)
+                    checkSuite { createdAt }
+                  }
+                  ... on StatusContext {
+                    context state targetUrl createdAt
+                    isRequired(pullRequestNumber:$number)
+                  }
                 }
               }
             }
@@ -2297,6 +2306,7 @@ _FALLBACK_PREFS_DEFAULTS: dict[str, Any] = {
     "judge_tip_shown": False,
     "max_rereview_requests": DEFAULT_REREVIEW_LIMIT,
     "profiles": {},
+    "fix_ci": False,
     "set_at": "",
 }
 
@@ -3723,7 +3733,7 @@ def render_receipt(
 
 
 def build_receipt_comment_body(
-    blocks: list[str], *, status: str, findings_block: str = ""
+    blocks: list[str], *, status: str, findings_block: str = "", state_block: str = ""
 ) -> str:
     """Markdown body carrying the FULL cycle/terminal receipt on the PR.
 
@@ -3743,6 +3753,8 @@ def build_receipt_comment_body(
     )
     parts.append("")
     parts.append(STICKY_RECEIPT_MARKER)
+    if state_block:
+        parts.append(state_block)
     return "\n".join(parts) + "\n"
 
 
@@ -4315,6 +4327,421 @@ def first_value(thread: dict[str, Any], key: str) -> Any:
             return value
     return None
 
+# ---------------------------------------------------------------------------
+# Head checks (CI), human review threads, receipt-embedded run state, churn
+# ---------------------------------------------------------------------------
+
+# CheckRun conclusions that mean the check failed. CANCELLED, SKIPPED, NEUTRAL
+# and STALE do not: a cancelled job on the head is usually a superseded run,
+# and Claude Code Review's own check run "doesn't conclude as a failure".
+CI_FAILING_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+CI_FAILING_STATES = {"FAILURE", "ERROR"}
+CI_PENDING_STATES = {"PENDING", "EXPECTED"}
+ACTIONS_RUN_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)")
+
+
+def _check_log_command(url: Any) -> str | None:
+    """``gh run view … --log-failed`` for a GitHub Actions details URL, else None."""
+    if not isinstance(url, str):
+        return None
+    match = ACTIONS_RUN_URL_RE.search(url)
+    if match is None:
+        return None
+    owner, repo, run_id = match.groups()
+    return f"gh run view {run_id} --repo {owner}/{repo} --log-failed"
+
+
+def ci_status(pull_request: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the head commit's checks from ``statusCheckRollup``.
+
+    Returns ``{"state", "total", "pending", "failing": [...], "truncated"}``.
+    Each failing entry carries ``name``, ``state``, ``required``, ``url`` and,
+    for a GitHub Actions check, ``log_command`` (``gh run view --log-failed``)
+    so the agent can read the failure without guessing the run id. Fails open:
+    a payload without a rollup reads as no checks.
+    """
+    nodes = (pull_request.get("commits") or {}).get("nodes") or []
+    last = nodes[-1] if nodes and isinstance(nodes[-1], dict) else {}
+    commit = last.get("commit") if isinstance(last.get("commit"), dict) else {}
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    rollup = rollup if isinstance(rollup, dict) else {}
+    contexts = (rollup.get("contexts") or {}).get("nodes") or []
+    failing: list[dict[str, Any]] = []
+    pending = 0
+    total = 0
+    for node in contexts:
+        if not isinstance(node, dict):
+            continue
+        typename = node.get("__typename")
+        if typename == "CheckRun":
+            total += 1
+            if node.get("status") != "COMPLETED":
+                pending += 1
+                continue
+            conclusion = node.get("conclusion")
+            if conclusion in CI_FAILING_CONCLUSIONS:
+                url = node.get("detailsUrl")
+                failing.append({
+                    "name": node.get("name") or "?",
+                    "state": str(conclusion).lower(),
+                    "required": node.get("isRequired") is True,
+                    "url": url if isinstance(url, str) else None,
+                    "log_command": _check_log_command(url),
+                })
+        elif typename == "StatusContext":
+            total += 1
+            state = node.get("state")
+            if state in CI_PENDING_STATES:
+                pending += 1
+                continue
+            if state in CI_FAILING_STATES:
+                url = node.get("targetUrl")
+                failing.append({
+                    "name": node.get("context") or "?",
+                    "state": str(state).lower(),
+                    "required": node.get("isRequired") is True,
+                    "url": url if isinstance(url, str) else None,
+                    "log_command": _check_log_command(url),
+                })
+    return {
+        "state": rollup.get("state"),
+        "total": total,
+        "pending": pending,
+        "failing": failing,
+        # contexts(first:50): a full page may hide a check.
+        "truncated": len(contexts) >= 50,
+    }
+
+
+def ci_record_fields(ci: dict[str, Any]) -> dict[str, Any]:
+    """The slim, identity-free CI summary stored in a run record."""
+    return {
+        "state": ci.get("state"),
+        "total": _safe_int(ci.get("total")),
+        "pending": _safe_int(ci.get("pending")),
+        "failing": [
+            {"name": c.get("name"), "required": bool(c.get("required"))}
+            for c in ci.get("failing") or []
+            if isinstance(c, dict)
+        ],
+    }
+
+
+HUMAN_THREAD_EXCERPT_CHARS = 160
+
+
+def _is_bot_author(author: Any, reviewer_login: str) -> bool:
+    if not isinstance(author, dict):
+        return True
+    login = author.get("login") or ""
+    return (
+        not login
+        or login == reviewer_login
+        or login.endswith("[bot]")
+        or author.get("__typename") == "Bot"
+    )
+
+
+def human_review_threads(
+    pull_request: dict[str, Any], reviewer_login: str, agent_login: str | None
+) -> list[dict[str, Any]]:
+    """Unresolved, current threads a person opened — not reviewer findings.
+
+    The loop never fixes these on its own: a teammate's comment is a
+    conversation, so the agent drafts a reply and asks the user. Threads the
+    agent's own login opened are not feedback and are skipped, which also
+    keeps the loop from reading its own replies as new review (the self-reply
+    loop reported against Claude Code's PR monitor). ``awaiting_reply`` is
+    True until the agent's login has the last word in the thread.
+    """
+    items: list[dict[str, Any]] = []
+    for thread in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+        if not isinstance(thread, dict) or thread.get("isResolved") or thread.get("isOutdated"):
+            continue
+        comments = [c for c in _iter_comments(thread) if isinstance(c, dict)]
+        if not comments:
+            continue
+        first = comments[0]
+        author = first.get("author") or {}
+        if _is_bot_author(author, reviewer_login):
+            continue
+        login = author.get("login") or ""
+        if agent_login and login == agent_login:
+            continue
+        last_login = ((comments[-1].get("author") or {}).get("login")) or ""
+        body = first.get("body") if isinstance(first.get("body"), str) else ""
+        excerpt = re.sub(r"\s+", " ", body).strip()
+        if len(excerpt) > HUMAN_THREAD_EXCERPT_CHARS:
+            excerpt = excerpt[: HUMAN_THREAD_EXCERPT_CHARS - 1].rstrip() + "…"
+        line = thread.get("line")
+        if line is None:
+            line = thread.get("originalLine")
+        items.append({
+            "id": thread.get("id"),
+            "path": thread.get("path"),
+            "line": line,
+            "author": login,
+            "url": first.get("url"),
+            "excerpt": excerpt,
+            "reply_count": len(comments) - 1,
+            "awaiting_reply": not (agent_login and last_login == agent_login),
+        })
+    return items
+
+
+# Machine-readable run state embedded in the sticky receipt, so a second
+# machine (or a wiped state dir) resumes the same run instead of starting a
+# new one at cycle 1. Base64 keeps `-->` out of the HTML comment whatever the
+# paths and fingerprints contain.
+STICKY_STATE_MARKER = "<!-- gh-review-loop:state v1 "
+STICKY_STATE_RE = re.compile(r"<!-- gh-review-loop:state v1 ([A-Za-z0-9_=-]+) -->")
+# Every per-run key the receipt carries. Local-only bookkeeping that another
+# machine must not inherit (comment ids, wait chunks, judge payloads) stays out.
+EMBEDDED_RUN_KEYS = (
+    "started_at",
+    "session_cycle",
+    "update_seq",
+    "rereviews_posted",
+    "rereviews_posted_at_cycle_start",
+    "finding_ids",
+    "finding_paths",
+    "seen_finding_fps",
+    "prior_seen_finding_fps",
+    "fixed_finding_fps",
+    "fixed_paths",
+    "seen_pattern_sigs",
+    "prior_seen_pattern_sigs",
+    "swept_pattern_sigs",
+    "thread_fingerprint",
+    "last_head_oid",
+    "fix_induced_fps",
+    "cycles",
+)
+
+
+def embed_run_state(run: dict[str, Any]) -> str:
+    """The hidden state block for a receipt, or '' when there is no run."""
+    if not isinstance(run, dict) or "started_at" not in run:
+        return ""
+    payload = {k: run[k] for k in EMBEDDED_RUN_KEYS if k in run}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return STICKY_STATE_MARKER + base64.urlsafe_b64encode(raw).decode("ascii") + " -->"
+
+
+def parse_embedded_run_state(body: Any) -> dict[str, Any] | None:
+    """The run dict a receipt body carries, or None when absent or unreadable."""
+    if not isinstance(body, str):
+        return None
+    match = STICKY_STATE_RE.search(body)
+    if match is None:
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(match.group(1).encode("ascii")))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("started_at"), str):
+        return None
+    return {k: v for k, v in data.items() if k in EMBEDDED_RUN_KEYS}
+
+
+def receipt_comment_on_pr(pull_request: dict[str, Any]) -> dict[str, Any] | None:
+    """The newest sticky receipt among the PR's fetched comments, if any."""
+    found = None
+    for comment in (pull_request.get("comments") or {}).get("nodes") or []:
+        if isinstance(comment, dict) and STICKY_RECEIPT_MARKER in (comment.get("body") or ""):
+            found = comment
+    return found
+
+
+def hydrate_run_from_receipt(
+    pr: PullRequest, pull_request: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Adopt the run state a RUNNING receipt carries when none exists locally.
+
+    Only an in-progress receipt is adopted: a DONE/STOPPED one belongs to a
+    run that ended, and the next loop starts fresh. The receipt was itself
+    the last summary, so ``last_summary_seq`` is set to its ``update_seq``
+    and the fetch that follows makes the summary stale again, as it should.
+    Returns the adopted run, or None. Fails open on any state error.
+    """
+    if "started_at" in read_run_tracking(pr):
+        return None
+    comment = receipt_comment_on_pr(pull_request)
+    if comment is None:
+        return None
+    body = comment.get("body") or ""
+    first_line = body.split("\n", 1)[0]
+    if "RUNNING" not in first_line:
+        return None
+    run = parse_embedded_run_state(body)
+    if run is None:
+        return None
+    run["last_summary_seq"] = _safe_int(run.get("update_seq", 0))
+    state = load_sticky_state()
+    key = _state_key(pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    entry["run"] = run
+    state[key] = entry
+    save_sticky_state(state)
+    return run
+
+
+def repo_root_for_history(pull_request: dict[str, Any], *, cwd: str | None = None) -> Path | None:
+    """A checkout of the PR's repository, whatever its HEAD or cleanliness.
+
+    Diffing two pushed commits needs the objects, not a clean tree at the
+    head, so this is looser than ``repo_root_for_pr`` on purpose.
+    """
+    root = repo_root(cwd)
+    if root is None:
+        return None
+    if _checkout_repository(root) not in _canonical_pr_repositories(pull_request):
+        return None
+    return root
+
+
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_changed_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """New-side line ranges per path from a ``git diff -U0`` output."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    path: str | None = None
+    for raw in diff_text.splitlines():
+        if raw.startswith("+++ "):
+            target = raw[4:].strip()
+            path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
+            continue
+        match = HUNK_RE.match(raw)
+        if match is None or path is None:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2)) if match.group(2) is not None else 1
+        # A pure deletion (count 0) anchors at the line that now follows it.
+        end = start + max(count, 1) - 1
+        ranges.setdefault(path, []).append((start, end))
+    return ranges
+
+
+def changed_line_ranges(
+    prev_head: str | None, head: str | None, *, cwd: str | Path | None
+) -> dict[str, list[tuple[int, int]]] | None:
+    """Lines ``prev_head..head`` touched, per path, or None when unknowable.
+
+    None (not ``{}``) when either commit is missing locally or git fails, so
+    the caller cannot mistake "could not compare" for "nothing changed".
+    """
+    if not prev_head or not head or prev_head == head or cwd is None:
+        return None
+    for sha in (prev_head, head):
+        probe = _run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=cwd)
+        if probe is None or probe.returncode != 0:
+            return None
+    result = _run_git(["diff", "-U0", "--no-color", f"{prev_head}..{head}"], cwd=cwd)
+    if result is None or result.returncode != 0:
+        return None
+    return parse_changed_line_ranges(result.stdout or "")
+
+
+def _thread_anchor_lines(thread: dict[str, Any]) -> tuple[int, int] | None:
+    line = thread.get("line")
+    if line is None:
+        line = thread.get("originalLine")
+    if not isinstance(line, int):
+        return None
+    start = thread.get("startLine")
+    if start is None:
+        start = thread.get("originalStartLine")
+    start = start if isinstance(start, int) and start <= line else line
+    return (start, line)
+
+
+def fix_induced_findings(
+    threads: list[dict[str, Any]],
+    *,
+    new_fingerprints: set[str],
+    ranges: dict[str, list[tuple[int, int]]],
+) -> set[str]:
+    """Fingerprints of new findings anchored inside the loop's own changes."""
+    induced: set[str] = set()
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        fingerprint = finding_fingerprint(thread)
+        if fingerprint not in new_fingerprints:
+            continue
+        anchor = _thread_anchor_lines(thread)
+        path = thread.get("path")
+        if anchor is None or not isinstance(path, str):
+            continue
+        lo, hi = anchor
+        if any(start <= hi and lo <= end for start, end in ranges.get(path, [])):
+            induced.add(fingerprint)
+    return induced
+
+
+def track_head_and_fix_induced(
+    pr: PullRequest,
+    pull_request: dict[str, Any],
+    threads: list[dict[str, Any]],
+    *,
+    new_fingerprints: set[str],
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Record the fetched head and which new findings its fixes caused.
+
+    Call once per real fetch, after ``track_finding_fingerprints``. The head
+    the previous fetch saw is the base: the diff from it to the current head
+    is what the loop (plus anyone else) pushed in between. Stores the
+    cumulative ``fix_induced_fps`` and this cycle's ``cycle_fix_induced_fps``
+    for the receipt. Fails open: no comparison → nothing is fix-induced.
+    """
+    state = load_sticky_state()
+    key = _state_key(pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    run = entry.get("run")
+    run = dict(run) if isinstance(run, dict) else {}
+    prev_head = run.get("last_head_oid")
+    head = pull_request.get("headRefOid")
+    ranges = None
+    if isinstance(prev_head, str) and isinstance(head, str):
+        ranges = changed_line_ranges(
+            prev_head, head, cwd=repo_root_for_history(pull_request, cwd=cwd)
+        )
+    induced = (
+        fix_induced_findings(threads, new_fingerprints=new_fingerprints, ranges=ranges)
+        if ranges
+        else set()
+    )
+    prior_val = run.get("fix_induced_fps")
+    prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
+    run["fix_induced_fps"] = sorted(prior | induced)
+    run["cycle_fix_induced_fps"] = sorted(induced)
+    run["cycle_new_findings"] = len(new_fingerprints)
+    if isinstance(head, str) and head:
+        run["last_head_oid"] = head
+    entry["run"] = run
+    state[key] = entry
+    save_sticky_state(state)
+    return {
+        "fix_induced": induced,
+        "new_findings": len(new_fingerprints),
+        "compared": ranges is not None,
+    }
+
+
+def churn_detected(
+    *, fix_induced: int, new_findings: int, session_cycle: int | None
+) -> bool:
+    """Every new finding this cycle (cycle 2+) landed on lines the loop changed."""
+    return bool(
+        new_findings
+        and fix_induced >= new_findings
+        and _safe_int(session_cycle) >= 2
+    )
+
 
 def main() -> int:
     # Post-rename housekeeping: move ~/.config/gh-gemini-review-loop to
@@ -4720,6 +5147,16 @@ def main() -> int:
         "--cycle-outcome",
         default="continued",
         help="Cycle outcome: 'continued' for a non-terminal cycle, else the terminal label.",
+    )
+    parser.add_argument(
+        "--fix-ci",
+        action="store_true",
+        help=(
+            "Treat a failing check on the head as a finding to fix this cycle "
+            "(the [loop] CI block says so). Default: report it and, when it is "
+            "all that is left, stop with --outcome ci_failed. Persist with "
+            "fix_ci: true in preferences.json."
+        ),
     )
     parser.add_argument(
         "--stats",
@@ -5128,6 +5565,21 @@ def main() -> int:
             finding["id"] for finding in summary_findings
         }
         threads = sort_by_severity(threads)
+        # Resume from the receipt on the PR (#resume): a RUNNING receipt with
+        # an embedded state block means another machine, or a wiped state
+        # dir, is mid-run. Adopt it before run tracking would start cycle 1.
+        resumed_run: dict[str, Any] | None = None
+        if not args.record_run and not args.cycle_summary and not args.stats:
+            try:
+                resumed_run = hydrate_run_from_receipt(pr, pull_request)
+            except OSError as exc:
+                print(f"warning: could not read run state from the PR receipt: {exc}", file=sys.stderr)
+            if resumed_run:
+                print(
+                    f"[loop] resumed run state from the PR receipt "
+                    f"(session cycle {_safe_int(resumed_run.get('session_cycle'))}).",
+                    file=sys.stderr,
+                )
         if not args.record_run and not args.stats:
             try:
                 update_run_tracking(
@@ -5166,6 +5618,7 @@ def main() -> int:
         # --stats), so the comparison reflects actual loop cycles, not
         # mid-cycle read-only calls.
         no_progress_flag = False
+        churn: dict[str, Any] = {"fix_induced": set(), "new_findings": 0, "compared": False}
         if not args.record_run and not args.cycle_summary and not args.stats:
             current_fp = thread_fingerprint(threads)
             try:
@@ -5174,12 +5627,21 @@ def main() -> int:
                 print(f"warning: could not check progress: {exc}", file=sys.stderr)
             # Snapshot prior-cycle finding fingerprints so the receipt can mark
             # carried-over findings. Real-fetch only, once per cycle.
+            fingerprint_delta = {"prior": set(), "new": set()}
             try:
-                track_finding_fingerprints(
+                fingerprint_delta = track_finding_fingerprints(
                     pr, {finding_fingerprint(t) for t in threads if isinstance(t, dict)}
                 )
             except OSError as exc:
                 print(f"warning: could not track finding fingerprints: {exc}", file=sys.stderr)
+            # Churn: which of this cycle's new findings sit on lines the loop
+            # itself changed since the head the previous fetch saw.
+            try:
+                churn = track_head_and_fix_induced(
+                    pr, pull_request, threads, new_fingerprints=fingerprint_delta["new"]
+                )
+            except OSError as exc:
+                print(f"warning: could not track fix-induced findings: {exc}", file=sys.stderr)
             try:
                 track_pattern_signatures(
                     pr,
@@ -5188,6 +5650,14 @@ def main() -> int:
                 )
             except OSError as exc:
                 print(f"warning: could not track pattern signatures: {exc}", file=sys.stderr)
+
+        # ---- Head checks and human threads ---------------------------------
+        # Both are feedback the thread filter never sees: a red check on the
+        # head, and a thread a person opened. Surfaced, not fixed: CI only on
+        # opt-in (fix_ci), human threads never.
+        ci = ci_status(pull_request)
+        fix_ci_mode = bool(args.fix_ci or prefs.get("fix_ci"))
+        human_threads = human_review_threads(pull_request, args.author, agent_login)
 
         # ---- Judge (optional, opt-in via prefs file or --judge-mode) -------
         # The script is the single source of truth for whether the judge
@@ -5394,6 +5864,16 @@ def main() -> int:
             history = metrics.pattern_history_for_pr(metrics_repo, pr.number)
             convergence = build_convergence(pr, clusters, history)
             conv_stats = convergence["stats"]
+            run_fix_induced = run.get("fix_induced_fps") if isinstance(run, dict) else None
+            run_fix_induced = (
+                {x for x in run_fix_induced if isinstance(x, str)}
+                if isinstance(run_fix_induced, list) else set()
+            )
+            cycle_fix_induced = run.get("cycle_fix_induced_fps") if isinstance(run, dict) else None
+            cycle_fix_induced = (
+                {x for x in cycle_fix_induced if isinstance(x, str)}
+                if isinstance(cycle_fix_induced, list) else set()
+            )
             record = metrics.build_record(
                 repo=metrics_repo,
                 pr=pr.number,
@@ -5425,6 +5905,9 @@ def main() -> int:
                     "signatures": sorted({c.signature for c in clusters}),
                     "swept": convergence["swept"],
                 } if clusters else None,
+                fix_induced=len(run_fix_induced),
+                human_threads=len(human_threads),
+                ci=ci_record_fields(ci),
                 **derived,
             )
             # Read the carried-over classification BEFORE the terminal branch:
@@ -5465,18 +5948,30 @@ def main() -> int:
             patterns_block = metrics.format_patterns_block(clusters)
             clustering_advisory = metrics.format_degenerate_clustering_advisory(clusters)
             convergence_line = convergence["line"]
+            ci_block = metrics.format_ci_block(ci, fix_ci=fix_ci_mode)
+            human_block = metrics.format_human_threads_block(human_threads)
+            churn_line = metrics.format_churn_line(
+                fix_induced=len(cycle_fix_induced),
+                new_findings=_safe_int(run.get("cycle_new_findings")) if isinstance(run, dict) else 0,
+                session_cycle=_safe_int(run.get("session_cycle")) if isinstance(run, dict) else None,
+            )
             findings_view = []
             for thread in threads:
                 comments = _iter_comments(thread)
                 line_val = thread.get("line")
+                fingerprint = finding_fingerprint(thread)
                 findings_view.append({
                     "path": thread.get("path"),
                     "line": line_val if line_val is not None else thread.get("originalLine"),
                     "severity": thread_severity(thread),
                     "url": comments[0].get("url") if comments and isinstance(comments[0], dict) else None,
-                    "carried": finding_fingerprint(thread) in prior_fps,
+                    "carried": fingerprint in prior_fps,
+                    "fix_induced": fingerprint in run_fix_induced,
                 })
             findings_block = metrics.format_findings_block(findings_view)
+            # The run state rides in the receipt (hidden) so another machine
+            # can resume; a terminal receipt carries none — the run is over.
+            state_block = "" if args.record_run else embed_run_state(run)
 
             receipt_url = None
             if not args.dry_run:
@@ -5488,12 +5983,16 @@ def main() -> int:
                         summary_block,
                         semantic_risk_block,
                         suite_block,
+                        ci_block,
                         patterns_block,
                         clustering_advisory,
                         convergence_line,
+                        churn_line,
+                        human_block,
                     ],
                     status=receipt_status,
                     findings_block=findings_block,
+                    state_block=state_block,
                 )
                 try:
                     comment_id = post_or_update_sticky_receipt(pr, body)
@@ -5536,6 +6035,12 @@ def main() -> int:
                 # pointer; everything else lives in the PR comment.
                 if clustering_advisory:
                     print(clustering_advisory)
+                # A red head and churn both change what the agent does next,
+                # so they stay in chat beside the pointer.
+                if ci_block:
+                    print(color_loop_block(ci_block, enabled=color_enabled))
+                if churn_line:
+                    print(color_loop_block(churn_line, enabled=color_enabled))
             else:
                 print(color_loop_block(summary_block, enabled=color_enabled))
                 if judge_eval_requested(judge_status):
@@ -5558,6 +6063,12 @@ def main() -> int:
                     print(clustering_advisory)
                 if convergence_line:
                     print(convergence_line)
+                if ci_block:
+                    print(color_loop_block(ci_block, enabled=color_enabled))
+                if churn_line:
+                    print(color_loop_block(churn_line, enabled=color_enabled))
+                if human_block:
+                    print(color_loop_block(human_block, enabled=color_enabled))
                 if findings_block:
                     print(findings_block)
             return 0
@@ -5706,8 +6217,29 @@ def main() -> int:
                         "actionableThreadFingerprint": thread_fingerprint(threads),
                         "noProgressDetected": no_progress_flag,
                         "judge": judge_status,
+                        # The head's checks; `failing` carries a log command
+                        # for Actions checks. fixCi says whether the loop may
+                        # fix a red check this cycle.
+                        "ci": ci,
+                        "fixCi": fix_ci_mode,
+                        "humanThreadCount": len(human_threads),
+                        # New findings on lines the loop's own fixes changed.
+                        "fixInduced": {
+                            "count": len(churn["fix_induced"]),
+                            "newFindings": churn["new_findings"],
+                            "compared": churn["compared"],
+                            "churn": churn_detected(
+                                fix_induced=len(churn["fix_induced"]),
+                                new_findings=churn["new_findings"],
+                                session_cycle=read_run_tracking(pr).get("session_cycle"),
+                            ),
+                        },
+                        "resumedFromReceipt": resumed_run is not None,
                     },
                     "judgeResults": judge_results,
+                    # Threads a person opened: surfaced for a reply draft,
+                    # never fixed by the loop.
+                    "humanThreads": human_threads,
                     "humanBlocks": {
                         "profileIntro": profile_intro_block,
                         # Empty (not a fallback string) while provisional, so
@@ -5813,6 +6345,19 @@ def main() -> int:
                     enabled=color_enabled,
                 )
             )
+        ci_block = metrics.format_ci_block(ci, fix_ci=fix_ci_mode)
+        if ci_block:
+            print(color_loop_block(ci_block, enabled=color_enabled))
+        churn_line = metrics.format_churn_line(
+            fix_induced=len(churn["fix_induced"]),
+            new_findings=churn["new_findings"],
+            session_cycle=session_cycle_n,
+        )
+        if churn_line:
+            print(color_loop_block(churn_line, enabled=color_enabled))
+        human_block = metrics.format_human_threads_block(human_threads)
+        if human_block:
+            print(color_loop_block(human_block, enabled=color_enabled))
         print(color_loop_block(profile_intro_block, enabled=color_enabled))
         if planned_verification_block:
             print(color_loop_block(planned_verification_block, enabled=color_enabled))

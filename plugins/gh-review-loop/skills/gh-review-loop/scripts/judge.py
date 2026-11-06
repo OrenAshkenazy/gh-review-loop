@@ -218,6 +218,9 @@ def load_preferences() -> dict[str, t.Any]:
         "max_rereview_requests": max_rereview_requests,
         "profiles": profiles,
         "set_at": data.get("set_at") or "",
+        # Opt-in: let the loop fix a failing head check as if it were a
+        # finding. Off by default: a red check is reported, not touched.
+        "fix_ci": data.get("fix_ci") is True,
     }
 
 
@@ -235,6 +238,7 @@ def save_preferences(judge_mode: str, *, judge_model: str | None = None) -> dict
             "max_rereview_requests", DEFAULT_MAX_REREVIEW_REQUESTS
         ),
         "profiles": existing.get("profiles", {}),
+        "fix_ci": bool(existing.get("fix_ci", False)),
         "set_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     path = prefs_path()
@@ -328,6 +332,7 @@ def _default_prefs() -> dict[str, t.Any]:
         "judge_tip_shown": False,
         "max_rereview_requests": DEFAULT_MAX_REREVIEW_REQUESTS,
         "profiles": {},
+        "fix_ci": False,
         "set_at": "",
     }
 

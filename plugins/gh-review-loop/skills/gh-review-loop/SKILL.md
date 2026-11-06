@@ -27,6 +27,8 @@ This file holds the every-cycle happy path. Read the referenced file **at the po
 | `references/judge-eval.md` | `judge_mode` ≠ `off`, the user mentions judge/eval, or the one-time tip is due |
 | `references/receipts-and-metrics.md` | `--post-receipt`/`--sticky-receipt`, `--semantic-risk`, `--stats`, the `--record-run` flag catalog |
 | `references/terminal-report.md` | Terminal `[loop] Summary` has `remaining_actionable > 0` |
+| `references/ci-and-human-threads.md` | The fetch prints a `[loop] CI:` block (failing/pending head checks) or a `[loop] Human review threads` block |
+| `references/churn.md` | The fetch prints `[loop] Fix-induced:` or `[loop] churn:` |
 | `references/resume-and-recovery.md` | Re-invocation at the cap; new pushes after the loop stopped; resumed/compacted session |
 | `references/variations.md` | Phrasing isn't the plain default loop (severity filters, audit-only, cap changes, judge modes, stats) |
 | `references/script-usage.md` | Any invocation not shown inline (wait catalog + outcome handling, discovery, read-only, dry-run, JSON, history) |
@@ -40,6 +42,7 @@ One configured reviewer bot per PR; returning runs reuse the persisted selection
 - **`RESOLVED`** / **`OUTDATED`** — skip (outdated is auto-resolved by the script).
 - **`ADDRESSED_BY_REPLY`** — a maintainer's substantive reply deferred it: do not fix again; auto-resolved next pass (details: `references/write-safety.md`).
 - **`UNRESOLVED`** — actionable; drives the next fix attempt. Ordered `critical → high → medium → low → unknown` from each reviewer's severity markers; unrecognized formats remain `unknown`.
+- **Human threads** (a person opened them) are listed separately by the fetch and are never fixed unasked: draft a reply, ask the user.
 
 ## Cycle Counting
 
@@ -92,7 +95,7 @@ An opt-in, read-only OpenAI judge can classify findings. **Off by default; nothi
 
 ## Stopping Conditions
 
-Stop and report instead of pushing or re-asking when any is true: **1. Cap reached** (`capped`) — ask once: stop, or raise to N (`--max-rereview-requests N`). **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — remaining threads are informational, duplicate, contradictory, or need a human call (incl. `ADDRESSED_BY_REPLY`). **4. Test regression** — a failure the fix did not clearly cause. **5. No progress** — the script prints `[loop] no_progress: …`: stop at once with `--record-run --outcome no_progress`; do not push or re-request.
+Stop and report instead of pushing or re-asking when any is true: **1. Cap reached** (`capped`) — ask once: stop, or raise to N (`--max-rereview-requests N`). **2. All clean** — no `UNRESOLVED` actionable threads after cleanup. **3. Human decision required** — remaining threads are informational, duplicate, contradictory, or need a human call (incl. `ADDRESSED_BY_REPLY`). **4. Test regression** — a failure the fix did not clearly cause. **5. No progress** — the script prints `[loop] no_progress: …`: stop at once with `--record-run --outcome no_progress`; do not push or re-request. **6. CI failed** — the `[loop] CI:` block shows a failing head check with `fix_ci: off` and no actionable thread is left: `--outcome ci_failed` (opt-in to fixing it: `references/ci-and-human-threads.md`). **7. Churn** — the script prints `[loop] churn: …`: `--outcome churn` unless the user said to ignore churn.
 
 At the cap still run cleanup, terminal classification, metrics, and the final summary. Re-invocation at the cap is a resume signal — load `references/resume-and-recovery.md` first.
 
