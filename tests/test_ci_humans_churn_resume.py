@@ -752,3 +752,62 @@ class TestCodexReviewPr123:
                                        after_iso="2026-11-06T10:00:00Z")
         assert info.value.pull_request["headRefOid"] == "c" * 40
         assert "CI: 1 failing check(s) on the head (tests)" in capsys.readouterr().err
+
+    # --- second Codex pass -------------------------------------------------
+
+    def test_a_receipt_outside_the_last_100_comments_is_recovered_by_rest(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        run = {"started_at": "2026-11-06T10:00:00Z", "session_cycle": 2, "update_seq": 3}
+        body = build_receipt_comment_body(["x"], status="RUNNING", state_block=embed_run_state(run))
+        calls = []
+
+        def fake_run_gh(args, cwd=None):
+            calls.append(args)
+            if "--paginate" in args:
+                return "4242\n"
+            assert args[1].endswith("/issues/comments/4242")
+            return {"id": 4242, "body": body}
+
+        monkeypatch.setattr(fgt, "run_gh", fake_run_gh)
+        # The fetched window holds 100 later comments and no receipt.
+        window = {"comments": {"nodes": [{"body": f"c{i}"} for i in range(100)]}}
+        assert hydrate_run_from_receipt(PR, window)["session_cycle"] == 2
+        assert read_run_tracking(PR)["session_cycle"] == 2
+        assert len(calls) == 2
+
+    def test_no_receipt_anywhere_means_no_lookup_beyond_discovery(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(fgt, "run_gh", lambda args, cwd=None: "")
+        assert hydrate_run_from_receipt(PR, {"comments": {"nodes": []}}) is None
+        monkeypatch.setattr(fgt, "run_gh", lambda args, cwd=None: (_ for _ in ()).throw(RuntimeError("gh down")))
+        assert hydrate_run_from_receipt(PR, {"comments": {"nodes": []}}) is None
+
+    def test_status_only_sticky_receipt_keeps_the_checkpoint(self, driven, monkeypatch, capsys):
+        _run(monkeypatch, capsys, "--format", "json")  # starts the run locally
+        bodies = []
+        monkeypatch.setattr(
+            fgt, "post_or_update_sticky_receipt",
+            lambda pr, body, *, dry_run=False: bodies.append(body) or 1,
+        )
+        _run(monkeypatch, capsys, "--sticky-receipt")
+        state = parse_embedded_run_state(bodies[-1])
+        assert state is not None and state["session_cycle"] == 1
+        assert bodies[-1].index(STICKY_RECEIPT_MARKER) < bodies[-1].index(fgt.STICKY_STATE_MARKER)
+        _run(monkeypatch, capsys, "--sticky-receipt", "--receipt-status", "done")
+        assert parse_embedded_run_state(bodies[-1]) is None
+
+    def test_git_quoted_paths_are_decoded_before_matching(self):
+        assert fgt.unquote_git_path("plain.py") == "plain.py"
+        assert fgt.unquote_git_path('"b/caf\\303\\251.py"') == "b/café.py"
+        assert fgt.unquote_git_path('"a\\"b\\\\c\\t.py"') == 'a"b\\c\t.py'
+        diff = (
+            'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+            '--- "a/caf\\303\\251.py"\n+++ "b/caf\\303\\251.py"\n@@ -1 +1,2 @@\n-x\n+y\n+z\n'
+        )
+        assert parse_changed_line_ranges(diff) == {"café.py": [(1, 2)]}
+        thread = {"id": "t", "path": "café.py", "line": 2,
+                  "comments": [{"author": {"login": BOT}, "body": "accent"}]}
+        assert fix_induced_findings(
+            [thread], new_fingerprints={finding_fingerprint(thread)},
+            ranges=parse_changed_line_ranges(diff),
+        ) == {finding_fingerprint(thread)}
