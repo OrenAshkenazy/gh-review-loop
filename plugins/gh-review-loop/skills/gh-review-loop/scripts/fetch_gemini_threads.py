@@ -4513,9 +4513,12 @@ def parse_changed_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]
             continue
         start = int(match.group(1))
         count = int(match.group(2)) if match.group(2) is not None else 1
-        # A pure deletion (count 0) anchors at the line that now follows it.
-        end = start + max(count, 1) - 1
-        ranges.setdefault(path, []).append((start, end))
+        # A pure deletion has no new-side lines: its positional anchor is an
+        # untouched neighbour, and reading it as changed made an original
+        # finding there look fix-induced (Codex, PR #123).
+        if count == 0:
+            continue
+        ranges.setdefault(path, []).append((start, start + count - 1))
     return ranges
 
 
