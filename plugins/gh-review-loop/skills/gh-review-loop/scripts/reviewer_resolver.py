@@ -373,12 +373,21 @@ def push_review_waits(
 def head_arrived_at(pull_request: dict[str, Any]) -> str:
     """When the head commit can first be shown to have reached the PR, or "".
 
+    See ``head_arrival`` for whether that time is push-evidenced.
+    """
+    return head_arrival(pull_request)[0]
+
+
+def head_arrival(pull_request: dict[str, Any]) -> tuple[str, bool]:
+    """``(arrived_at, evidenced)``: the arrival time and whether a check backs it.
+
     A commit's ``committedDate`` is when it was made, which can be hours
     before it was pushed: a clean summary posted in between
     would otherwise read as covering a head the reviewer never saw. GitHub
     creates a check suite or commit status only once a commit is pushed, so
     the earliest one on the head is a boundary the push cannot postdate. The
-    later of the two is used; a head with no checks keeps ``committedDate``.
+    later of the two is used; a head with no checks keeps ``committedDate``,
+    and ``evidenced`` is then False: nothing shows when the push happened.
     """
     nodes = (pull_request.get("commits") or {}).get("nodes") or []
     for node in reversed(nodes):
@@ -398,8 +407,8 @@ def head_arrived_at(pull_request: dict[str, Any]) -> str:
                 if isinstance(value, str) and value:
                     created.append(value)
                     break
-        return max(committed, min(created) if created else "")
-    return ""
+        return max(committed, min(created) if created else ""), bool(created)
+    return "", False
 
 
 def _parse_instant(value: str) -> _dt.datetime | None:

@@ -952,8 +952,9 @@ def summary_review_state(
     """What ``login``'s review summaries (PR comments) say about the head.
 
     ``covers_head``: a finished summary was posted after the head reached the
-    PR, the fetch's own coverage rule (``reviewer_resolver.head_arrived_at``);
-    without an arrival time nothing can be shown to cover it. The CI job posts
+    PR, the fetch's own coverage rule (``reviewer_resolver.head_arrival``);
+    without a push-evidenced arrival time (a check on the head) nothing can
+    be shown to cover it. The CI job posts
     comments, never reviews, so the review-based dedupe could not see this.
     ``reviews_on_push``: at least two summaries arrived with no trigger
     comment since the summary before, so the repository reviews every push and
@@ -968,7 +969,7 @@ def summary_review_state(
     SUCCESS, FAILURE or ERROR), so a push review not posted by now is not
     coming; no rollup yet, or one still pending, is not done.
     """
-    arrived = reviewer_resolver.head_arrived_at(pull_request)
+    arrived, evidenced = reviewer_resolver.head_arrival(pull_request)
     trigger = _trigger_re(vendor.mention)
     comments = sorted(
         (c for c in (pull_request.get("comments") or {}).get("nodes") or [] if isinstance(c, dict)),
@@ -983,7 +984,11 @@ def summary_review_state(
                     prompted = False
                 continue
             unprompted += 0 if prompted else 1
-            if arrived and not covers_head and (comment.get("createdAt") or "") >= arrived:
+            # Only a push-evidenced arrival can show a summary covers the
+            # head: with no check on the head, ``arrived`` is the commit time,
+            # and a receipt for the previous head posted between the commit
+            # and its push would read as covering it (Codex, PR #123).
+            if evidenced and not covers_head and (comment.get("createdAt") or "") >= arrived:
                 covers_head = True
                 push_reviewed = not prompted and seen > 0
             seen += 1

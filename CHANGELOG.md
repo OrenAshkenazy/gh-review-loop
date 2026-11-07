@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- **Checks on the head are feedback.** The fetch reads the head commit's
+  `statusCheckRollup` (check names, conclusions, `isRequired`, details URLs)
+  and prints a `[loop] CI:` block when a check failed or is still running,
+  with a `gh run view <id> --repo … --log-failed` command for each failing
+  GitHub Actions check. The loop reports the failure and never fixes it;
+  when nothing else is left it stops with the new outcome `ci_failed`. An
+  incomplete rollup (non-success state with no failing check fetched, or a
+  full page of 50 contexts) is named instead of read as green, and every
+  non-ready wait exit carries the head's checks. JSON: `loopStatus.ci`,
+  `wait.ci`. (`references/ci-checks.md`)
+- **Codex's clean receipt ends the wait.** Codex answers a re-review that
+  found nothing with a top-level comment (`<!-- codex-review-receipt:v1 -->`,
+  "Didn't find any major issues"), not a review; the waiter now reads it as
+  the reviewer's answer instead of timing out, and `request_rereview.py`
+  answers `already_reviewed_head` for a head it covers.
+- **Churn detection.** The fetch records the head it saw; the next fetch
+  diffs it against the new head and tags new findings anchored inside those
+  hunks as fix-induced (`· on lines this loop changed` in the receipt,
+  `fix_induced` in the record, `loopStatus.fixInduced` in JSON). When every
+  new finding on cycle 2+ is fix-induced the script prints `[loop] churn:`
+  and the loop stops with the new outcome `churn`. (`references/churn.md`)
+
 - **Claude Code is a first-class reviewer.** One vendor (`claude`, REST
   `claude[bot]`) covers the three ways Claude reviews a PR through the Claude
   GitHub App: the hosted Code Review service, the claude-code-action running

@@ -228,7 +228,9 @@ CLAUDE_OPEN_ITEM_SEVERITIES = {
 # gate, as for Copilot: the clean gate reads open_findings.
 CLAUDE_CLEAN_PHRASE_RE = re.compile(
     r"(?:\bno (?:new )?(?:blocking )?(?:issues|bugs|problems)(?: were)?(?: found)?\b"
-    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b)",
+    r"|\bnothing blocking\b|\bfound no (?:bugs|issues)\b"
+    # Codex's clean receipt wording.
+    r"|\bdidn't find any (?:major )?issues\b)",
     re.IGNORECASE,
 )
 SUMMARY_VERDICT_LINE_RE = re.compile(r"\*\*Verdict:?\*\*:?[ \t]*(?P<text>[^\n]*)", re.IGNORECASE)
@@ -386,11 +388,19 @@ query($owner:String!, $repo:String!, $number:Int!) {
           commit {
             committedDate
             statusCheckRollup {
+              state
               contexts(first:50) {
                 nodes {
                   __typename
-                  ... on CheckRun { startedAt checkSuite { createdAt } }
-                  ... on StatusContext { createdAt }
+                  ... on CheckRun {
+                    name status conclusion detailsUrl startedAt
+                    isRequired(pullRequestNumber:$number)
+                    checkSuite { createdAt }
+                  }
+                  ... on StatusContext {
+                    context state targetUrl createdAt
+                    isRequired(pullRequestNumber:$number)
+                  }
                 }
               }
             }
@@ -1302,11 +1312,16 @@ class WaitTimedOut(Exception):
     and a network error must not masquerade as a timeout.
     """
 
-    def __init__(self, elapsed_seconds: int) -> None:
+    def __init__(
+        self, elapsed_seconds: int, pull_request: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(
             f"Timed out waiting for stable review activity after {elapsed_seconds} seconds."
         )
         self.elapsed_seconds = elapsed_seconds
+        # The last payload polled, so the CLI can surface the head's checks:
+        # a reviewer that runs only after CI never arrives on a red head.
+        self.pull_request = pull_request
 
 
 def reviewer_refusal(
@@ -2979,6 +2994,7 @@ def run_wait_chunk(
                 "author": author,
                 "elapsed_seconds": elapsed,
                 "checks": wait["checks"],
+                "ci": ci_status(pull_request),
             }
             save_wait_snapshot(pr, snapshot)
             return {**snapshot, "pull_request": None}
@@ -2991,6 +3007,9 @@ def run_wait_chunk(
                 "elapsed_seconds": elapsed,
                 "checks": wait["checks"],
                 "next_wait_seconds": next_wait,
+                # The head's checks ride with every non-ready exit: a failing
+                # check may be why the reviewer never comes (Codex, PR #123).
+                "ci": ci_status(pull_request),
             }
             if fingerprint is not None:
                 snapshot["quiet_period_remaining_seconds"] = quiet_remaining
@@ -4000,9 +4019,10 @@ def wait_for_stable_review(
                     waiting_for = f"Waiting for {author} review of {head7}..."
                 else:
                     waiting_for = f"Waiting for {author} review activity..."
+                ci_note = _ci_heartbeat_note(ci_status(pull_request))
                 print(
                     f"{waiting_for} "
-                    f"({int(now - start)}s elapsed, timeout {timeout_seconds}s)",
+                    f"({int(now - start)}s elapsed, timeout {timeout_seconds}s){ci_note}",
                     file=sys.stderr,
                 )
                 last_heartbeat = now
@@ -4023,7 +4043,7 @@ def wait_for_stable_review(
             return pull_request
 
         if now >= deadline:
-            raise WaitTimedOut(int(now - start))
+            raise WaitTimedOut(int(now - start), pull_request)
 
         time.sleep(min(interval_seconds, max(0.0, deadline - now)))
 
@@ -4314,6 +4334,316 @@ def first_value(thread: dict[str, Any], key: str) -> Any:
         if value is not None:
             return value
     return None
+
+# ---------------------------------------------------------------------------
+# Head checks (CI), human review threads, receipt-embedded run state, churn
+# ---------------------------------------------------------------------------
+
+# CheckRun conclusions that mean the check failed. CANCELLED, SKIPPED, NEUTRAL
+# and STALE do not: a cancelled job on the head is usually a superseded run,
+# and Claude Code Review's own check run "doesn't conclude as a failure".
+CI_FAILING_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+CI_FAILING_STATES = {"FAILURE", "ERROR"}
+CI_PENDING_STATES = {"PENDING", "EXPECTED"}
+ACTIONS_RUN_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)")
+
+
+def _check_log_command(url: Any) -> str | None:
+    """``gh run view … --log-failed`` for a GitHub Actions details URL, else None."""
+    if not isinstance(url, str):
+        return None
+    match = ACTIONS_RUN_URL_RE.search(url)
+    if match is None:
+        return None
+    owner, repo, run_id = match.groups()
+    return f"gh run view {run_id} --repo {owner}/{repo} --log-failed"
+
+
+def _ci_heartbeat_note(ci: dict[str, Any]) -> str:
+    """Suffix for a wait heartbeat line naming failing head checks, or ''."""
+    failing = [c for c in ci.get("failing") or [] if isinstance(c, dict)]
+    if not failing:
+        return ""
+    names = ", ".join(str(c.get("name") or "?") for c in failing[:3])
+    more = f", +{len(failing) - 3} more" if len(failing) > 3 else ""
+    return f" — CI: {len(failing)} failing check(s) on the head ({names}{more})"
+
+
+def ci_status(pull_request: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the head commit's checks from ``statusCheckRollup``.
+
+    Returns ``{"state", "total", "pending", "failing": [...], "truncated"}``.
+    Each failing entry carries ``name``, ``state``, ``required``, ``url`` and,
+    for a GitHub Actions check, ``log_command`` (``gh run view --log-failed``)
+    so the agent can read the failure without guessing the run id. Fails open:
+    a payload without a rollup reads as no checks.
+    """
+    nodes = (pull_request.get("commits") or {}).get("nodes") or []
+    last = nodes[-1] if nodes and isinstance(nodes[-1], dict) else {}
+    commit = last.get("commit") if isinstance(last.get("commit"), dict) else {}
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    rollup = rollup if isinstance(rollup, dict) else {}
+    contexts = (rollup.get("contexts") or {}).get("nodes") or []
+    failing: list[dict[str, Any]] = []
+    pending = 0
+    total = 0
+    for node in contexts:
+        if not isinstance(node, dict):
+            continue
+        typename = node.get("__typename")
+        if typename == "CheckRun":
+            total += 1
+            if node.get("status") != "COMPLETED":
+                pending += 1
+                continue
+            conclusion = node.get("conclusion")
+            if conclusion in CI_FAILING_CONCLUSIONS:
+                url = node.get("detailsUrl")
+                failing.append({
+                    "name": node.get("name") or "?",
+                    "state": str(conclusion).lower(),
+                    "required": node.get("isRequired") is True,
+                    "url": url if isinstance(url, str) else None,
+                    "log_command": _check_log_command(url),
+                })
+        elif typename == "StatusContext":
+            total += 1
+            state = node.get("state")
+            if state in CI_PENDING_STATES:
+                pending += 1
+                continue
+            if state in CI_FAILING_STATES:
+                url = node.get("targetUrl")
+                failing.append({
+                    "name": node.get("context") or "?",
+                    "state": str(state).lower(),
+                    "required": node.get("isRequired") is True,
+                    "url": url if isinstance(url, str) else None,
+                    "log_command": _check_log_command(url),
+                })
+    return {
+        "state": rollup.get("state"),
+        "total": total,
+        "pending": pending,
+        "failing": failing,
+        # contexts(first:50): a full page may hide a check.
+        "truncated": len(contexts) >= 50,
+    }
+
+
+def ci_record_fields(ci: dict[str, Any]) -> dict[str, Any]:
+    """The slim, identity-free CI summary stored in a run record."""
+    return {
+        "state": ci.get("state"),
+        "total": _safe_int(ci.get("total")),
+        "pending": _safe_int(ci.get("pending")),
+        "failing": [
+            {"name": c.get("name"), "required": bool(c.get("required"))}
+            for c in ci.get("failing") or []
+            if isinstance(c, dict)
+        ],
+    }
+
+
+def repo_root_for_history(pull_request: dict[str, Any], *, cwd: str | None = None) -> Path | None:
+    """A checkout of the PR's repository, whatever its HEAD or cleanliness.
+
+    Diffing two pushed commits needs the objects, not a clean tree at the
+    head, so this is looser than ``repo_root_for_pr`` on purpose.
+    """
+    root = repo_root(cwd)
+    if root is None:
+        return None
+    if _checkout_repository(root) not in _canonical_pr_repositories(pull_request):
+        return None
+    return root
+
+
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_GIT_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def unquote_git_path(value: str) -> str:
+    """Decode a path git printed C-quoted (``"caf\\303\\251.py"``).
+
+    Git quotes a path holding non-ASCII (with ``core.quotePath``, the
+    default), a quote, a backslash or a control character. A review thread
+    names the real path, so the diff's key must be decoded to match it
+    (Codex, PR #123). An unquoted value is returned as is.
+    """
+    if len(value) < 2 or not (value.startswith('"') and value.endswith('"')):
+        return value
+    raw = value[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch != "\\" or i + 1 >= len(raw):
+            out.extend(ch.encode("utf-8", "surrogateescape"))
+            i += 1
+            continue
+        nxt = raw[i + 1]
+        if nxt in "01234567":
+            digits = raw[i + 1 : i + 4]
+            length = 0
+            while length < len(digits) and digits[length] in "01234567":
+                length += 1
+            out.append(int(digits[:length], 8) & 0xFF)
+            i += 1 + length
+        elif nxt in _GIT_ESCAPES:
+            out.append(_GIT_ESCAPES[nxt])
+            i += 2
+        else:
+            out.extend(nxt.encode("utf-8", "surrogateescape"))
+            i += 2
+    return out.decode("utf-8", "surrogateescape")
+
+
+def parse_changed_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """New-side line ranges per path from a ``git diff -U0`` output."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    path: str | None = None
+    for raw in diff_text.splitlines():
+        if raw.startswith("+++ "):
+            target = unquote_git_path(raw[4:].strip())
+            path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
+            continue
+        match = HUNK_RE.match(raw)
+        if match is None or path is None:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2)) if match.group(2) is not None else 1
+        # A pure deletion has no new-side lines: its positional anchor is an
+        # untouched neighbour, and reading it as changed made an original
+        # finding there look fix-induced (Codex, PR #123).
+        if count == 0:
+            continue
+        ranges.setdefault(path, []).append((start, start + count - 1))
+    return ranges
+
+
+def changed_line_ranges(
+    prev_head: str | None, head: str | None, *, cwd: str | Path | None
+) -> dict[str, list[tuple[int, int]]] | None:
+    """Lines ``prev_head..head`` touched, per path, or None when unknowable.
+
+    None (not ``{}``) when either commit is missing locally or git fails, so
+    the caller cannot mistake "could not compare" for "nothing changed".
+    """
+    if not prev_head or not head or prev_head == head or cwd is None:
+        return None
+    for sha in (prev_head, head):
+        probe = _run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=cwd)
+        if probe is None or probe.returncode != 0:
+            return None
+    result = _run_git(["diff", "-U0", "--no-color", f"{prev_head}..{head}"], cwd=cwd)
+    if result is None or result.returncode != 0:
+        return None
+    return parse_changed_line_ranges(result.stdout or "")
+
+
+def _thread_anchor_lines(thread: dict[str, Any]) -> tuple[int, int] | None:
+    # A LEFT-side thread's line numbers are the base file's; the changed
+    # ranges are new-side lines of the current head, so the two cannot be
+    # compared (Codex, PR #123). Such a finding is never fix-induced.
+    if thread.get("diffSide") == "LEFT":
+        return None
+    line = thread.get("line")
+    if line is None:
+        line = thread.get("originalLine")
+    if not isinstance(line, int):
+        return None
+    start = thread.get("startLine")
+    if start is None:
+        start = thread.get("originalStartLine")
+    start = start if isinstance(start, int) and start <= line else line
+    return (start, line)
+
+
+def fix_induced_findings(
+    threads: list[dict[str, Any]],
+    *,
+    new_fingerprints: set[str],
+    ranges: dict[str, list[tuple[int, int]]],
+) -> set[str]:
+    """Fingerprints of new findings anchored inside the loop's own changes."""
+    induced: set[str] = set()
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        fingerprint = finding_fingerprint(thread)
+        if fingerprint not in new_fingerprints:
+            continue
+        anchor = _thread_anchor_lines(thread)
+        path = thread.get("path")
+        if anchor is None or not isinstance(path, str):
+            continue
+        lo, hi = anchor
+        if any(start <= hi and lo <= end for start, end in ranges.get(path, [])):
+            induced.add(fingerprint)
+    return induced
+
+
+def track_head_and_fix_induced(
+    pr: PullRequest,
+    pull_request: dict[str, Any],
+    threads: list[dict[str, Any]],
+    *,
+    new_fingerprints: set[str],
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Record the fetched head and which new findings its fixes caused.
+
+    Call once per real fetch, after ``track_finding_fingerprints``. The head
+    the previous fetch saw is the base: the diff from it to the current head
+    is what the loop (plus anyone else) pushed in between. Stores the
+    cumulative ``fix_induced_fps`` and this cycle's ``cycle_fix_induced_fps``
+    for the receipt. Fails open: no comparison → nothing is fix-induced.
+    """
+    state = load_sticky_state()
+    key = _state_key(pr)
+    entry = state.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    run = entry.get("run")
+    run = dict(run) if isinstance(run, dict) else {}
+    prev_head = run.get("last_head_oid")
+    head = pull_request.get("headRefOid")
+    ranges = None
+    if isinstance(prev_head, str) and isinstance(head, str):
+        ranges = changed_line_ranges(
+            prev_head, head, cwd=repo_root_for_history(pull_request, cwd=cwd)
+        )
+    induced = (
+        fix_induced_findings(threads, new_fingerprints=new_fingerprints, ranges=ranges)
+        if ranges
+        else set()
+    )
+    prior_val = run.get("fix_induced_fps")
+    prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
+    run["fix_induced_fps"] = sorted(prior | induced)
+    run["cycle_fix_induced_fps"] = sorted(induced)
+    run["cycle_new_findings"] = len(new_fingerprints)
+    if isinstance(head, str) and head:
+        run["last_head_oid"] = head
+    entry["run"] = run
+    state[key] = entry
+    save_sticky_state(state)
+    return {
+        "fix_induced": induced,
+        "new_findings": len(new_fingerprints),
+        "compared": ranges is not None,
+    }
+
+
+def churn_detected(
+    *, fix_induced: int, new_findings: int, session_cycle: int | None
+) -> bool:
+    """Every new finding this cycle (cycle 2+) landed on lines the loop changed."""
+    return bool(
+        new_findings
+        and fix_induced >= new_findings
+        and _safe_int(session_cycle) >= 2
+    )
 
 
 def main() -> int:
@@ -4969,6 +5299,9 @@ def main() -> int:
                             enabled=color_enabled,
                         )
                     )
+                    wait_ci_block = metrics.format_ci_block(chunk.get("ci"))
+                    if wait_ci_block:
+                        print(color_loop_block(wait_ci_block, enabled=color_enabled))
                 return 0
             pull_request = chunk["pull_request"]
         elif args.wait:
@@ -4993,12 +5326,16 @@ def main() -> int:
                 # Mirror the chunked-mode timed_out contract: deterministic
                 # relayable output, exit 0. Matters most when this wait ran as
                 # a background task and this is the tail of its captured log.
+                # The head's checks come with it: a red check may be the
+                # reason the reviewer never came.
+                timed_out_ci = ci_status(timed_out.pull_request or {})
                 if args.format == "json":
                     print(
                         json.dumps(
                             {"wait": {
                                 "status": "timed_out",
                                 "elapsed_seconds": timed_out.elapsed_seconds,
+                                "ci": timed_out_ci,
                             }},
                             indent=2,
                             sort_keys=True,
@@ -5015,6 +5352,9 @@ def main() -> int:
                             enabled=color_enabled,
                         )
                     )
+                    wait_ci_block = metrics.format_ci_block(timed_out_ci)
+                    if wait_ci_block:
+                        print(color_loop_block(wait_ci_block, enabled=color_enabled))
                 return 0
         else:
             pull_request = fetch_threads(pr)
@@ -5166,6 +5506,7 @@ def main() -> int:
         # --stats), so the comparison reflects actual loop cycles, not
         # mid-cycle read-only calls.
         no_progress_flag = False
+        churn: dict[str, Any] = {"fix_induced": set(), "new_findings": 0, "compared": False}
         if not args.record_run and not args.cycle_summary and not args.stats:
             current_fp = thread_fingerprint(threads)
             try:
@@ -5174,12 +5515,21 @@ def main() -> int:
                 print(f"warning: could not check progress: {exc}", file=sys.stderr)
             # Snapshot prior-cycle finding fingerprints so the receipt can mark
             # carried-over findings. Real-fetch only, once per cycle.
+            fingerprint_delta = {"prior": set(), "new": set()}
             try:
-                track_finding_fingerprints(
+                fingerprint_delta = track_finding_fingerprints(
                     pr, {finding_fingerprint(t) for t in threads if isinstance(t, dict)}
                 )
             except OSError as exc:
                 print(f"warning: could not track finding fingerprints: {exc}", file=sys.stderr)
+            # Churn: which of this cycle's new findings sit on lines the loop
+            # itself changed since the head the previous fetch saw.
+            try:
+                churn = track_head_and_fix_induced(
+                    pr, pull_request, threads, new_fingerprints=fingerprint_delta["new"]
+                )
+            except OSError as exc:
+                print(f"warning: could not track fix-induced findings: {exc}", file=sys.stderr)
             try:
                 track_pattern_signatures(
                     pr,
@@ -5188,6 +5538,11 @@ def main() -> int:
                 )
             except OSError as exc:
                 print(f"warning: could not track pattern signatures: {exc}", file=sys.stderr)
+
+        # ---- Head checks ---------------------------------------------------
+        # Feedback the thread filter never sees: a red check on the head.
+        # Surfaced, never fixed by the loop.
+        ci = ci_status(pull_request)
 
         # ---- Judge (optional, opt-in via prefs file or --judge-mode) -------
         # The script is the single source of truth for whether the judge
@@ -5394,6 +5749,16 @@ def main() -> int:
             history = metrics.pattern_history_for_pr(metrics_repo, pr.number)
             convergence = build_convergence(pr, clusters, history)
             conv_stats = convergence["stats"]
+            run_fix_induced = run.get("fix_induced_fps") if isinstance(run, dict) else None
+            run_fix_induced = (
+                {x for x in run_fix_induced if isinstance(x, str)}
+                if isinstance(run_fix_induced, list) else set()
+            )
+            cycle_fix_induced = run.get("cycle_fix_induced_fps") if isinstance(run, dict) else None
+            cycle_fix_induced = (
+                {x for x in cycle_fix_induced if isinstance(x, str)}
+                if isinstance(cycle_fix_induced, list) else set()
+            )
             record = metrics.build_record(
                 repo=metrics_repo,
                 pr=pr.number,
@@ -5425,6 +5790,8 @@ def main() -> int:
                     "signatures": sorted({c.signature for c in clusters}),
                     "swept": convergence["swept"],
                 } if clusters else None,
+                fix_induced=len(run_fix_induced),
+                ci=ci_record_fields(ci),
                 **derived,
             )
             # Read the carried-over classification BEFORE the terminal branch:
@@ -5465,16 +5832,24 @@ def main() -> int:
             patterns_block = metrics.format_patterns_block(clusters)
             clustering_advisory = metrics.format_degenerate_clustering_advisory(clusters)
             convergence_line = convergence["line"]
+            ci_block = metrics.format_ci_block(ci)
+            churn_line = metrics.format_churn_line(
+                fix_induced=len(cycle_fix_induced),
+                new_findings=_safe_int(run.get("cycle_new_findings")) if isinstance(run, dict) else 0,
+                session_cycle=_safe_int(run.get("session_cycle")) if isinstance(run, dict) else None,
+            )
             findings_view = []
             for thread in threads:
                 comments = _iter_comments(thread)
                 line_val = thread.get("line")
+                fingerprint = finding_fingerprint(thread)
                 findings_view.append({
                     "path": thread.get("path"),
                     "line": line_val if line_val is not None else thread.get("originalLine"),
                     "severity": thread_severity(thread),
                     "url": comments[0].get("url") if comments and isinstance(comments[0], dict) else None,
-                    "carried": finding_fingerprint(thread) in prior_fps,
+                    "carried": fingerprint in prior_fps,
+                    "fix_induced": fingerprint in run_fix_induced,
                 })
             findings_block = metrics.format_findings_block(findings_view)
 
@@ -5488,9 +5863,11 @@ def main() -> int:
                         summary_block,
                         semantic_risk_block,
                         suite_block,
+                        ci_block,
                         patterns_block,
                         clustering_advisory,
                         convergence_line,
+                        churn_line,
                     ],
                     status=receipt_status,
                     findings_block=findings_block,
@@ -5536,6 +5913,12 @@ def main() -> int:
                 # pointer; everything else lives in the PR comment.
                 if clustering_advisory:
                     print(clustering_advisory)
+                # A red head and churn both change what the agent does next,
+                # so they stay in chat beside the pointer.
+                if ci_block:
+                    print(color_loop_block(ci_block, enabled=color_enabled))
+                if churn_line:
+                    print(color_loop_block(churn_line, enabled=color_enabled))
             else:
                 print(color_loop_block(summary_block, enabled=color_enabled))
                 if judge_eval_requested(judge_status):
@@ -5558,6 +5941,10 @@ def main() -> int:
                     print(clustering_advisory)
                 if convergence_line:
                     print(convergence_line)
+                if ci_block:
+                    print(color_loop_block(ci_block, enabled=color_enabled))
+                if churn_line:
+                    print(color_loop_block(churn_line, enabled=color_enabled))
                 if findings_block:
                     print(findings_block)
             return 0
@@ -5706,6 +6093,20 @@ def main() -> int:
                         "actionableThreadFingerprint": thread_fingerprint(threads),
                         "noProgressDetected": no_progress_flag,
                         "judge": judge_status,
+                        # The head's checks; `failing` carries a log command
+                        # for Actions checks.
+                        "ci": ci,
+                        # New findings on lines the loop's own fixes changed.
+                        "fixInduced": {
+                            "count": len(churn["fix_induced"]),
+                            "newFindings": churn["new_findings"],
+                            "compared": churn["compared"],
+                            "churn": churn_detected(
+                                fix_induced=len(churn["fix_induced"]),
+                                new_findings=churn["new_findings"],
+                                session_cycle=read_run_tracking(pr).get("session_cycle"),
+                            ),
+                        },
                     },
                     "judgeResults": judge_results,
                     "humanBlocks": {
@@ -5813,6 +6214,16 @@ def main() -> int:
                     enabled=color_enabled,
                 )
             )
+        ci_block = metrics.format_ci_block(ci)
+        if ci_block:
+            print(color_loop_block(ci_block, enabled=color_enabled))
+        churn_line = metrics.format_churn_line(
+            fix_induced=len(churn["fix_induced"]),
+            new_findings=churn["new_findings"],
+            session_cycle=session_cycle_n,
+        )
+        if churn_line:
+            print(color_loop_block(churn_line, enabled=color_enabled))
         print(color_loop_block(profile_intro_block, enabled=color_enabled))
         if planned_verification_block:
             print(color_loop_block(planned_verification_block, enabled=color_enabled))

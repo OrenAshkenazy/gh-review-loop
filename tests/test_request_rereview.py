@@ -26,6 +26,15 @@ def _cap_check_is_inert_by_default(monkeypatch):
     stub_cap_check_known_under_cap(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def _no_summary_read_by_default(monkeypatch):
+    """Codex posts its clean verdict as a receipt comment, so the helper now
+    reads the PR's comments before pinging a comment vendor that may already
+    have answered. These tests are about the ping itself; a test that needs
+    the summary path stubs the read with its own payload."""
+    monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: None)
+
+
 def _successful_post(**overrides):
     payload = {"created_at": CREATED_AT, **overrides}
     return subprocess.CompletedProcess(

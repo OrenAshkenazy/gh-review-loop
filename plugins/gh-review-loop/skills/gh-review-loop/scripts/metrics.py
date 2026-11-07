@@ -34,10 +34,16 @@ VALID_OUTCOMES = (
     "no_progress",
     "verification_failed",
     "fixed_pending_confirmation",
+    # A failing check on the head is the only thing left; the loop reports
+    # it and never fixes it.
+    "ci_failed",
+    # Every new finding this cycle lands on lines the loop's own fixes changed:
+    # the reviewer is reviewing the fixes, not the PR (see format_churn_line).
+    "churn",
 )
 VALID_VERIFICATION = ("passed", "failed", "skipped")
 # Terminal outcomes counted as a "failed run" in the elapsed-by-outcome split.
-FAILED_OUTCOMES = ("verification_failed", "regression")
+FAILED_OUTCOMES = ("verification_failed", "regression", "ci_failed")
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -529,6 +535,18 @@ def format_next_options(outcome: str, cap_reached: bool, needs_human: int) -> st
             "Manually inspect and resolve the remaining GitHub thread",
             "Leave it for a follow-up PR",
         ]
+    elif outcome == "ci_failed":
+        options = [
+            "Read the failing check's log (the [loop] CI block names the command) and fix it",
+            "Re-run the check if it looks flaky, then re-run the loop",
+            "Leave CI for a follow-up",
+        ]
+    elif outcome == "churn":
+        options = [
+            "Review the fix-induced findings yourself; they are on lines this loop changed",
+            "Split the loop's fixes into their own PR and re-run there",
+            'Continue anyway: "run the review loop, ignore churn"',
+        ]
     elif outcome == "human" or _count(needs_human):
         options = [
             "Ask Claude to implement option A",
@@ -569,6 +587,94 @@ def format_semantic_risk_block(changes: list[str] | None) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def format_ci_block(ci: dict[str, Any] | None) -> str:
+    """Script-owned ``[loop] CI`` block for the head's checks, or '' when green.
+
+    ``ci`` is ``fetch_gemini_threads.ci_status()`` output. Pending checks and
+    failures are both surfaced: a reviewer that waits for CI never arrives on
+    a red head, and a loop that only watches threads would wait out its whole
+    timeout. Checks that cannot fail (``neutral``, ``skipped``) are not
+    failures. The loop reports a red check; it never fixes one.
+    """
+    if not isinstance(ci, dict):
+        return ""
+    failing = [c for c in ci.get("failing") or [] if isinstance(c, dict)]
+    pending = _count(ci.get("pending"))
+    total = _count(ci.get("total"))
+    state = ci.get("state")
+    if not failing and not pending:
+        # The rollup's own verdict and the page limit both outrank an empty
+        # list: a full page of 50 green contexts can hide the one red check
+        # (Codex, PR #123). Say so instead of reading it as green.
+        if ci.get("truncated") or (isinstance(state, str) and state != "SUCCESS"):
+            return (
+                f"[loop] CI: results incomplete — the head rollup state is "
+                f"{state or 'unknown'} but the fetched contexts ({total}, page of 50"
+                f"{' full' if ci.get('truncated') else ''}) show no failing or "
+                "pending check. Open the PR's checks tab before calling this PR "
+                "clean; do not read this as green."
+            )
+        return ""
+    lines: list[str] = []
+    if failing:
+        required = sum(1 for c in failing if c.get("required"))
+        req = f", {required} required" if required else ""
+        lines.append(
+            f"[loop] CI: {len(failing)} failing check(s) on the head{req} "
+            f"({total} total)."
+        )
+        for check in failing:
+            name = check.get("name") or "?"
+            state = check.get("state") or "failure"
+            tag = " [required]" if check.get("required") else ""
+            lines.append(f"  - {name}{tag}: {state}")
+            url = check.get("url")
+            if url:
+                lines.append(f"    {url}")
+            log = check.get("log_command")
+            if log:
+                lines.append(f"    log: {log}")
+        lines.append(
+            "  The loop reports a red check and does not fix it. If this is all "
+            "that is left, stop with --record-run --outcome ci_failed."
+        )
+    if pending:
+        lines.append(
+            f"[loop] CI: {pending} check(s) still running on the head"
+            + ("." if failing else " — a reviewer that waits for CI has not seen it yet.")
+        )
+    return "\n".join(lines)
+
+
+def format_churn_line(
+    *, fix_induced: int, new_findings: int, session_cycle: int | None
+) -> str:
+    """Advisory line on findings that land on lines the loop itself changed.
+
+    A finding is *fix-induced* when it is new this cycle and anchors inside a
+    hunk of the diff between the head the previous cycle reviewed and the
+    current head. One such finding is information; when every new finding is
+    one (cycle 2+), the reviewer is reviewing the loop's fixes, not the PR —
+    the churn competitors stop on after a second round. Returns '' when no
+    finding is fix-induced.
+    """
+    fix_induced = _count(fix_induced)
+    new_findings = _count(new_findings)
+    if not fix_induced:
+        return ""
+    base = (
+        f"Fix-induced: {fix_induced} of {new_findings} new finding(s) land on "
+        "lines this loop changed."
+    )
+    if new_findings and fix_induced >= new_findings and _count(session_cycle) >= 2:
+        return (
+            "[loop] churn: " + base + " The reviewer is reviewing the fixes, not "
+            "the PR. Stop with: --record-run --outcome churn, or continue only "
+            "if the user asked to ignore churn."
+        )
+    return "[loop] " + base
 
 
 def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
@@ -630,6 +736,14 @@ def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
             lines.append(f"Human decision required: {needs_human}")
     if record.get("addressed_by_reply"):
         lines.append(f"Addressed by reply: {record['addressed_by_reply']}")
+    if _count(record.get("fix_induced")):
+        lines.append(f"Fix-induced findings (on lines this loop changed): {_count(record['fix_induced'])}")
+    ci = record.get("ci")
+    if isinstance(ci, dict) and ci.get("failing"):
+        names = ", ".join(
+            str(c.get("name") or "?") for c in ci["failing"] if isinstance(c, dict)
+        )
+        lines.append(f"CI failing on head: {names}")
     lines.append(f"Re-review requests used: {record['cycles_used']}/{record['cycle_cap']} (cap)")
     lines.append(f"Verification: {record['verification']}")
     if record["verification"] == "failed":
@@ -699,6 +813,8 @@ def format_findings_block(findings: list[dict[str, Any]]) -> str:
             loc = f"{loc}:{line}"
         severity = finding.get("severity") or "unknown"
         tag = " · carried over from a prior cycle" if finding.get("carried") else ""
+        if finding.get("fix_induced"):
+            tag += " · on lines this loop changed"
         lines.append(f"  {idx}. {loc} [{severity}]{tag}")
         url = finding.get("url")
         if url:
@@ -961,6 +1077,8 @@ def build_record(
     cycles: list[dict[str, Any]] | None = None,
     terminal_breakdown: dict[str, Any] | None = None,
     patterns: dict[str, Any] | None = None,
+    fix_induced: int = 0,
+    ci: dict[str, Any] | None = None,
     ts: str | None = None,
 ) -> dict[str, Any]:
     ts = ts or now_iso()
@@ -1002,4 +1120,9 @@ def build_record(
         "judge": judge or {"enabled": False},
         "terminal_breakdown": dict(terminal_breakdown) if isinstance(terminal_breakdown, dict) else {},
         "patterns": dict(patterns) if isinstance(patterns, dict) else {},
+        # Findings that landed on lines the loop's own fixes changed (churn).
+        "fix_induced": _count(fix_induced),
+        # Head check summary at record time: counts and failing check names
+        # only (no logs, no URLs beyond the check's own details page).
+        "ci": dict(ci) if isinstance(ci, dict) else {},
     }

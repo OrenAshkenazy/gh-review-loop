@@ -8,7 +8,7 @@ A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome
 
 - `--fixed-count <n>` — findings fixed across the run.
 - `--verification <passed|failed|skipped>` and `--verification-details '<json>'` — from `run_profile.py` output.
-- `--outcome <clean|capped|human|regression|no_progress|verification_failed|fixed_pending_confirmation>` plus `--outcome-reason '<text>'`.
+- `--outcome <clean|capped|human|regression|no_progress|verification_failed|fixed_pending_confirmation|ci_failed|churn>` plus `--outcome-reason '<text>'` (`ci_failed`, `churn`: `references/ci-checks.md`, `references/churn.md`).
 - `--gemini-confirmed` / `--gemini-unconfirmed` — reviewer re-review confirmation from the final wait result.
 - `--fixed-finding <fp>` (repeatable) — per-finding fingerprint markers.
 - `--swept-pattern <sig>` (repeatable) — the `sig:` token from the Patterns receipt, for each swept pattern.
@@ -20,6 +20,7 @@ A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome
 - The comment id is stored in `~/.config/gh-review-loop/state.json` (override dir with `GGRL_STATE_DIR`); subsequent invocations PATCH the same comment — no comment accretion.
 - Discovery fallback: if local state is missing, the script finds the receipt by its embedded marker and re-attaches.
 - Delivery fallback: if the comment write fails (network, permissions) or `--dry-run` is set, the full receipt prints to stdout instead — a receipt is never lost.
+- The receipt body also holds the `[loop] CI:` block and the fix-induced/churn line when they apply; both are repeated in chat beside the pointer because they change what the agent does next.
 
 **One-shot receipt (`--post-receipt`).** Leaves one standalone audit-trail comment: re-review requests used (against the cap), threads resolved (outdated + addressed-by-reply), threads still pending, severity breakdown. Preview with `--dry-run --post-receipt`. Right for scripted/batch contexts where each invocation is independent.
 
@@ -27,7 +28,7 @@ A bare `--record-run` silently defaults every field (`fixed_count` 0, no outcome
 
 ## Run metrics (`runs.jsonl`)
 
-`--record-run` appends one JSON record per completed loop to `~/.config/gh-review-loop/runs.jsonl` (append-only; never transmitted). Each record holds **counts only**: findings fetched/fixed/needs-human/addressed-by-reply, re-review requests used, verification result, outcome, duration, finding areas/paths, repo + PR number, and a judge-derived breakdown only when judge mode was on. **No identity is recorded** — no git author, no login — so the data cannot become a productivity score.
+`--record-run` appends one JSON record per completed loop to `~/.config/gh-review-loop/runs.jsonl` (append-only; never transmitted). Each record holds **counts only**: findings fetched/fixed/needs-human/addressed-by-reply, re-review requests used, verification result, outcome, duration, finding areas/paths, repo + PR number, `fix_induced` (findings on lines the loop changed), a `ci` summary (state, counts, failing check names), and a judge-derived breakdown only when judge mode was on. **No identity is recorded** — no git author, no login — so the data cannot become a productivity score.
 
 The run's start timestamp and per-finding accumulation reuse the same per-PR key in `state.json`; no extra state file.
 
