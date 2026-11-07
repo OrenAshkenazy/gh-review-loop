@@ -215,10 +215,15 @@ deleted file mode 100644
 
 class TestChangedLineRanges:
     def test_new_side_ranges_per_path(self):
+        # The pure deletion at +41,0 adds no new-side line (Codex, PR #123).
         assert parse_changed_line_ranges(DIFF) == {
-            "src/x.py": [(10, 12), (41, 41)],
+            "src/x.py": [(10, 12)],
             "new.py": [(1, 5)],
         }
+
+    def test_a_deletion_only_hunk_marks_no_line(self):
+        diff = "--- a/f.py\n+++ b/f.py\n@@ -2 +1,0 @@\n-gone\n"
+        assert parse_changed_line_ranges(diff) == {}
 
     def test_git_quoted_paths_are_decoded(self):
         # Codex, PR #123: git C-quotes non-ASCII paths by default.
@@ -550,3 +555,60 @@ class TestCodexCleanReceiptEndsTheWait:
         assert settled is payload
         assert fgt.wait_activity_fingerprint(payload, self.CODEX, "2026-11-06T15:48:00Z") is None
         assert fgt.summary_comment_findings(payload, self.CODEX) == []
+
+
+class TestCodexReceiptDedupeNeedsAPushEvidencedHead:
+    """Codex, PR #123: with no check on the head, arrival falls back to the
+    commit time, and a receipt for the previous head posted between the
+    commit and its push read as covering the new head — so no ping, and no
+    review of the new changes."""
+
+    CODEX = "chatgpt-codex-connector"
+    RECEIPT = "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues.\n"
+    NEW_HEAD = "b" * 40
+
+    def _pull(self, *, checks):
+        return {
+            "headRefOid": self.NEW_HEAD,
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2026-11-07T10:00:00Z",
+                "statusCheckRollup": {"state": "SUCCESS", "contexts": {"nodes": checks}},
+            }}]},
+            "comments": {"nodes": [
+                {"author": {"login": "loop-agent"}, "body": "@codex review", "createdAt": "2026-11-07T09:00:00Z"},
+                {"author": {"login": self.CODEX}, "body": self.RECEIPT, "createdAt": "2026-11-07T11:00:00Z"},
+            ]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+        }
+
+    def _run(self, monkeypatch, capsys, pull):
+        import request_rereview
+        from conftest import stub_cap_check_known_under_cap
+
+        stub_cap_check_known_under_cap(monkeypatch)
+        monkeypatch.setattr(request_rereview, "current_head", lambda *a, **k: self.NEW_HEAD)
+        monkeypatch.setattr(request_rereview, "_all_reviews", lambda *a, **k: [])
+        monkeypatch.setattr(request_rereview, "read_summary_pull_request", lambda *a, **k: pull)
+        posted = []
+        monkeypatch.setattr(request_rereview, "post_rereview", lambda repo, pr, phrase, **k: (
+            posted.append(phrase) or {"created_at": "2026-11-07T12:01:00Z", "repo": repo, "pr": pr, "phrase": phrase}
+        ))
+        assert request_rereview.main([
+            "--repo", "acme/widget", "--pr", "7", "--reviewer-login", self.CODEX,
+            "--expect-head", self.NEW_HEAD, "--json",
+        ]) == 0
+        return posted, json.loads(capsys.readouterr().out)
+
+    def test_no_check_on_the_head_means_the_receipt_cannot_cover_it(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        posted, payload = self._run(monkeypatch, capsys, self._pull(checks=[]))
+        assert posted == ["@codex review"]
+        assert payload["phrase"] == "@codex review"
+
+    def test_a_check_on_the_head_lets_a_later_receipt_cover_it(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        pushed = [{"__typename": "CheckRun", "startedAt": "2026-11-07T10:30:00Z",
+                   "checkSuite": {"createdAt": "2026-11-07T10:30:00Z"}}]
+        posted, payload = self._run(monkeypatch, capsys, self._pull(checks=pushed))
+        assert payload["status"] == "already_reviewed_head"
+        assert posted == []
