@@ -14,9 +14,7 @@ This table is authoritative; if a phrasing isn't here, fall back to defaults.
 | **Fewer cycles once** | "one cycle only" / "don't loop, just fix once" | `--max-rereview-requests 1` |
 | **Persistent cap** | "always use 4 cycles" / "configure the cap max to 4" | Set `max_rereview_requests` in `~/.config/gh-review-loop/preferences.json` |
 | **Specific PR** | "handle PR https://github.com/..." | `--pr <URL>` |
-| **Fix CI too** | "fix CI" / "make the checks green" / "handle the failing tests on the PR" | `--fix-ci` on every fetch this session; persistent: `fix_ci: true` in `preferences.json` (`references/ci-and-human-threads.md`) |
 | **Ignore churn** | "ignore churn" / "keep going even if it's reviewing the fixes" | Continue past `[loop] churn:`; the cap remains the brake (`references/churn.md`) |
-| **Answer human comments** | "reply to Alice's comments" / "address the human review" | Draft replies from the `[loop] Human review threads` block; edit only after the user approves each (`references/ci-and-human-threads.md`) |
 | **Select Codex** | "run the Codex loop" / "use Codex for this PR" | `--reviewer chatgpt-codex-connector --reviewer-source confirmed` (name and trigger are known) |
 | **Different reviewer bot** | "handle review comments from coderabbitai" | `--reviewer coderabbitai --review-trigger-mention @coderabbitai --reviewer-name CodeRabbit` |
 | **Post status without acting** | "leave a status comment without touching anything" | `--post-receipt --no-resolve-outdated --no-resolve-addressed-by-reply` |

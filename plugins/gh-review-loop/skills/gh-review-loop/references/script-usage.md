@@ -69,10 +69,6 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py
 # Run the verification profile (feed its JSON into --verification-details).
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/run_profile.py" owner/repo /path/to/repo
 
-# Opt in to fixing a failing head check this cycle (default: report only).
-# The fetch's [loop] CI: block prints the `gh run view … --log-failed` command.
-python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --fix-ci
-
 # Read-only fetch (no GraphQL mutations)
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" \
     --no-resolve-outdated --no-resolve-addressed-by-reply

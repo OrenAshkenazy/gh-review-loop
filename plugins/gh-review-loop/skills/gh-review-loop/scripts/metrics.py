@@ -34,8 +34,8 @@ VALID_OUTCOMES = (
     "no_progress",
     "verification_failed",
     "fixed_pending_confirmation",
-    # A failing check on the head is the only thing left and the loop was not
-    # asked to fix CI (``fix_ci`` preference / ``--fix-ci``).
+    # A failing check on the head is the only thing left; the loop reports
+    # it and never fixes it.
     "ci_failed",
     # Every new finding this cycle lands on lines the loop's own fixes changed:
     # the reviewer is reviewing the fixes, not the PR (see format_churn_line).
@@ -537,8 +537,8 @@ def format_next_options(outcome: str, cap_reached: bool, needs_human: int) -> st
         ]
     elif outcome == "ci_failed":
         options = [
-            'Let the loop fix CI: "run the review loop and fix CI"',
-            "Fix the failing check yourself and re-run the loop",
+            "Read the failing check's log (the [loop] CI block names the command) and fix it",
+            "Re-run the check if it looks flaky, then re-run the loop",
             "Leave CI for a follow-up",
         ]
     elif outcome == "churn":
@@ -589,14 +589,14 @@ def format_semantic_risk_block(changes: list[str] | None) -> str:
     return "\n".join(lines)
 
 
-def format_ci_block(ci: dict[str, Any] | None, *, fix_ci: bool = False) -> str:
+def format_ci_block(ci: dict[str, Any] | None) -> str:
     """Script-owned ``[loop] CI`` block for the head's checks, or '' when green.
 
     ``ci`` is ``fetch_gemini_threads.ci_status()`` output. Pending checks and
     failures are both surfaced: a reviewer that waits for CI never arrives on
     a red head, and a loop that only watches threads would wait out its whole
     timeout. Checks that cannot fail (``neutral``, ``skipped``) are not
-    failures. ``fix_ci`` names the mode so the agent follows the right path.
+    failures. The loop reports a red check; it never fixes one.
     """
     if not isinstance(ci, dict):
         return ""
@@ -636,53 +636,15 @@ def format_ci_block(ci: dict[str, Any] | None, *, fix_ci: bool = False) -> str:
             log = check.get("log_command")
             if log:
                 lines.append(f"    log: {log}")
-        if fix_ci:
-            lines.append(
-                "  fix_ci: on — treat each failing check as a finding this cycle: "
-                "read its log, fix, verify, push."
-            )
-        else:
-            lines.append(
-                "  fix_ci: off — report, do not fix. If this is all that is left, "
-                "stop with --record-run --outcome ci_failed. Opt in with "
-                "'fix CI' (or fix_ci: true in preferences.json)."
-            )
+        lines.append(
+            "  The loop reports a red check and does not fix it. If this is all "
+            "that is left, stop with --record-run --outcome ci_failed."
+        )
     if pending:
         lines.append(
             f"[loop] CI: {pending} check(s) still running on the head"
             + ("." if failing else " — a reviewer that waits for CI has not seen it yet.")
         )
-    return "\n".join(lines)
-
-
-def format_human_threads_block(threads: list[dict[str, Any]] | None) -> str:
-    """``[loop] Human review threads`` block, or '' when there are none.
-
-    Each item is ``fetch_gemini_threads.human_review_threads()`` output:
-    ``author``, ``path``, ``line``, ``url``, ``excerpt``, ``awaiting_reply``.
-    These are never auto-fixed: the loop drafts a reply or asks the user.
-    """
-    items = [t for t in threads or [] if isinstance(t, dict)]
-    if not items:
-        return ""
-    waiting = sum(1 for t in items if t.get("awaiting_reply"))
-    lines = [
-        f"[loop] Human review threads ({len(items)}, {waiting} awaiting your reply) — "
-        "not reviewer findings: never auto-fix; draft a reply for each and ask "
-        "the user before changing code."
-    ]
-    for idx, t in enumerate(items, 1):
-        loc = t.get("path") or "?"
-        if t.get("line") is not None:
-            loc = f"{loc}:{t['line']}"
-        tag = "awaiting reply" if t.get("awaiting_reply") else "replied"
-        lines.append(f"  {idx}. {loc} · @{t.get('author') or '?'} · {tag}")
-        excerpt = t.get("excerpt")
-        if excerpt:
-            lines.append(f"     {excerpt}")
-        url = t.get("url")
-        if url:
-            lines.append(f"     {url}")
     return "\n".join(lines)
 
 
@@ -776,8 +738,6 @@ def format_run_summary(record: dict[str, Any], *, terminal: bool = True) -> str:
         lines.append(f"Addressed by reply: {record['addressed_by_reply']}")
     if _count(record.get("fix_induced")):
         lines.append(f"Fix-induced findings (on lines this loop changed): {_count(record['fix_induced'])}")
-    if _count(record.get("human_threads")):
-        lines.append(f"Human review threads (not auto-fixed): {_count(record['human_threads'])}")
     ci = record.get("ci")
     if isinstance(ci, dict) and ci.get("failing"):
         names = ", ".join(
@@ -1118,7 +1078,6 @@ def build_record(
     terminal_breakdown: dict[str, Any] | None = None,
     patterns: dict[str, Any] | None = None,
     fix_induced: int = 0,
-    human_threads: int = 0,
     ci: dict[str, Any] | None = None,
     ts: str | None = None,
 ) -> dict[str, Any]:
@@ -1163,8 +1122,6 @@ def build_record(
         "patterns": dict(patterns) if isinstance(patterns, dict) else {},
         # Findings that landed on lines the loop's own fixes changed (churn).
         "fix_induced": _count(fix_induced),
-        # Unresolved threads a person opened; surfaced, never auto-fixed.
-        "human_threads": _count(human_threads),
         # Head check summary at record time: counts and failing check names
         # only (no logs, no URLs beyond the check's own details page).
         "ci": dict(ci) if isinstance(ci, dict) else {},
