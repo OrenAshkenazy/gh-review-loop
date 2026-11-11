@@ -23,6 +23,7 @@ path. Lifecycle:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -30,9 +31,28 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator, TypeVar
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None  # type: ignore[assignment]
+
+T = TypeVar("T")
 
 SENTINEL_TTL_SECONDS = 24 * 60 * 60
+
+# The one lock every state.json writer takes. state.json is shared by every
+# PR of every repo, so a per-PR lock cannot serialize it; one file-wide lock
+# can. A writer that cannot take it within this long proceeds anyway (fail
+# open, with a warning): a lock a crashed process left behind is released
+# by the OS, but an unwritable state dir must never wedge the loop.
+STATE_LOCK_NAME = "state.lock"
+STATE_LOCK_WAIT_SECONDS = 5
 
 SENTINEL_NAME = "loop-active"
 
@@ -140,9 +160,138 @@ def load_sticky_state() -> dict[str, Any]:
 
 
 def save_sticky_state(state: dict[str, Any]) -> None:
+    """Write state.json whole, atomically.
+
+    A reader that catches a half-written file sees invalid JSON, which
+    ``load_sticky_state`` reads as an empty state, and the next writer then
+    saves that emptiness over every PR's entry. Writing to a sibling file and
+    renaming it into place means a reader sees the old file or the new one,
+    never a torn one. The temporary name carries the pid so two processes
+    cannot share it.
+    """
     path = sticky_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# File locks
+# ---------------------------------------------------------------------------
+
+
+def try_lock(handle: Any) -> bool:
+    """One non-blocking attempt. Raises BlockingIOError/PermissionError when busy."""
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    return True
+
+
+def unlock(handle: Any) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, wait_seconds: float) -> Iterator[bool | None]:
+    """Hold an exclusive lock on ``path`` for the block.
+
+    Yields True when the lock is held, False when another process kept it
+    past ``wait_seconds``, and None when no lock can be established (no
+    flock/msvcrt, unwritable directory). What to do on False or None is the
+    caller's call: the re-review request refuses to post, a state.json write
+    proceeds with a warning.
+    """
+    if fcntl is None and msvcrt is None:
+        yield None
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = open(path, "a+", encoding="utf-8")
+    except (OSError, ValueError):
+        yield None
+        return
+    try:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                try_lock(handle)
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+            except OSError:
+                yield None
+                return
+        try:
+            yield True
+        finally:
+            unlock(handle)
+    finally:
+        handle.close()
+
+
+def state_lock_path() -> Path:
+    return state_dir() / STATE_LOCK_NAME
+
+
+@contextlib.contextmanager
+def state_lock() -> Iterator[bool | None]:
+    """The file-wide lock for state.json (see ``file_lock`` for the yield)."""
+    with file_lock(state_lock_path(), STATE_LOCK_WAIT_SECONDS) as held:
+        yield held
+
+
+def mutate_sticky_state(mutate: Callable[[dict[str, Any]], T]) -> T:
+    """Read state.json, apply ``mutate`` to it in place, write it back, all
+    under the state lock. Returns whatever ``mutate`` returns.
+
+    Every writer goes through here. state.json is rewritten whole, so two
+    unlocked writers holding different snapshots erase each other's changes:
+    a fetch that loaded the file before a request script stamped it saved
+    the stamp away again (PR #116 review), which is why the cycle stamps and
+    the request provenance moved to append-only logs. The lock closes the
+    window for everything that stays in this file.
+
+    Fails open. When the lock is busy past ``STATE_LOCK_WAIT_SECONDS`` or
+    cannot be established at all, the write still happens, after one warning
+    on stderr: that is exactly today's unlocked behavior, and a correctness
+    aid must never wedge the loop.
+    """
+    with state_lock() as held:
+        if held is None:
+            print(
+                f"warning: no lock on {state_lock_path()}; writing state.json "
+                "unserialized (a concurrent writer may be overwritten).",
+                file=sys.stderr,
+            )
+        elif not held:
+            print(
+                f"warning: {state_lock_path()} held by another process for over "
+                f"{STATE_LOCK_WAIT_SECONDS}s; writing state.json anyway.",
+                file=sys.stderr,
+            )
+        state = load_sticky_state()
+        if not isinstance(state, dict):
+            # load_sticky_state already guards this; the guard is repeated at
+            # the one point every writer passes through so a corrupt file can
+            # never reach a mutate function as anything but a dict.
+            state = {}
+        result = mutate(state)
+        save_sticky_state(state)
+    return result
 
 
 def pr_scoped_path(repo: str, pr: int, subdir: str, suffix: str) -> Path:

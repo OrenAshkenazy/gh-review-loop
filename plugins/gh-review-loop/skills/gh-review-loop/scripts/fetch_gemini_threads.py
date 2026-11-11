@@ -33,8 +33,9 @@ from loop_state import (  # noqa: E402 — sibling module, stdlib-only
     find_active_run,  # noqa: F401 — re-exported; hooks/tests import via this module
     load_sticky_state,
     migrate_legacy_state_dir,
+    mutate_sticky_state,
     resolve_current_repo,
-    save_sticky_state,
+    save_sticky_state,  # noqa: F401 — re-exported; tests seed state via this module
     sentinel_path,
     state_dir,
     sticky_state_path,  # noqa: F401 — re-exported; hooks/tests import via this module
@@ -2458,25 +2459,29 @@ def read_reviewer_selection(pr: PullRequest) -> dict[str, Any] | None:
 
 
 def save_reviewer_selection(pr: PullRequest, reviewer: dict[str, Any]) -> None:
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    entry["reviewer"] = dict(reviewer)
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        entry["reviewer"] = dict(reviewer)
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
 
 
 def clear_reviewer_selection(pr: PullRequest) -> bool:
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    if not isinstance(entry, dict) or "reviewer" not in entry:
-        return False
-    del entry["reviewer"]
-    state[key] = entry
-    save_sticky_state(state)
-    return True
+
+    def mutate(state: dict[str, Any]) -> bool:
+        entry = state.get(key)
+        if not isinstance(entry, dict) or "reviewer" not in entry:
+            return False
+        del entry["reviewer"]
+        state[key] = entry
+        return True
+
+    return mutate_sticky_state(mutate)
 
 
 def read_render_baseline(pr: PullRequest, author: str) -> dict[str, str]:
@@ -2505,16 +2510,18 @@ def save_render_baseline(pr: PullRequest, author: str, fps: dict[str, str]) -> N
     before emission would collapse threads the agent never saw. Replacement
     (not merge) keeps the baseline scoped to the previous cycle.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    baselines = entry.get("render_baseline")
-    baselines = dict(baselines) if isinstance(baselines, dict) else {}
-    baselines[author] = dict(fps)
-    entry["render_baseline"] = baselines
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        baselines = entry.get("render_baseline")
+        baselines = dict(baselines) if isinstance(baselines, dict) else {}
+        baselines[author] = dict(fps)
+        entry["render_baseline"] = baselines
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
 
 
 def reviewer_selection_state(record: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -2658,8 +2665,34 @@ def update_run_tracking(
     actually *transitioned* (pushed and asked for a re-review), not merely
     that it emitted a summary — see the rules below.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
+    repo_full = f"{pr.owner}/{pr.repo}"
+
+    def mutate(state: dict[str, Any]) -> None:
+        _update_run_tracking_in(state, key, repo_full, findings, bump_session_cycle)
+
+    mutate_sticky_state(mutate)
+    # Freshen the loop-active sentinel so the hooks.json shell guard lets the
+    # gates run for the duration of this loop (and the 24h TTL restarts).
+    # Without the marker the guard exits before Python starts, so the gates are
+    # off even though this run is active — never let that happen silently.
+    if not touch_sentinel():
+        print(
+            f"warning: could not write the loop-active sentinel at {sentinel_path()}. "
+            "The loop continues, but its edit gate, push gate, and Stop-hook "
+            "summary backstop stay disabled until the sentinel can be created.",
+            file=sys.stderr,
+        )
+
+
+def _update_run_tracking_in(
+    state: dict[str, Any],
+    key: str,
+    repo_full: str,
+    findings: list[tuple[str, str | None]],
+    bump_session_cycle: bool,
+) -> None:
+    """The in-place half of ``update_run_tracking``, applied under the state lock."""
     entry = state.get(key, {})
     run = entry.get("run", {})
     if "started_at" not in run:
@@ -2700,7 +2733,7 @@ def update_run_tracking(
     # second re-review arriving before the new cycle wrote its own summary
     # advanced the ordinal twice off one stale summary (#111 review).
     posted = _safe_int(run.get("rereviews_posted", 0)) + loop_state.count_cycle_stamps(
-        f"{pr.owner}/{pr.repo}", pr.number
+        repo_full, int(key.rpartition("#")[2])
     )
     posted_baseline = _safe_int(run.get("rereviews_posted_at_cycle_start", 0))
     summary_seq = _safe_int(run.get("last_summary_seq", 0))
@@ -2727,18 +2760,6 @@ def update_run_tracking(
     run["finding_paths"] = sorted(paths)
     entry["run"] = run
     state[key] = entry
-    save_sticky_state(state)
-    # Freshen the loop-active sentinel so the hooks.json shell guard lets the
-    # gates run for the duration of this loop (and the 24h TTL restarts).
-    # Without the marker the guard exits before Python starts, so the gates are
-    # off even though this run is active — never let that happen silently.
-    if not touch_sentinel():
-        print(
-            f"warning: could not write the loop-active sentinel at {sentinel_path()}. "
-            "The loop continues, but its edit gate, push gate, and Stop-hook "
-            "summary backstop stay disabled until the sentinel can be created.",
-            file=sys.stderr,
-        )
 
 
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
@@ -2754,15 +2775,15 @@ def clear_run_tracking(pr: PullRequest) -> None:
     session has never seen down to URL-only stubs on its very first fetch.
     Clearing both together makes the next run start from a full render.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    if isinstance(entry, dict):
-        stale = [field for field in ("run", "render_baseline") if field in entry]
-        for field in stale:
-            del entry[field]
-        if stale:
-            save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        if isinstance(entry, dict):
+            for field in ("run", "render_baseline"):
+                entry.pop(field, None)
+
+    mutate_sticky_state(mutate)
     # Drop the sentinel only when no loop remains anywhere — another repo's
     # concurrent loop still needs the hooks live.
     if not any_active_run():
@@ -2778,27 +2799,34 @@ def begin_wait_chunk(pr: PullRequest, after_iso: str | None) -> dict[str, Any]:
     chunk invocations, incremented once per call. Fails open: state I/O
     errors yield a fresh single-chunk state rather than crashing the wait.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    wait = run.get("wait")
-    wait = dict(wait) if isinstance(wait, dict) else {}
-    if wait.get("after") != after_iso:
-        wait = {"after": after_iso}
-    if not isinstance(wait.get("started_at"), str) or not wait.get("started_at"):
-        wait["started_at"] = metrics.now_iso()
-    wait["checks"] = _safe_int(wait.get("checks")) + 1
-    run["wait"] = wait
-    entry["run"] = run
-    state[key] = entry
+    captured: dict[str, Any] = {}
+
+    def mutate(state: dict[str, Any]) -> dict[str, Any]:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        wait = run.get("wait")
+        wait = dict(wait) if isinstance(wait, dict) else {}
+        if wait.get("after") != after_iso:
+            wait = {"after": after_iso}
+        if not isinstance(wait.get("started_at"), str) or not wait.get("started_at"):
+            wait["started_at"] = metrics.now_iso()
+        wait["checks"] = _safe_int(wait.get("checks")) + 1
+        run["wait"] = wait
+        entry["run"] = run
+        state[key] = entry
+        captured["wait"] = wait
+        return wait
+
     try:
-        save_sticky_state(state)
+        return mutate_sticky_state(mutate)
     except OSError as exc:
         print(f"warning: could not persist wait state: {exc}", file=sys.stderr)
-    return wait
+        return captured.get("wait") or {
+            "after": after_iso, "started_at": metrics.now_iso(), "checks": 1,
+        }
 
 
 def read_wait_state(pr: PullRequest) -> dict[str, Any]:
@@ -2808,20 +2836,22 @@ def read_wait_state(pr: PullRequest) -> dict[str, Any]:
 
 
 def _update_wait_state(pr: PullRequest, updates: dict[str, Any]) -> None:
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    wait = run.get("wait")
-    wait = dict(wait) if isinstance(wait, dict) else {}
-    wait.update(updates)
-    run["wait"] = wait
-    entry["run"] = run
-    state[key] = entry
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        wait = run.get("wait")
+        wait = dict(wait) if isinstance(wait, dict) else {}
+        wait.update(updates)
+        run["wait"] = wait
+        entry["run"] = run
+        state[key] = entry
+
     try:
-        save_sticky_state(state)
+        mutate_sticky_state(mutate)
     except OSError as exc:
         print(f"warning: could not persist wait state: {exc}", file=sys.stderr)
 
@@ -2837,15 +2867,17 @@ def save_wait_snapshot(pr: PullRequest, snapshot: dict[str, Any]) -> None:
 
 
 def clear_wait_state(pr: PullRequest) -> None:
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    if isinstance(entry, dict) and isinstance(entry.get("run"), dict) and "wait" in entry["run"]:
-        del entry["run"]["wait"]
-        try:
-            save_sticky_state(state)
-        except OSError as exc:
-            print(f"warning: could not clear wait state: {exc}", file=sys.stderr)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        if isinstance(entry, dict) and isinstance(entry.get("run"), dict):
+            entry["run"].pop("wait", None)
+
+    try:
+        mutate_sticky_state(mutate)
+    except OSError as exc:
+        print(f"warning: could not clear wait state: {exc}", file=sys.stderr)
 
 
 WAIT_FIRST_CHUNK_SECONDS = 60
@@ -3040,27 +3072,29 @@ def accumulate_fixed_markers(
     metrics.classify_finding_state. Stored alongside, never replacing, the
     existing run-tracking ids/paths.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    fps_val = run.get("fixed_finding_fps")
-    fps = {x for x in fps_val if isinstance(x, str)} if isinstance(fps_val, list) else set()
-    fpaths_val = run.get("fixed_paths")
-    fpaths = {x for x in fpaths_val if isinstance(x, str)} if isinstance(fpaths_val, list) else set()
-    for fp in fingerprints or []:
-        if fp:
-            fps.add(fp)
-    for p in paths or []:
-        if p:
-            fpaths.add(p)
-    run["fixed_finding_fps"] = sorted(fps)
-    run["fixed_paths"] = sorted(fpaths)
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        fps_val = run.get("fixed_finding_fps")
+        fps = {x for x in fps_val if isinstance(x, str)} if isinstance(fps_val, list) else set()
+        fpaths_val = run.get("fixed_paths")
+        fpaths = {x for x in fpaths_val if isinstance(x, str)} if isinstance(fpaths_val, list) else set()
+        for fp in fingerprints or []:
+            if fp:
+                fps.add(fp)
+        for p in paths or []:
+            if p:
+                fpaths.add(p)
+        run["fixed_finding_fps"] = sorted(fps)
+        run["fixed_paths"] = sorted(fpaths)
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
 
 
 def read_fixed_markers(pr: PullRequest) -> dict[str, set[str]]:
@@ -3085,21 +3119,23 @@ def accumulate_swept_patterns(pr: PullRequest, signatures: list[str]) -> None:
     Twin of accumulate_fixed_markers. A pattern the agent reports as swept this
     cycle is matched against later cycles' findings to flag recurrence.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    val = run.get("swept_pattern_sigs")
-    sigs = {x for x in val if isinstance(x, str)} if isinstance(val, list) else set()
-    for s in signatures or []:
-        if s:
-            sigs.add(s)
-    run["swept_pattern_sigs"] = sorted(sigs)
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        val = run.get("swept_pattern_sigs")
+        sigs = {x for x in val if isinstance(x, str)} if isinstance(val, list) else set()
+        for s in signatures or []:
+            if s:
+                sigs.add(s)
+        run["swept_pattern_sigs"] = sorted(sigs)
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
 
 
 def read_swept_patterns(pr: PullRequest) -> set[str]:
@@ -3354,22 +3390,24 @@ def track_finding_fingerprints(pr: PullRequest, current_fps: set[str]) -> dict[s
     Returns ``{"prior": <prior union>, "new": <current − prior>}``. Fails open:
     any state I/O error yields an empty prior (everything reads as new).
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key, {})
-    if not isinstance(entry, dict):
-        entry = {}
-    run = entry.get("run", {})
-    if not isinstance(run, dict):
-        run = {}
-    prior_val = run.get("seen_finding_fps", [])
-    prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
-    run["prior_seen_finding_fps"] = sorted(prior)
-    run["seen_finding_fps"] = sorted(prior | current_fps)
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
-    return {"prior": prior, "new": current_fps - prior}
+
+    def mutate(state: dict[str, Any]) -> dict[str, set[str]]:
+        entry = state.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        run = entry.get("run", {})
+        if not isinstance(run, dict):
+            run = {}
+        prior_val = run.get("seen_finding_fps", [])
+        prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
+        run["prior_seen_finding_fps"] = sorted(prior)
+        run["seen_finding_fps"] = sorted(prior | current_fps)
+        entry["run"] = run
+        state[key] = entry
+        return {"prior": prior, "new": current_fps - prior}
+
+    return mutate_sticky_state(mutate)
 
 
 def prior_finding_fingerprints(pr: PullRequest) -> set[str]:
@@ -3393,22 +3431,24 @@ def track_pattern_signatures(pr: PullRequest, current_sigs: set[str]) -> dict[st
     in a previous cycle?" without the current fetch poisoning the answer.
     Returns ``{"prior": <prior union>, "new": <current − prior>}``. Fails open.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key, {})
-    if not isinstance(entry, dict):
-        entry = {}
-    run = entry.get("run", {})
-    if not isinstance(run, dict):
-        run = {}
-    prior_val = run.get("seen_pattern_sigs", [])
-    prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
-    run["prior_seen_pattern_sigs"] = sorted(prior)
-    run["seen_pattern_sigs"] = sorted(prior | current_sigs)
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
-    return {"prior": prior, "new": current_sigs - prior}
+
+    def mutate(state: dict[str, Any]) -> dict[str, set[str]]:
+        entry = state.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        run = entry.get("run", {})
+        if not isinstance(run, dict):
+            run = {}
+        prior_val = run.get("seen_pattern_sigs", [])
+        prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
+        run["prior_seen_pattern_sigs"] = sorted(prior)
+        run["seen_pattern_sigs"] = sorted(prior | current_sigs)
+        entry["run"] = run
+        state[key] = entry
+        return {"prior": prior, "new": current_sigs - prior}
+
+    return mutate_sticky_state(mutate)
 
 
 def prior_pattern_signatures(pr: PullRequest) -> set[str]:
@@ -3438,25 +3478,27 @@ def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
     Fails OPEN: any state read/write error allows the push (correctness aid
     must never wedge the loop).
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key, {})
-    if not isinstance(entry, dict):
-        entry = {}
-    run = entry.get("run", {})
-    if not isinstance(run, dict):
-        run = {}
-    prev_fingerprint = run.get("thread_fingerprint")
-    update_seq = _safe_int(run.get("update_seq", 0))
-    run["thread_fingerprint"] = current_fingerprint
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
-    return bool(
-        prev_fingerprint
-        and prev_fingerprint == current_fingerprint
-        and update_seq >= 2
-    )
+
+    def mutate(state: dict[str, Any]) -> bool:
+        entry = state.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        run = entry.get("run", {})
+        if not isinstance(run, dict):
+            run = {}
+        prev_fingerprint = run.get("thread_fingerprint")
+        update_seq = _safe_int(run.get("update_seq", 0))
+        run["thread_fingerprint"] = current_fingerprint
+        entry["run"] = run
+        state[key] = entry
+        return bool(
+            prev_fingerprint
+            and prev_fingerprint == current_fingerprint
+            and update_seq >= 2
+        )
+
+    return mutate_sticky_state(mutate)
 
 
 def stamp_summary_emitted(pr: PullRequest) -> None:
@@ -3466,22 +3508,22 @@ def stamp_summary_emitted(pr: PullRequest) -> None:
     backstop won't re-emit a summary the agent already showed. A no-op when no
     run is being tracked, so it never resurrects a cleared/absent run block.
     """
-    state = load_sticky_state()
-    if not isinstance(state, dict):
-        return
     key = _state_key(pr)
-    entry = state.get(key)
-    if not isinstance(entry, dict):
-        return
-    run = entry.get("run")
-    if not isinstance(run, dict) or "update_seq" not in run:
-        return
-    seq = _safe_int(run.get("update_seq"))
-    if seq <= 0:
-        return  # corrupt/non-numeric update_seq — nothing meaningful to stamp
-    run["last_summary_seq"] = seq
-    state[key]["run"] = run
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        if not isinstance(entry, dict):
+            return
+        run = entry.get("run")
+        if not isinstance(run, dict) or "update_seq" not in run:
+            return
+        seq = _safe_int(run.get("update_seq"))
+        if seq <= 0:
+            return  # corrupt/non-numeric update_seq — nothing meaningful to stamp
+        run["last_summary_seq"] = seq
+        state[key]["run"] = run
+
+    mutate_sticky_state(mutate)
 
 
 def accumulate_judge_results(
@@ -3497,26 +3539,22 @@ def accumulate_judge_results(
     """
     if not judge_results:
         return
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    if not isinstance(entry, dict):
-        entry = {}
-    else:
-        entry = dict(entry)
-    run = entry.get("run")
-    if not isinstance(run, dict):
-        run = {}
-    else:
-        run = dict(run)
-    stored = run.get("judge_results")
-    stored_dict = dict(stored) if isinstance(stored, dict) else {}
-    stored_dict.update(judge_results)
-    run["judge_results"] = stored_dict
-    run["judge_ran"] = True
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        stored = run.get("judge_results")
+        stored_dict = dict(stored) if isinstance(stored, dict) else {}
+        stored_dict.update(judge_results)
+        run["judge_results"] = stored_dict
+        run["judge_ran"] = True
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
 
 
 def merge_judge_results(
@@ -3566,24 +3604,24 @@ def record_cycle(
         "finding_count": int(finding_count),
         "outcome": outcome,
     }
-    state = load_sticky_state()
-    # The state file can be hand-edited or corrupt; verify each level is the
-    # expected type before use (a non-dict state would AttributeError on .get,
-    # and dict()/list() on a string/int would raise), mirroring
-    # accumulate_judge_results.
-    state = state if isinstance(state, dict) else {}
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    cycles = run.get("cycles")
-    cycles = list(cycles) if isinstance(cycles, list) else []
-    cycles.append(cycle)
-    run["cycles"] = cycles
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        # The state file can be hand-edited or corrupt; verify each level is
+        # the expected type before use (dict()/list() on a string/int would
+        # raise), mirroring accumulate_judge_results.
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        cycles = run.get("cycles")
+        cycles = list(cycles) if isinstance(cycles, list) else []
+        cycles.append(cycle)
+        run["cycles"] = cycles
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
     return cycle
 
 
@@ -3628,16 +3666,18 @@ def post_or_update_sticky_receipt(
     state file. Subsequent invocations PATCH the same comment so the user
     sees one live status block on the PR instead of N new comments.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key, {})
-    comment_id = entry.get("comment_id")
+    entry = load_sticky_state().get(key, {})
+    comment_id = entry.get("comment_id") if isinstance(entry, dict) else None
+    # The fields this call settles; applied under the state lock at the end,
+    # so the lock is never held across the GitHub calls in between.
+    updates: dict[str, Any] = {}
 
     if comment_id is None:
         # Fall back to GitHub-side discovery before posting a duplicate.
         comment_id = find_existing_sticky_comment(pr)
         if comment_id and not dry_run:
-            entry["comment_id"] = comment_id
+            updates["comment_id"] = comment_id
 
     if dry_run:
         verb = "PATCH" if comment_id else "POST"
@@ -3656,7 +3696,7 @@ def post_or_update_sticky_receipt(
                     f"body={body}",
                 ]
             )
-            entry["updated_at"] = _now_iso()
+            updates["updated_at"] = _now_iso()
         except RuntimeError as exc:
             # If the sticky comment was deleted on GitHub, PATCH returns 404.
             # Drop the stale id and fall through to POST a fresh comment so
@@ -3686,12 +3726,17 @@ def post_or_update_sticky_receipt(
         if not isinstance(result, dict) or "id" not in result:
             raise RuntimeError(f"Failed to post sticky receipt: {result}")
         comment_id = int(result["id"])
-        entry["comment_id"] = comment_id
-        entry["started_at"] = _now_iso()
-        entry["updated_at"] = entry["started_at"]
+        updates["comment_id"] = comment_id
+        updates["started_at"] = _now_iso()
+        updates["updated_at"] = updates["started_at"]
 
-    state[key] = entry
-    save_sticky_state(state)
+    def mutate(state: dict[str, Any]) -> None:
+        current = state.get(key)
+        current = dict(current) if isinstance(current, dict) else {}
+        current.update(updates)
+        state[key] = current
+
+    mutate_sticky_state(mutate)
     return comment_id
 
 
@@ -4600,13 +4645,11 @@ def track_head_and_fix_induced(
     cumulative ``fix_induced_fps`` and this cycle's ``cycle_fix_induced_fps``
     for the receipt. Fails open: no comparison → nothing is fix-induced.
     """
-    state = load_sticky_state()
     key = _state_key(pr)
-    entry = state.get(key)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    run = entry.get("run")
-    run = dict(run) if isinstance(run, dict) else {}
-    prev_head = run.get("last_head_oid")
+    # The git diff runs before the lock is taken, so the lock is never held
+    # across a subprocess; the head it is based on is re-read under the lock
+    # only to be overwritten.
+    prev_head = read_run_tracking(pr).get("last_head_oid")
     head = pull_request.get("headRefOid")
     ranges = None
     if isinstance(prev_head, str) and isinstance(head, str):
@@ -4618,16 +4661,23 @@ def track_head_and_fix_induced(
         if ranges
         else set()
     )
-    prior_val = run.get("fix_induced_fps")
-    prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
-    run["fix_induced_fps"] = sorted(prior | induced)
-    run["cycle_fix_induced_fps"] = sorted(induced)
-    run["cycle_new_findings"] = len(new_fingerprints)
-    if isinstance(head, str) and head:
-        run["last_head_oid"] = head
-    entry["run"] = run
-    state[key] = entry
-    save_sticky_state(state)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        prior_val = run.get("fix_induced_fps")
+        prior = {x for x in prior_val if isinstance(x, str)} if isinstance(prior_val, list) else set()
+        run["fix_induced_fps"] = sorted(prior | induced)
+        run["cycle_fix_induced_fps"] = sorted(induced)
+        run["cycle_new_findings"] = len(new_fingerprints)
+        if isinstance(head, str) and head:
+            run["last_head_oid"] = head
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
     return {
         "fix_induced": induced,
         "new_findings": len(new_fingerprints),

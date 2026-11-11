@@ -60,6 +60,19 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- **state.json writes are serialized and atomic.** Every writer now goes
+  through `loop_state.mutate_sticky_state`, which reads, applies and writes
+  under one file-wide `state.lock`. state.json is rewritten whole, so two
+  unlocked writers holding different snapshots erased each other's changes
+  (the clobber that moved the cycle stamps and request provenance into
+  append-only logs); the lock closes that window for everything that stays
+  in the file, including the wait block, fixed markers and judge verdicts.
+  The write itself is a rename of a sibling file, so a reader never sees a
+  torn file that `load_sticky_state` would read as an empty state. A busy
+  or unavailable lock warns once and writes anyway, the old behavior, so it
+  can never wedge the loop. The re-review script's per-PR lock uses the
+  same primitive.
+
 - **No reviewer configured means no ping.** With nothing persisted and no
   reviewer named, `request_rereview.py` fell back to the suggested vendor and
   posted `@codex review`, even on PRs a CI job's Claude review was covering.
