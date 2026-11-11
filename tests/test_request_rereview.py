@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+import loop_state
 import request_rereview
 from conftest import stub_cap_check_known_under_cap
 import review_vendors
@@ -1859,8 +1860,10 @@ class TestReviewRequestMain:
         so a run that cannot establish the lock posts nothing (PR #116 review)."""
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         if break_lock == "no_lock_module":
-            monkeypatch.setattr(request_rereview, "fcntl", None)
-            monkeypatch.setattr(request_rereview, "msvcrt", None)
+            # The lock primitive lives in loop_state (shared with the
+            # state.json writers); the request script only chooses the path.
+            monkeypatch.setattr(loop_state, "fcntl", None)
+            monkeypatch.setattr(loop_state, "msvcrt", None)
         else:
             monkeypatch.setattr(request_rereview, "lock_path", lambda repo, pr: tmp_path / "missing" / "x" / "\0bad")
         self._stub_reads(monkeypatch)

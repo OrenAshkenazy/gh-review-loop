@@ -22,15 +22,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no flock
-    fcntl = None  # type: ignore[assignment]
-try:
-    import msvcrt
-except ImportError:  # POSIX
-    msvcrt = None  # type: ignore[assignment]
-
 import judge
 import review_vendors
 import reviewer_resolver
@@ -1853,27 +1844,6 @@ def lock_path(repo: str, pr: int) -> Path:
     return loop_state.pr_scoped_path(repo, pr, "locks", ".lock")
 
 
-def _try_lock(handle: Any) -> bool:
-    """One non-blocking attempt. Raises BlockingIOError/PermissionError when busy."""
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-    return True
-
-
-def _unlock(handle: Any) -> None:
-    try:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        else:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    except OSError:
-        pass
-
-
 @contextlib.contextmanager
 def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
     """Serialize the state-check/count/POST sequence per PR on this machine.
@@ -1885,38 +1855,16 @@ def pr_request_lock(repo: str, pr: int) -> Iterator[bool | None]:
     flock/msvcrt, unwritable state dir). The caller posts only on True: an
     unserialized run is exactly the duplicate this lock exists to prevent.
     Runs on other machines are not covered; the pending-state dedupe and the
-    unconfirmed-request record are the guard there.
+    unconfirmed-request record are the guard there. The lock itself is
+    ``loop_state.file_lock``, shared with the state.json writers.
     """
-    if fcntl is None and msvcrt is None:
-        yield None
-        return
     try:
         path = lock_path(repo, pr)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        handle = open(path, "a+", encoding="utf-8")
     except (OSError, ValueError):
         yield None
         return
-    try:
-        deadline = time.monotonic() + LOCK_WAIT_SECONDS
-        while True:
-            try:
-                _try_lock(handle)
-                break
-            except (BlockingIOError, PermissionError):
-                if time.monotonic() >= deadline:
-                    yield False
-                    return
-                time.sleep(0.5)
-            except OSError:
-                yield None
-                return
-        try:
-            yield True
-        finally:
-            _unlock(handle)
-    finally:
-        handle.close()
+    with loop_state.file_lock(path, LOCK_WAIT_SECONDS) as held:
+        yield held
 
 
 def unconfirmed_unreadable_payload(repo: str, pr: int, reviewer: str) -> dict[str, Any]:

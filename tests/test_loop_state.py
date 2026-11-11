@@ -564,3 +564,115 @@ def test_a_stray_file_at_the_new_path_does_not_shadow_legacy_data(tmp_path, monk
     (tmp_path / loop_state.STATE_DIR_NAME).write_text("not a directory")
 
     assert loop_state.state_dir() == legacy
+
+
+class TestStateLock:
+    """Every state.json writer serializes on one file-wide lock.
+
+    state.json is rewritten whole, so two unlocked writers holding different
+    snapshots erase each other's changes: a fetch that loaded the file before
+    the request script stamped it saved the stamp away again (PR #116
+    review). ``mutate_sticky_state`` reads, applies and writes under
+    ``state.lock``; it fails open (warns and writes anyway) when the lock is
+    busy past the wait or cannot be established, which is the old behavior.
+    """
+
+    @staticmethod
+    def _state_file(tmp_path: Path) -> Path:
+        return tmp_path / "state.json"
+
+    def test_mutate_applies_in_place_and_returns_the_result(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+
+        def mutate(state):
+            state["o/r#1"] = {"run": {"update_seq": 1}}
+            return "done"
+
+        assert loop_state.mutate_sticky_state(mutate) == "done"
+        assert json.loads(self._state_file(tmp_path).read_text()) == {
+            "o/r#1": {"run": {"update_seq": 1}}
+        }
+
+    def test_save_is_atomic_and_leaves_no_temporary_file(self, tmp_path, monkeypatch):
+        """A reader that caught a half-written file would read it as an empty
+        state, and the next writer would save that emptiness over every PR's
+        entry. The write goes to a sibling file and is renamed into place."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        loop_state.save_sticky_state({"a": 1})
+        loop_state.save_sticky_state({"a": 1, "b": 2})
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
+        assert json.loads(self._state_file(tmp_path).read_text()) == {"a": 1, "b": 2}
+
+    def test_busy_lock_times_out_then_writes_with_a_warning(self, tmp_path, monkeypatch, capsys):
+        """A lock held past the wait must not wedge the loop: the write still
+        happens, after one stderr line saying it is unserialized."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(loop_state, "STATE_LOCK_WAIT_SECONDS", 0.2)
+        with loop_state.state_lock() as held:
+            assert held is True
+            start = time.monotonic()
+            loop_state.mutate_sticky_state(lambda state: state.setdefault("late", True))
+            assert time.monotonic() - start >= 0.2
+        assert "held by another process" in capsys.readouterr().err
+        assert json.loads(self._state_file(tmp_path).read_text()) == {"late": True}
+
+    @pytest.mark.parametrize("break_lock", ["no_lock_module", "unwritable_dir"])
+    def test_no_lock_still_writes_with_a_warning(self, tmp_path, monkeypatch, capsys, break_lock):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        if break_lock == "no_lock_module":
+            monkeypatch.setattr(loop_state, "fcntl", None)
+            monkeypatch.setattr(loop_state, "msvcrt", None)
+        else:
+            monkeypatch.setattr(
+                loop_state, "state_lock_path", lambda: tmp_path / "missing" / "x" / "\0bad"
+            )
+        loop_state.mutate_sticky_state(lambda state: state.setdefault("written", 1))
+        assert "no lock on" in capsys.readouterr().err
+        assert json.loads(self._state_file(tmp_path).read_text()) == {"written": 1}
+
+    def test_two_processes_do_not_clobber_each_other(self, tmp_path, monkeypatch):
+        """The clobber the lock exists to prevent, reproduced across processes.
+
+        A holder process takes the lock, signals it, sleeps, then writes its
+        key. This process writes its own key while the holder sleeps. Without
+        the lock this write lands between the holder's read and its write, so
+        the holder's save erases it; with the lock this write waits for the
+        holder and both keys survive.
+        """
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        marker = tmp_path / "holder-has-lock"
+        holder = (
+            "import sys, time, pathlib\n"
+            f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+            "import loop_state\n"
+            f"marker = pathlib.Path({str(marker)!r})\n"
+            "def mutate(state):\n"
+            "    marker.write_text('held')\n"
+            "    time.sleep(1.0)\n"
+            "    state['holder'] = 1\n"
+            "loop_state.mutate_sticky_state(mutate)\n"
+        )
+        env = dict(os.environ, GGRL_STATE_DIR=str(tmp_path))
+        proc = subprocess.Popen([sys.executable, "-I", "-c", holder], env=env)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists():
+                assert proc.poll() is None, "holder exited before taking the lock"
+                assert time.monotonic() < deadline, "holder never took the lock"
+                time.sleep(0.02)
+            start = time.monotonic()
+            loop_state.mutate_sticky_state(lambda state: state.setdefault("main", 1))
+            waited = time.monotonic() - start
+        finally:
+            assert proc.wait(timeout=10) == 0
+        assert waited >= 0.3, f"this process did not wait for the holder ({waited:.2f}s)"
+        assert json.loads(self._state_file(tmp_path).read_text()) == {"holder": 1, "main": 1}
+
+    def test_request_lock_and_state_lock_are_different_files(self, tmp_path, monkeypatch):
+        """The per-PR request lock cannot serialize state.json, which every PR
+        of every repo shares; the state lock is file-wide."""
+        import request_rereview
+
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        assert request_rereview.lock_path("o/r", 1) != loop_state.state_lock_path()
+        assert loop_state.state_lock_path().parent == tmp_path

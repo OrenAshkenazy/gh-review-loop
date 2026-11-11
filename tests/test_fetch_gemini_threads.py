@@ -2045,9 +2045,12 @@ class TestRunTracking:
         # AttributeError on state.get(key).
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         import fetch_gemini_threads as fgt
-        monkeypatch.setattr(fgt, "load_sticky_state", lambda: ["not", "a", "dict"])
+        import loop_state
+        # Every writer goes through loop_state.mutate_sticky_state, so the
+        # corrupt read and the captured write are patched there.
+        monkeypatch.setattr(loop_state, "load_sticky_state", lambda: ["not", "a", "dict"])
         captured = {}
-        monkeypatch.setattr(fgt, "save_sticky_state", lambda s: captured.update(state=s))
+        monkeypatch.setattr(loop_state, "save_sticky_state", lambda s: captured.update(state=s))
         cycle = fgt.record_cycle(self._pr(), started_at="2026-06-05T09:00:00Z",
                                  finished_at="2026-06-05T09:01:00Z",
                                  finding_count=1, outcome="clean")
@@ -2060,11 +2063,12 @@ class TestRunTracking:
         # A failed metrics write must not break the loop: warn, exit 0.
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         import fetch_gemini_threads as fgt
+        import loop_state
 
         def _boom(*a, **k):
             raise OSError("disk full")
 
-        monkeypatch.setattr(fgt, "save_sticky_state", _boom)
+        monkeypatch.setattr(loop_state, "save_sticky_state", _boom)
         monkeypatch.setattr(sys, "argv", [
             "fetch_gemini_threads.py",
             "--pr", "https://github.com/o/r/pull/9",
