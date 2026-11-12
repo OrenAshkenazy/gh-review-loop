@@ -2651,8 +2651,15 @@ def update_run_tracking(
     findings: list[tuple[str, str | None]],
     *,
     bump_session_cycle: bool = True,
+    phase: str | None = None,
+    cap: dict[str, Any] | None = None,
 ) -> None:
     """Merge this invocation's findings into the run's tracking state.
+
+    ``phase`` (a real fetch passes ``"fetched"``) and ``cap`` (the counters
+    the fetch computed: ``cap_used``, ``cap_limit``, ``cap_reached``,
+    ``cap_count_complete``) are recorded on the run block so a later local
+    read can say where the loop is without a GitHub call.
 
     ``findings`` is a list of (thread_id, path) pairs. Sets ``started_at`` on
     the first call of a run; unions ids/paths on every call. Stored under the
@@ -2668,10 +2675,16 @@ def update_run_tracking(
     key = _state_key(pr)
     repo_full = f"{pr.owner}/{pr.repo}"
 
-    def mutate(state: dict[str, Any]) -> None:
-        _update_run_tracking_in(state, key, repo_full, findings, bump_session_cycle)
+    def mutate(state: dict[str, Any]) -> str | None:
+        return _update_run_tracking_in(
+            state, key, repo_full, findings, bump_session_cycle, phase=phase, cap=cap
+        )
 
-    mutate_sticky_state(mutate)
+    previous = mutate_sticky_state(mutate)
+    if phase:
+        warning = loop_state.phase_warning(previous, phase)
+        if warning:
+            print(warning, file=sys.stderr)
     # Freshen the loop-active sentinel so the hooks.json shell guard lets the
     # gates run for the duration of this loop (and the 24h TTL restarts).
     # Without the marker the guard exits before Python starts, so the gates are
@@ -2691,8 +2704,12 @@ def _update_run_tracking_in(
     repo_full: str,
     findings: list[tuple[str, str | None]],
     bump_session_cycle: bool,
-) -> None:
-    """The in-place half of ``update_run_tracking``, applied under the state lock."""
+    *,
+    phase: str | None = None,
+    cap: dict[str, Any] | None = None,
+) -> str | None:
+    """The in-place half of ``update_run_tracking``, applied under the state
+    lock. Returns the phase the run was in before, for the transition warning."""
     entry = state.get(key, {})
     run = entry.get("run", {})
     if "started_at" not in run:
@@ -2758,8 +2775,14 @@ def _update_run_tracking_in(
             paths.add(path)
     run["finding_ids"] = sorted(ids)
     run["finding_paths"] = sorted(paths)
+    if cap:
+        run.update(cap)
+    previous = run.get("phase") if isinstance(run.get("phase"), str) else None
+    if phase:
+        previous = loop_state.set_phase(run, phase, _now_iso())
     entry["run"] = run
     state[key] = entry
+    return previous
 
 
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
@@ -2770,8 +2793,13 @@ def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
     return run if isinstance(run, dict) else {}
 
 
-def clear_run_tracking(pr: PullRequest) -> None:
+def clear_run_tracking(pr: PullRequest, *, last_run: dict[str, Any] | None = None) -> None:
     """Tear down the run accumulator and the delta baseline for this PR.
+
+    ``last_run`` (outcome, recorded time, session cycle) is left on the entry
+    in the run block's place, so a later local read can say how the last loop
+    ended instead of "no run"; the hooks read the run block only and stand
+    down.
 
     The render baseline (#95) is only meaningful while the full render it
     fingerprints is still in the agent's context. Terminal completion ends that
@@ -2783,9 +2811,15 @@ def clear_run_tracking(pr: PullRequest) -> None:
 
     def mutate(state: dict[str, Any]) -> None:
         entry = state.get(key)
-        if isinstance(entry, dict):
-            for field in ("run", "render_baseline"):
-                entry.pop(field, None)
+        if not isinstance(entry, dict):
+            if last_run is None:
+                return
+            entry = {}
+        for field in ("run", "render_baseline"):
+            entry.pop(field, None)
+        if last_run is not None:
+            entry["last_run"] = dict(last_run)
+        state[key] = entry
 
     mutate_sticky_state(mutate)
     # Drop the sentinel only when no loop remains anywhere — another repo's
@@ -3001,7 +3035,9 @@ def run_wait_chunk(
         pull_request = fetch_threads(pr)
         refusal = reviewer_refusal(pull_request, author, after_iso=after_iso)
         if refusal is not None:
-            clear_wait_state(pr)
+            # Kept, not cleared: a refusal is the wait's outcome, and a later
+            # local read must be able to say the reviewer declined.
+            save_wait_snapshot(pr, {"status": "refused", "author": author, **refusal})
             return {"status": "refused", "author": author, "pull_request": None, **refusal}
         fingerprint = wait_activity_fingerprint(pull_request, author, after_iso)
         now_dt = _dt.datetime.now(_dt.timezone.utc)
@@ -3525,6 +3561,7 @@ def stamp_summary_emitted(pr: PullRequest) -> None:
         if seq <= 0:
             return  # corrupt/non-numeric update_seq — nothing meaningful to stamp
         run["last_summary_seq"] = seq
+        loop_state.set_phase(run, "summarized", _now_iso())
         state[key]["run"] = run
 
     mutate_sticky_state(mutate)
@@ -5148,6 +5185,14 @@ def main() -> int:
                 )
             )
             return 0
+        if snapshot.get("status") == "refused":
+            print_reviewer_refusal(
+                snapshot,
+                author=str(snapshot.get("author", DEFAULT_AUTHOR)),
+                json_output=args.format == "json",
+                color_enabled=color_enabled,
+            )
+            return 0
         print(
             color_loop_block(
                 metrics.format_wait_heartbeat(
@@ -5309,6 +5354,8 @@ def main() -> int:
                 accumulate_swept_patterns(pr, args.swept_pattern)
             except OSError as exc:
                 print(f"warning: could not persist swept patterns: {exc}", file=sys.stderr)
+        if args.wait:
+            loop_state.mark_phase(_state_key(pr), "waiting", _now_iso())
         if args.wait and args.wait_chunk_seconds is not None:
             if args.wait_chunk_seconds <= 0:
                 parser.error("--wait-chunk-seconds must be a positive integer.")
@@ -5369,6 +5416,7 @@ def main() -> int:
                     after_iso=args.after,
                 )
             except ReviewerRefused as refused:
+                save_wait_snapshot(pr, {"status": "refused", "author": args.author, **refused.refusal})
                 print_reviewer_refusal(
                     {"status": "refused", **refused.refusal},
                     author=args.author,
@@ -5383,6 +5431,12 @@ def main() -> int:
                 # The head's checks come with it: a red check may be the
                 # reason the reviewer never came.
                 timed_out_ci = ci_status(timed_out.pull_request or {})
+                save_wait_snapshot(pr, {
+                    "status": "timed_out",
+                    "author": args.author,
+                    "elapsed_seconds": timed_out.elapsed_seconds,
+                    "ci": timed_out_ci,
+                })
                 if args.format == "json":
                     print(
                         json.dumps(
@@ -5528,6 +5582,26 @@ def main() -> int:
                     pr,
                     [(t["id"], t.get("path", "")) for t in threads],
                     bump_session_cycle=not args.cycle_summary,
+                    # A read-only summary is not a fetch; it sets its own
+                    # phase when it stamps the summary.
+                    phase=None if args.cycle_summary else "fetched",
+                    cap={
+                        "cap_used": len(rereviews),
+                        "cap_limit": args.max_rereview_requests,
+                        "cap_reached": bool(_limit_reached),
+                        "cap_count_complete": review_request_count_complete(
+                            pull_request,
+                            review_request_vendor=review_request_vendor,
+                            loop_request_times=recorded_request_times,
+                            counted_requests=len(rereviews),
+                            provenance_incomplete=loop_state.cap_count_uncertain(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
+                            baseline_adopted=loop_state.baseline_adopted(
+                                f"{pr.owner}/{pr.repo}", pr.number
+                            ),
+                        ),
+                    },
                 )
             except OSError as exc:
                 print(f"warning: could not update run tracking: {exc}", file=sys.stderr)
@@ -5862,7 +5936,12 @@ def main() -> int:
                     print(f"warning: could not record run metrics: {exc}", file=sys.stderr)
                 else:
                     try:
-                        clear_run_tracking(pr)
+                        clear_run_tracking(pr, last_run={
+                            "outcome": record.get("outcome"),
+                            "recorded_at": _now_iso(),
+                            "session_cycle": record.get("session_cycle"),
+                            "cycles_used": record.get("cycles_used"),
+                        })
                     except OSError as exc:
                         print(f"warning: could not clear run tracking: {exc}", file=sys.stderr)
             else:
@@ -6117,6 +6196,13 @@ def main() -> int:
                         "sessionCycle": _safe_int(
                             read_run_tracking(pr).get("session_cycle")
                         ) or None,
+                        # Where the loop is, as recorded on the run block:
+                        # fetched, summarized, requested or waiting, with the
+                        # time of the last recorded request when there is one.
+                        "phase": read_run_tracking(pr).get("phase"),
+                        "phaseAt": read_run_tracking(pr).get("phase_at"),
+                        "requestedAt": read_run_tracking(pr).get("requested_at"),
+                        "requestedHead": read_run_tracking(pr).get("requested_head"),
                         "reReviewRequests": len(rereviews),
                         "reReviewLimit": args.max_rereview_requests,
                         "limitReached": _limit_reached,

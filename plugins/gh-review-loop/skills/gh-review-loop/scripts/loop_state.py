@@ -56,6 +56,24 @@ SENTINEL_TTL_SECONDS = 24 * 60 * 60
 STATE_LOCK_NAME = "state.lock"
 STATE_LOCK_WAIT_SECONDS = 5
 
+# Where a loop run is, as the scripts can observe it. ``fetched``: a real
+# fetch rendered the threads. ``summarized``: ``--cycle-summary`` (the agent's
+# or the Stop-hook backstop's) delivered the receipt. ``requested``: a
+# re-review is on its way (posted, confirmed after an uncertain POST, a push
+# review the loop waits on, or a request GitHub still lists as pending).
+# ``waiting``: a ``--wait`` started. The terminal ``--record-run`` clears the
+# run block and leaves ``entry["last_run"]`` instead. Recorded, never
+# enforced: a phase that cannot be set must never block the loop.
+PHASES = ("fetched", "summarized", "requested", "waiting")
+
+# The one transition that is never right: a re-review requested straight
+# after a fetch means the cycle summary was skipped, which the push gate
+# exists to catch. Everything else is allowed — a fetch can happen at any
+# point (a recovery ``--full``), a wait follows a request or, on cycle 1 for
+# a self-reviewing vendor, nothing at all, and a request may be retried
+# after a wait that timed out.
+UNEXPECTED_TRANSITIONS = {("fetched", "requested")}
+
 SENTINEL_NAME = "loop-active"
 
 # The plugin was renamed gh-gemini-review-loop -> gh-review-loop. The state
@@ -314,6 +332,62 @@ def mutate_sticky_state(mutate: Callable[[dict[str, Any]], T]) -> T:
         if json.dumps(state, sort_keys=True) != before or not path.exists():
             save_sticky_state(state)
     return result
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def set_phase(run: dict[str, Any], phase: str, at: str, **fields: Any) -> str | None:
+    """Record ``phase`` on a run block in place; returns the previous phase.
+
+    ``fields`` ride with the phase (``requested_at``, ``requested_head``) and
+    are written as given, None included: a request whose head is unknown
+    must not keep an older request's head. The caller holds the state lock
+    (see ``mutate_sticky_state``).
+    """
+    previous = run.get("phase")
+    run["phase"] = phase
+    run["phase_at"] = at
+    run.update(fields)
+    return previous if isinstance(previous, str) else None
+
+
+def phase_warning(previous: str | None, phase: str) -> str | None:
+    """The stderr line an unexpected transition earns, or None."""
+    if (previous, phase) in UNEXPECTED_TRANSITIONS:
+        return (
+            f"warning: loop phase {previous} -> {phase}: a re-review was "
+            "requested with no cycle summary since the last fetch."
+        )
+    return None
+
+
+def mark_phase(key: str, phase: str, at: str | None = None, **fields: Any) -> str | None:
+    """Set the phase on ``state[key]["run"]`` under the lock; returns the
+    previous phase and prints the transition warning when one is due.
+
+    Creates the run block when there is none: a ping-first vendor's opening
+    request lands before the first fetch. ``any_active_run`` still ignores
+    such a block (no ``update_seq``), so the hooks stay down until a fetch.
+    """
+    stamp = at or now_iso()
+
+    def mutate(state: dict[str, Any]) -> str | None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        previous = set_phase(run, phase, stamp, **fields)
+        entry["run"] = run
+        state[key] = entry
+        return previous
+
+    previous = mutate_sticky_state(mutate)
+    warning = phase_warning(previous, phase)
+    if warning:
+        print(warning, file=sys.stderr)
+    return previous
 
 
 def pr_scoped_path(repo: str, pr: int, subdir: str, suffix: str) -> Path:

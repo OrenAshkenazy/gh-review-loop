@@ -417,6 +417,17 @@ def state_key_for(state: dict[str, Any], repo: str, pr: int) -> str:
     return f"{repo}#{pr}"
 
 
+def mark_requested(repo: str, pr: int, *, at: str | None, head: str | None) -> None:
+    """Record that a review is on its way: phase ``requested`` on the PR's run
+    block, with the request time (``--wait --after`` anchors on it) and the
+    head it was made for when known. Fails open like every phase write."""
+    try:
+        key = state_key_for(load_state(), repo, pr)
+        loop_state.mark_phase(key, "requested", requested_at=at, requested_head=head)
+    except OSError as exc:
+        print(f"warning: could not record the requested phase: {exc}", file=sys.stderr)
+
+
 # How far after the local pre-POST timestamp a timeline event may appear and
 # still be the same request. GitHub stamps the event server-side; the gap is
 # normally under a second.
@@ -2120,6 +2131,9 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         _emit(already_reviewed_payload(args.repo, args.pr, reviewer, state["head"]), json_output=json_output)
         return 0
     if state["state"] == "PENDING":
+        # A request GitHub still lists is this cycle's request: the loop
+        # waits on it, so the phase says so.
+        mark_requested(args.repo, args.pr, at=state["pending_since"], head=state["head"])
         _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
         return 0
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
@@ -2309,6 +2323,8 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
             # The record (or the incomplete flag) is durable; the reservation
             # has done its job. Otherwise it stays as the only record.
             clear_unconfirmed_request(args.repo, args.pr)
+    if not payload.get("dry_run"):
+        mark_requested(args.repo, args.pr, at=payload.get("created_at"), head=state["head"])
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     elif payload.get("dry_run"):
@@ -2511,6 +2527,7 @@ def main(argv: list[str] | None = None) -> int:
                     push_wait = summary
                 elif not summary["checks_done"] and not push_wait_expired(earlier[-1], utc_now_iso()):
                     # Already waiting on this head, and already counted.
+                    mark_requested(args.repo, args.pr, at=summary["arrived_at"], head=summary["head"])
                     _emit(push_review_pending_payload(
                         args.repo, args.pr, reviewer, summary["head"], summary["arrived_at"],
                     ), json_output=args.json_output)
@@ -2592,6 +2609,7 @@ def main(argv: list[str] | None = None) -> int:
         if push_wait is not None:
             reviewer = reviewer_login or vendor.login
             record_push_review_wait(args.repo, args.pr, reviewer, push_wait["head"], utc_now_iso())
+            mark_requested(args.repo, args.pr, at=push_wait["arrived_at"], head=push_wait["head"])
             _emit(push_review_pending_payload(
                 args.repo, args.pr, reviewer, push_wait["head"], push_wait["arrived_at"],
             ), json_output=args.json_output)
@@ -2600,6 +2618,7 @@ def main(argv: list[str] | None = None) -> int:
         # A dry run posts nothing, so it closes no cycle.
         if payload.get("posted") is not False and not payload.get("dry_run"):
             record_rereview_posted(args.repo, args.pr)
+            mark_requested(args.repo, args.pr, at=payload.get("created_at"), head=head)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
