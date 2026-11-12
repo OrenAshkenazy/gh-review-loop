@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- **`loop_status.py`: where the loop is, and the one next command.** Reads
+  local state only (state.json, the PR's provenance files, the saved
+  verification profile, the git checkout) and never calls `gh`, so it is free
+  to run on a resumed or compacted session, offline, or a day later. Prints a
+  `[loop] status` block: reviewer, phase and age, session cycle, cap used over
+  limit, the recorded request, a kept wait outcome, local HEAD against the
+  upstream, profile state, warnings (missing or stale loop-active marker,
+  incomplete provenance, a stale summary the push gate will block on, a cap
+  raised since the last fetch), then `Next:` with exactly one command.
+  `--format json` returns the same decision as an object. The resume ladder
+  in `references/resume-and-recovery.md` is now what the script implements: a
+  cap raised in preferences.json lifts "capped" before any fetch, local
+  commits ahead of the upstream mean push, a pushed head with no request or a
+  request older than the head means request, a kept timed-out or refused wait
+  means re-run it or record. The PR is picked from the checkout's active run,
+  else its newest run block, else its last recorded run; `--pr` overrides.
+  SKILL.md's two resume pointers now say to run it first.
+
 - **The loop phase is recorded.** The run block in state.json now carries
   `phase` (`fetched`, `summarized`, `requested`, `waiting`) with `phase_at`,
   so a later local read can say where a loop is instead of inferring it from
