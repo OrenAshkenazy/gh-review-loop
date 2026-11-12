@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- **The loop phase is recorded.** The run block in state.json now carries
+  `phase` (`fetched`, `summarized`, `requested`, `waiting`) with `phase_at`,
+  so a later local read can say where a loop is instead of inferring it from
+  counters. A real fetch sets `fetched` and stores the cap counters it
+  computed (`cap_used`, `cap_limit`, `cap_reached`, `cap_count_complete`);
+  `--cycle-summary`, the Stop-hook backstop included, sets `summarized`; a
+  wait sets `waiting` and now keeps a timed-out or refused outcome in
+  `run.wait.last_snapshot` instead of clearing it (`--wait-heartbeat` renders
+  a kept refusal); `request_rereview.py` sets `requested` with `requested_at`
+  and `requested_head` when it posts, when a POST is confirmed after an
+  uncertain answer, when it waits on a push review, and when GitHub still
+  lists a request as pending. `--record-run` still clears the run block and
+  leaves `last_run` (outcome, time, session cycle) in its place. Transitions
+  are recorded, never enforced; the one pair that is never right, a request
+  straight after a fetch with no cycle summary between, prints one warning.
+  JSON fetches expose `loopStatus.phase`, `phaseAt`, `requestedAt` and
+  `requestedHead`.
+
 - **Checks on the head are feedback.** The fetch reads the head commit's
   `statusCheckRollup` (check names, conclusions, `isRequired`, details URLs)
   and prints a `[loop] CI:` block when a check failed or is still running,
