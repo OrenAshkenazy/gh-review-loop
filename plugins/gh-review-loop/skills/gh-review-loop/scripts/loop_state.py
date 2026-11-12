@@ -27,8 +27,10 @@ import contextlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
@@ -166,14 +168,28 @@ def save_sticky_state(state: dict[str, Any]) -> None:
     ``load_sticky_state`` reads as an empty state, and the next writer then
     saves that emptiness over every PR's entry. Writing to a sibling file and
     renaming it into place means a reader sees the old file or the new one,
-    never a torn one. The temporary name carries the pid so two processes
-    cannot share it.
+    never a torn one. The temporary file is created exclusively with a
+    unique name (``mkstemp``), so two writers that slipped past the lock
+    cannot share one and a planted symlink is never followed, and it takes
+    the existing file's mode so a restrictive state.json stays restrictive.
     """
     path = sticky_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True))
+        try:
+            os.chmod(tmp_name, stat.S_IMODE(path.stat().st_mode))
+        except OSError:
+            pass  # no existing file, or a mode that cannot be read: keep mkstemp's 0600
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +286,7 @@ def mutate_sticky_state(mutate: Callable[[dict[str, Any]], T]) -> T:
     on stderr: that is exactly today's unlocked behavior, and a correctness
     aid must never wedge the loop.
     """
+    path = sticky_state_path()
     with state_lock() as held:
         if held is None:
             print(
@@ -289,8 +306,13 @@ def mutate_sticky_state(mutate: Callable[[dict[str, Any]], T]) -> T:
             # the one point every writer passes through so a corrupt file can
             # never reach a mutate function as anything but a dict.
             state = {}
+        before = json.dumps(state, sort_keys=True)
         result = mutate(state)
-        save_sticky_state(state)
+        # A mutation that changed nothing is not written: an unreadable or
+        # corrupt file reads as {}, and saving that back would replace every
+        # PR's entry with nothing for a no-op such as clearing an absent run.
+        if json.dumps(state, sort_keys=True) != before or not path.exists():
+            save_sticky_state(state)
     return result
 
 

@@ -2080,6 +2080,15 @@ class TestRunTracking:
         assert "could not record cycle timing" in capsys.readouterr().err
 
 
+class TestReadRunTrackingTolerance:
+    @pytest.mark.parametrize("entry", ["not a dict", {"run": "not a dict"}, {"run": None}])
+    def test_malformed_entry_or_run_reads_as_absent(self, tmp_path, monkeypatch, entry):
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        import loop_state
+        loop_state.save_sticky_state({"o/r#9": entry})
+        assert read_run_tracking(PullRequest(owner="o", repo="r", number=9)) == {}
+
+
 class TestRemainingFindingStateAdapter:
     def _thread(self, thread_id="t1", path="a.py", body="Use the helper here."):
         return {

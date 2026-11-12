@@ -2763,7 +2763,11 @@ def _update_run_tracking_in(
 
 
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
-    return load_sticky_state().get(_state_key(pr), {}).get("run", {})
+    """The PR's run block, or {}. A hand-edited entry or run that is not a
+    dict reads as absent rather than raising mid-fetch."""
+    entry = load_sticky_state().get(_state_key(pr))
+    run = entry.get("run") if isinstance(entry, dict) else None
+    return run if isinstance(run, dict) else {}
 
 
 def clear_run_tracking(pr: PullRequest) -> None:
