@@ -1,19 +1,38 @@
 # Resuming after the cap, missed triggers, and post-stop pushes
 
+## First: ask the script where the loop is
+
+`loop_status.py` reads local state only (state.json, the PR's provenance files, the saved verification profile, the git checkout) and prints the phase, the cap, any warnings and the one next command. It never calls `gh`, so it is free to run on a resumed or compacted session, offline, or a day later.
+
+```bash
+# The PR is picked from the checkout's active run (else its newest run, else its last recorded run).
+python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/loop_status.py"
+# A specific PR; --format json for the same answer as a machine-readable object.
+python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/loop_status.py" --pr <URL>
+```
+
+Relay the `[loop] status` block verbatim and run its `Next:` command. What it decides, in order: no persisted reviewer → select one; an open unconfirmed re-review reservation → `request_rereview.py` (it settles it first); then the phase:
+
+| Phase | Next |
+|---|---|
+| none | fetch; after `--record-run` the entry keeps `last_run` (outcome, time) and the next fetch starts a new loop |
+| `fetched` | no saved profile → the profile decision; cap reached → `--record-run --outcome capped` or raise the cap; else fix, verify, `--cycle-summary` |
+| `summarized` | local commits ahead of the upstream → `git push`; else `request_rereview.py --expect-head` |
+| `requested` | commits after the request → push, then request again; head moved since the request → request again; else `--wait --after <requested_at>` |
+| `waiting` | kept `timed_out` → re-run the wait or record `--gemini-unconfirmed`; `refused` → record as human (quota: ask the user first); mid-wait → continue the chunked wait |
+
 ## Resuming after the cap
 
-Re-invoking the loop on a PR already at the cap is usually a **resume signal**, not an instant stop. Evaluate as a **strict priority order — first match wins**:
+Re-invoking the loop on a PR already at the cap is usually a **resume signal**, not an instant stop. `loop_status.py` applies this order — first match wins:
 
-| Priority | Condition | Action |
-|----------|-----------|--------|
-| 1 (highest) | User increased the cap (effective `max_rereview_requests` > cap already consumed) | **Continue** from the next cycle |
-| 2 | Interrupted local work **not pushed** (local commits/edits beyond the remote branch HEAD) | **Finish the push** — no new cycle consumed |
-| 3 | **Pushed** but no re-review request posted for that pushed SHA | **Request review** for that SHA — no new cycle consumed |
-| 4 (lowest) | No new local work **and** no higher cap | **Hard stop** (Stopping Condition 1) |
+| Priority | Condition | How it is detected | Action |
+|----------|-----------|--------------------|--------|
+| 1 (highest) | User increased the cap | `max_rereview_requests` in preferences.json is above the stored `cap_used`; the status stops reporting capped before any fetch | **Continue** from the next cycle |
+| 2 | Interrupted local work **not pushed** | `git rev-parse HEAD` ahead of `@{u}` | **Finish the push** — no new cycle consumed |
+| 3 | **Pushed** but no re-review request for that SHA | phase `summarized`, or `requested` with a `requested_head` older than HEAD | **Request review** for that SHA — no new cycle consumed |
+| 4 (lowest) | No new local work **and** no higher cap | none of the above | **Hard stop** (Stopping Condition 1) |
 
 A bumped cap (priority 1) wins even when unpushed work also exists. Cases 2 and 3 complete an already-started cycle and do **not** consume a new one.
-
-> **Follow-up (deterministic detection).** Cases 2 and 3 are prose-detected for now and MUST become deterministic: case 2 needs a local-vs-remote SHA comparison (`git rev-parse HEAD` vs `@{u}`); case 3 needs a GitHub check that the latest pushed SHA has no following agent-posted re-review comment. Tracked in `docs/superpowers/specs/2026-06-06-pr37-followup-design.md`.
 
 ## Recovery: missed initial trigger
 
@@ -26,12 +45,15 @@ The skill auto-triggers after `gh pr create`. If that was missed, invoke retroac
 
 ## Recovery: resumed session or compacted context
 
-The fetch collapses threads that are unchanged since the previous cycle to
-one-line stubs (delta mode). That is safe only while the earlier full render
-is still in your context. On a **resumed session** or after **context
+Run `loop_status.py` first: it says which phase the loop was in and what to do,
+and its warnings name a missing or stale loop-active marker (the hooks are off
+until the next fetch). Then, before acting on findings, re-establish the delta
+baseline. The fetch collapses threads that are unchanged since the previous
+cycle to one-line stubs (delta mode). That is safe only while the earlier full
+render is still in your context. On a **resumed session** or after **context
 compaction**, the persisted baseline survives but your context does not — the
-stubs would point at content you can no longer see. Re-establish the baseline
-with a single full fetch:
+stubs would point at content you can no longer see. Re-establish it with a
+single full fetch:
 
 ```bash
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/fetch_gemini_threads.py" --full
