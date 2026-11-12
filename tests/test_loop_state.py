@@ -603,6 +603,31 @@ class TestStateLock:
         assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
         assert json.loads(self._state_file(tmp_path).read_text()) == {"a": 1, "b": 2}
 
+    def test_save_replaces_rather_than_rewrites_and_keeps_the_mode(self, tmp_path, monkeypatch):
+        """The file a reader has open is never the one being written: the
+        new content arrives under a new inode. A restrictive mode survives."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        loop_state.save_sticky_state({"a": 1})
+        path = self._state_file(tmp_path)
+        os.chmod(path, 0o600)
+        inode = path.stat().st_ino
+        with open(path, encoding="utf-8") as reader:
+            loop_state.save_sticky_state({"a": 2})
+            assert json.loads(reader.read()) == {"a": 1}  # the open handle still sees the old file
+        assert path.stat().st_ino != inode
+        assert oct(path.stat().st_mode & 0o777) == "0o600"
+        assert json.loads(path.read_text()) == {"a": 2}
+
+    def test_a_no_op_mutation_never_overwrites_an_unreadable_file(self, tmp_path, monkeypatch):
+        """An unreadable file reads as {}; a no-op such as clearing an absent
+        run must not save that emptiness over every PR's entry."""
+        monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
+        self._state_file(tmp_path).write_text("{not json")
+        loop_state.mutate_sticky_state(lambda state: state.pop("absent", None))
+        assert self._state_file(tmp_path).read_text() == "{not json"
+        loop_state.mutate_sticky_state(lambda state: state.setdefault("x", 1))
+        assert json.loads(self._state_file(tmp_path).read_text()) == {"x": 1}
+
     def test_busy_lock_times_out_then_writes_with_a_warning(self, tmp_path, monkeypatch, capsys):
         """A lock held past the wait must not wedge the loop: the write still
         happens, after one stderr line saying it is unserialized."""
