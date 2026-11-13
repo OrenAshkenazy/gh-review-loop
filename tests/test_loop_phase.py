@@ -120,6 +120,15 @@ class TestPhaseWriters:
         assert status["phase"] == "fetched"
         assert status["requestedAt"] is None
 
+    def test_open_actionable_follows_the_severity_filter(self, loop, monkeypatch, capsys):
+        """What the fetch reports as actionable is the filtered set; a resume
+        must not be told to fix threads the fetch dropped."""
+        first = select_codex(monkeypatch, capsys)
+        assert run_block()["open_actionable"] == len(first["threads"]) == 2
+        filtered, _ = run_main(monkeypatch, capsys, "--min-severity", "critical", "--drop-unknown-severity")
+        assert filtered["threads"] == []
+        assert run_block()["open_actionable"] == 0
+
     @pytest.mark.parametrize("extra", [(), ("--auto-snapshot",)])
     def test_cycle_summary_records_summarized_including_the_backstop(self, loop, monkeypatch, capsys, extra):
         """The Stop-hook backstop runs --cycle-summary --auto-snapshot; the push

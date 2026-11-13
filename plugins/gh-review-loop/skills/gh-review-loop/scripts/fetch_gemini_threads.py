@@ -2785,6 +2785,22 @@ def _update_run_tracking_in(
     return previous
 
 
+def update_run_fields(pr: PullRequest, fields: dict[str, Any]) -> None:
+    """Set plain fields on the PR's run block under the state lock."""
+    key = _state_key(pr)
+
+    def mutate(state: dict[str, Any]) -> None:
+        entry = state.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        run = entry.get("run")
+        run = dict(run) if isinstance(run, dict) else {}
+        run.update(fields)
+        entry["run"] = run
+        state[key] = entry
+
+    mutate_sticky_state(mutate)
+
+
 def read_run_tracking(pr: PullRequest) -> dict[str, Any]:
     """The PR's run block, or {}. A hand-edited entry or run that is not a
     dict reads as absent rather than raising mid-fetch."""
@@ -5626,6 +5642,21 @@ def main() -> int:
                 else:
                     msg = f"--drop-unknown-severity: dropped {dropped} unknown-severity thread(s)."
                 print(msg, file=sys.stderr)
+                if not args.record_run and not args.stats:
+                    # The run block was written before the filter; what the
+                    # fetch reports as actionable is the filtered set, so a
+                    # local read must see the same count and clean blocker.
+                    try:
+                        update_run_fields(pr, {
+                            "open_actionable": len(threads),
+                            "clean_blocked_by": clean_blocked_by(
+                                threads, reviewer_overview,
+                                head_review_vendor=head_review_vendor,
+                                known_thread_ids=known_finding_ids,
+                            ),
+                        })
+                    except OSError as exc:
+                        print(f"warning: could not update run tracking: {exc}", file=sys.stderr)
         # Comment vendors keep the original one-argument call (their count
         # never depends on the timeline page).
         page_warnings = (
