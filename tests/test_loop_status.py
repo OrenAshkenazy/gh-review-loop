@@ -93,6 +93,11 @@ class TestDecideNext:
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, no_progress=True, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="no_review_for_head", cap_reached=True)), "the cap is reached: record the run as capped", "--record-run --outcome capped"),
             (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by="no_review_for_head", cap_reached=True, last_head_oid="aaaaaaa1")), "review_pending", "--outcome capped"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=2, session_cycle=2, cycle_new_findings=2, cycle_fix_induced_fps=["a", "b"], last_head_oid="aaaaaaa1")), "churn: all 2 new finding(s)", "--record-run --outcome churn"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=1, session_cycle=3, cycle_new_findings=1, cycle_fix_induced_fps=["a"], last_head_oid="aaaaaaa1")), "ignore churn", "--outcome churn"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=1, session_cycle=1, cycle_new_findings=1, cycle_fix_induced_fps=["a"])), "fix the findings", "--cycle-summary"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=2, session_cycle=2, cycle_new_findings=2, cycle_fix_induced_fps=["a"])), "fix the findings", "--cycle-summary"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=2, session_cycle=2, cycle_new_findings=2, cycle_fix_induced_fps=["a", "b"], last_head_oid="0000000")), "fix the findings", "--cycle-summary"),
         ],
         ids=[
             "no-reviewer", "reservation", "no-run", "last-run", "fetched-no-profile",
@@ -109,7 +114,8 @@ class TestDecideNext:
             "fetched-clean-same-head", "summarized-ci-failed-but-pushed-since",
             "fetched-no-progress", "summarized-no-progress", "fetched-no-progress-but-head-moved",
             "fetched-clean-beats-no-progress", "fetched-no-head-review-capped",
-            "summarized-no-head-review-capped",
+            "summarized-no-head-review-capped", "fetched-churn", "summarized-churn",
+            "churn-needs-cycle-2", "churn-needs-every-new-finding", "churn-but-head-moved",
         ],
     )
     def test_table(self, over, action, command):

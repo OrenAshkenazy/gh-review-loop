@@ -25,7 +25,9 @@ All notable changes to this project will be documented in this file. The format 
   A clean or `ci_failed` stop is recommended only while HEAD is still the
   head the fetch classified; a fetch's `no_progress` verdict is kept on the
   run block and becomes `--outcome no_progress` on resume under the same
-  rule. A blocking wait stores its `--after` anchor with its timed-out or
+  rule, and so does a churn verdict (`--outcome churn`, from the
+  fix-induced counts the fetch already keeps). At the cap, a head with no
+  review means record capped, not another refused request. A blocking wait stores its `--after` anchor with its timed-out or
   refused outcome, so status keeps it instead of discarding it as an
   earlier wait's. Local git facts count only when the checkout is
   on the PR's branch (the fetch now records `head_ref` and `head_repo`); from

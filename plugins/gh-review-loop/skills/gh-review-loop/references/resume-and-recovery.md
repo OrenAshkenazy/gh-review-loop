@@ -16,8 +16,8 @@ Relay the `[loop] status` block verbatim and run its `Next:` command. Local git 
 | Phase | Next |
 |---|---|
 | none | fetch; after `--record-run` the entry keeps `last_run` (outcome, time) and the next fetch starts a new loop |
-| `fetched` | no thread at the fetch and HEAD unchanged since → record (clean, `ci_failed`) or request the missing head review; the fetch reported `no_progress` and HEAD unchanged since → `--record-run --outcome no_progress`; no saved profile → the profile decision; cap reached → `--record-run --outcome capped` or raise the cap; else fix, verify, `--cycle-summary` |
-| `summarized` | local commits ahead of the upstream → `git push`; no thread or `no_progress` at the fetch and HEAD unchanged since → record as for `fetched`; HEAD still the fetched head → fix, verify, `--cycle-summary`; else `request_rereview.py --expect-head` |
+| `fetched` | no thread at the fetch and HEAD unchanged since → record (clean, `ci_failed`) or request the missing head review; the fetch reported `no_progress` or churn and HEAD unchanged since → `--record-run --outcome no_progress` / `churn` (churn: unless the user said to ignore it); no saved profile → the profile decision; cap reached → `--record-run --outcome capped` or raise the cap; else fix, verify, `--cycle-summary` |
+| `summarized` | local commits ahead of the upstream → `git push`; no thread, `no_progress` or churn at the fetch and HEAD unchanged since → record as for `fetched`; HEAD still the fetched head → fix, verify, `--cycle-summary`; else `request_rereview.py --expect-head` |
 | `requested` | commits after the request → push, then request again; head moved since the request → request again; else `--wait --after <requested_at>` |
 | `waiting` | kept `timed_out` → re-run the wait or record `--gemini-unconfirmed`; `refused` → record as human (quota: ask the user first); mid-wait → continue the chunked wait |
 
