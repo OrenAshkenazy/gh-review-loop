@@ -91,6 +91,8 @@ class TestDecideNext:
             (dict(phase="summarized", run=run("summarized", open_actionable=2, no_progress=True, last_head_oid="aaaaaaa1")), "(no_progress)", "--outcome no_progress"),
             (dict(phase="fetched", run=run("fetched", open_actionable=2, no_progress=True, last_head_oid="0000000")), "fix the findings", "--cycle-summary"),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, no_progress=True, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="no_review_for_head", cap_reached=True)), "the cap is reached: record the run as capped", "--record-run --outcome capped"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by="no_review_for_head", cap_reached=True, last_head_oid="aaaaaaa1")), "review_pending", "--outcome capped"),
         ],
         ids=[
             "no-reviewer", "reservation", "no-run", "last-run", "fetched-no-profile",
@@ -106,7 +108,8 @@ class TestDecideNext:
             "summarized-clean-but-pushed-since", "fetched-clean-but-head-moved",
             "fetched-clean-same-head", "summarized-ci-failed-but-pushed-since",
             "fetched-no-progress", "summarized-no-progress", "fetched-no-progress-but-head-moved",
-            "fetched-clean-beats-no-progress",
+            "fetched-clean-beats-no-progress", "fetched-no-head-review-capped",
+            "summarized-no-head-review-capped",
         ],
     )
     def test_table(self, over, action, command):

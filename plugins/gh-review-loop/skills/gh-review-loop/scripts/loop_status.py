@@ -373,6 +373,16 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             # A head-reviewing vendor has not cleared the head: zero threads
             # is not clean yet, and a fix cycle would loop on unchanged code
             # (references/reviewer-selection.md).
+            if blocked == "no_review_for_head" and cap_reached:
+                # The request script answers `capped` without moving the
+                # phase, so prescribing it again would repeat forever. It
+                # checks for a pending request before the cap, though.
+                return answer(
+                    "no thread is open but the head has no review yet, and the cap is reached: record "
+                    "the run as capped or raise the cap (if a request is already pending on GitHub, the "
+                    "request script answers review_pending; then wait for it)",
+                    f"{cmd['record']} --outcome capped",
+                )
             if blocked == "no_review_for_head":
                 return answer(
                     "no thread is open but the head has no review yet: request one (the script "
