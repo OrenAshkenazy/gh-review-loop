@@ -231,30 +231,77 @@ class TestWaitPhase:
         heartbeat, _ = run_main(monkeypatch, capsys, "--wait-heartbeat", fmt=None)
         assert "refused the review" in heartbeat
 
+    @pytest.mark.parametrize("mode", ["blocking", "chunked"])
+    def test_a_phase_write_that_fails_does_not_abort_the_wait(self, loop, monkeypatch, capsys, mode):
+        """Read-only or full disk: every state write fails. The phase is only
+        a record, so the wait still polls the reviewer and reports."""
+        select_codex(monkeypatch, capsys)
+
+        def disk_full(_state):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(loop_state, "save_sticky_state", disk_full)
+        extra = ("--wait-chunk-seconds", "1") if mode == "chunked" else ()
+        out, err = run_main(monkeypatch, capsys, "--wait", "--after", REREVIEW_AT, "--timeout", "0", *extra)
+        assert out["wait"]["status"] == "timed_out"
+        assert "could not record the waiting phase" in err
+
+    @pytest.mark.parametrize("earlier", ["refused", "timed_out"])
+    def test_a_blocking_wait_that_succeeds_clears_the_earlier_outcome(self, loop, monkeypatch, capsys, earlier):
+        """The reviewer answered a later request: the kept refusal or timeout
+        is obsolete, and --wait-heartbeat must stop printing it."""
+        select_codex(monkeypatch, capsys)
+        if earlier == "refused":
+            loop["payload"] = self._refusing_payload(_iso(5))
+            out, _ = run_main(monkeypatch, capsys, "--wait", "--after", _iso(-60), "--timeout", "600")
+        else:
+            out, _ = run_main(monkeypatch, capsys, "--wait", "--after", REREVIEW_AT, "--timeout", "0")
+        assert out["wait"]["status"] == earlier
+        assert run_block()["wait"]["last_snapshot"]["status"] == earlier
+
+        loop["payload"] = FIXTURE["after_rereview"]
+        run_main(
+            monkeypatch, capsys, "--wait", "--after", REREVIEW_AT,
+            "--timeout", "600", "--quiet-period", "0",
+        )
+        run = run_block()
+        assert run["phase"] == "fetched"
+        assert "wait" not in run
+        heartbeat, _ = run_main(monkeypatch, capsys, "--wait-heartbeat", fmt=None)
+        assert "no reviewer wait in progress" in heartbeat
+
 
 class TestCopilotRequestPhase:
-    def test_a_pending_request_records_requested_with_pending_since(self, tmp_path, monkeypatch, capsys):
-        """A request GitHub still lists is this cycle's request: the loop
-        waits on it, so the phase says so and the wait anchor rides along."""
+    PENDING = {
+        "state": "PENDING", "head": "feed0000", "pending_since": "2026-10-16T10:00:00Z",
+        "first_completed_review_at": "2026-10-16T09:00:00Z",
+    }
+
+    def _request_pending(self, tmp_path, monkeypatch, capsys, *extra):
         monkeypatch.setenv("GGRL_STATE_DIR", str(tmp_path))
         monkeypatch.setattr(request_rereview, "gh_login", lambda *a, **k: "agent")
-        monkeypatch.setattr(
-            request_rereview, "request_state",
-            lambda *a, **k: {
-                "state": "PENDING", "head": "feed0000", "pending_since": "2026-10-16T10:00:00Z",
-                "first_completed_review_at": "2026-10-16T09:00:00Z",
-            },
-        )
+        monkeypatch.setattr(request_rereview, "request_state", lambda *a, **k: dict(self.PENDING))
         rc = request_rereview.main([
             "--repo", "acme/widget", "--pr", "159",
-            "--reviewer-login", "copilot-pull-request-reviewer", "--json",
+            "--reviewer-login", "copilot-pull-request-reviewer", "--json", *extra,
         ])
         assert rc == 0
         assert json.loads(capsys.readouterr().out)["status"] == "review_pending"
+
+    def test_a_pending_request_records_requested_with_pending_since(self, tmp_path, monkeypatch, capsys):
+        """A request GitHub still lists is this cycle's request: the loop
+        waits on it, so the phase says so and the wait anchor rides along."""
+        self._request_pending(tmp_path, monkeypatch, capsys)
         run = loop_state.load_sticky_state()[KEY]["run"]
         assert run["phase"] == "requested"
         assert run["requested_at"] == "2026-10-16T10:00:00Z"
         assert run["requested_head"] == "feed0000"
+
+    def test_a_dry_run_against_a_pending_request_records_nothing(self, tmp_path, monkeypatch, capsys):
+        """Previewing is read-only: the pending branch returns before the
+        posting path's dry-run guard, so it carries its own."""
+        self._request_pending(tmp_path, monkeypatch, capsys, "--dry-run")
+        assert KEY not in loop_state.load_sticky_state()
 
 
 class TestMarkPhase:

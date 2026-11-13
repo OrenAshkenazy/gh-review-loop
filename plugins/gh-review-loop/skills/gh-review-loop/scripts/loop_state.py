@@ -370,6 +370,10 @@ def mark_phase(key: str, phase: str, at: str | None = None, **fields: Any) -> st
     Creates the run block when there is none: a ping-first vendor's opening
     request lands before the first fetch. ``any_active_run`` still ignores
     such a block (no ``update_seq``), so the hooks stay down until a fetch.
+
+    Fails open: a write that fails (read-only or full disk) warns on stderr
+    and returns None, so recording where the loop is can never abort the
+    wait or request it describes.
     """
     stamp = at or now_iso()
 
@@ -383,7 +387,11 @@ def mark_phase(key: str, phase: str, at: str | None = None, **fields: Any) -> st
         state[key] = entry
         return previous
 
-    previous = mutate_sticky_state(mutate)
+    try:
+        previous = mutate_sticky_state(mutate)
+    except OSError as exc:
+        print(f"warning: could not record the {phase} phase: {exc}", file=sys.stderr)
+        return None
     warning = phase_warning(previous, phase)
     if warning:
         print(warning, file=sys.stderr)

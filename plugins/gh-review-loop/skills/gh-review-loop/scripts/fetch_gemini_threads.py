@@ -5415,6 +5415,10 @@ def main() -> int:
                     quiet_seconds=args.quiet_period,
                     after_iso=args.after,
                 )
+                # The reviewer answered: an earlier wait's refusal or timeout
+                # is obsolete, so --wait-heartbeat must stop reporting it
+                # (the chunked wait clears on ready the same way).
+                clear_wait_state(pr)
             except ReviewerRefused as refused:
                 save_wait_snapshot(pr, {"status": "refused", "author": args.author, **refused.refusal})
                 print_reviewer_refusal(

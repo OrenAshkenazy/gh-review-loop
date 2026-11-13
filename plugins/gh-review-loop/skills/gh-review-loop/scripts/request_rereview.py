@@ -2132,8 +2132,10 @@ def _run_review_request_locked(args: argparse.Namespace, vendor: review_vendors.
         return 0
     if state["state"] == "PENDING":
         # A request GitHub still lists is this cycle's request: the loop
-        # waits on it, so the phase says so.
-        mark_requested(args.repo, args.pr, at=state["pending_since"], head=state["head"])
+        # waits on it, so the phase says so. A dry run previews; it writes
+        # nothing, here as on the posting path below.
+        if not args.dry_run:
+            mark_requested(args.repo, args.pr, at=state["pending_since"], head=state["head"])
         _emit(review_pending_payload(args.repo, args.pr, reviewer, state["pending_since"]), json_output=json_output)
         return 0
     # Cycle 0 is free, so it is not gated on the cap — nor on the reads the cap
