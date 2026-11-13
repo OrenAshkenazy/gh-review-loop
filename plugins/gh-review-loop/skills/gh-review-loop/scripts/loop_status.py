@@ -72,6 +72,22 @@ def repo_from_origin(cwd: str | None = None) -> str | None:
     return parse_origin_url(_git(["remote", "get-url", "origin"], cwd))
 
 
+def repos_from_remotes(cwd: str | None = None) -> set[str]:
+    """Every GitHub repo a remote of the checkout points at, case-folded.
+
+    A fork checkout has ``origin`` on the fork and, usually, ``upstream`` on
+    the base repository the PR targets; its HEAD and ahead/behind describe
+    that PR just as well, so any remote naming the PR's repo qualifies.
+    """
+    out: set[str] = set()
+    for line in (_git(["remote", "-v"], cwd) or "").splitlines():
+        parts = line.split()
+        repo = parse_origin_url(parts[1]) if len(parts) >= 2 else None
+        if repo:
+            out.add(repo.casefold())
+    return out
+
+
 def local_git(cwd: str | None = None) -> dict[str, Any]:
     """HEAD, its upstream, and how far apart they are; None where unknown."""
     head = _git(["rev-parse", "HEAD"], cwd)
@@ -237,13 +253,19 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
     then the phase decides, with the verification profile checked before the
     first edit and the cap checked before any new fix or request.
     """
-    cmd = facts["commands"]
+    cmd = dict(facts["commands"])
     reviewer = facts.get("reviewer")
     phase = facts.get("phase")
     run = facts.get("run") or {}
     git = facts.get("git") or {}
     ahead = git.get("ahead")
     cap_reached = bool(run.get("cap_reached"))
+    # The cap the run ran under may be a --max-rereview-requests override
+    # above the preference; the request script would fall back to the
+    # preference and refuse, so the command carries it.
+    cap_limit = run.get("cap_limit")
+    if isinstance(cap_limit, int) and not isinstance(cap_limit, bool):
+        cmd["request"] = f"{cmd['request']} --max-rereview-requests {cap_limit}"
 
     def answer(action: str, command: str | None) -> dict[str, str | None]:
         return {"action": action, "command": command}
@@ -264,6 +286,15 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             )
         return answer("fetch the reviewer's threads", cmd["fetch"])
     if phase == "fetched":
+        open_actionable = run.get("open_actionable")
+        if open_actionable == 0 and not run.get("clean_blocked_by"):
+            # A fetch that found nothing to fix is the clean stop; a session
+            # that ended before --record-run resumes by recording, not by
+            # fixing (SKILL.md stopping condition 2).
+            return answer(
+                "the last fetch found no actionable thread: record the run as clean",
+                f"{cmd['record']} --outcome clean --verification <passed|failed|skipped>",
+            )
         if facts.get("profile") is None:
             return answer(
                 "save a verification profile before editing (the edit gate blocks until then)",
@@ -388,6 +419,7 @@ def build_status(
     git: dict[str, Any],
     git_repo: str | None,
     profile: str | None,
+    git_repos: set[str] | None = None,
     sentinel: str,
     reservation_open: bool,
     provenance_incomplete: bool,
@@ -426,14 +458,19 @@ def build_status(
     phase = run.get("phase") if isinstance(run.get("phase"), str) else None
     active = loop_state.safe_int(run.get("update_seq")) > 0
 
-    # Git facts only describe this PR when the checkout points at its repo.
-    git_applies = bool(git_repo) and git_repo.casefold() == repo.casefold()
+    # Git facts only describe this PR when a remote of the checkout points at
+    # its repo: origin, or the upstream remote of a fork checkout.
+    known = set(git_repos or ())
+    if git_repo:
+        known.add(git_repo.casefold())
+    git_applies = repo.casefold() in known
     git_facts = dict(git) if git_applies else {"head": None, "upstream": None, "ahead": None, "behind": None}
 
     warnings: list[str] = []
     if not git_applies:
         warnings.append(
-            f"git facts skipped: the checkout points at {git_repo or 'no GitHub remote'}, not {repo}"
+            f"git facts skipped: no remote of the checkout points at {repo} "
+            f"(origin is {git_repo or 'not a GitHub remote'})"
         )
     elif git.get("head") and not git.get("upstream"):
         warnings.append("no upstream branch: unpushed work cannot be told")
@@ -611,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         entry,
         git=local_git(args.cwd),
         git_repo=git_repo,
+        git_repos=repos_from_remotes(args.cwd),
         profile=profile_source(repo, prefs),
         sentinel=sentinel_state(),
         reservation_open=loop_state.unconfirmed_request_path(repo, number).exists(),

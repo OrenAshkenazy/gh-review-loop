@@ -5589,6 +5589,14 @@ def main() -> int:
                         "cap_used": len(rereviews),
                         "cap_limit": args.max_rereview_requests,
                         "cap_reached": bool(_limit_reached),
+                        # What this fetch found, so a local read can tell a
+                        # clean stop from a fix cycle without GitHub.
+                        "open_actionable": len(threads),
+                        "clean_blocked_by": clean_blocked_by(
+                            threads, reviewer_overview,
+                            head_review_vendor=head_review_vendor,
+                            known_thread_ids=known_finding_ids,
+                        ),
                         "cap_count_complete": review_request_count_complete(
                             pull_request,
                             review_request_vendor=review_request_vendor,
