@@ -116,6 +116,7 @@ class TestPhaseWriters:
         assert run["cap_reached"] == status["limitReached"] is False
         assert run["cap_count_complete"] == status["reReviewCountComplete"] is True
         assert run["open_actionable"] == len(first["threads"]) > 0
+        assert run["ci_failing"] == [] and run["ci_pending"] == 0
         assert run["clean_blocked_by"] == status["cleanBlockedBy"]
         assert status["phase"] == "fetched"
         assert status["requestedAt"] is None

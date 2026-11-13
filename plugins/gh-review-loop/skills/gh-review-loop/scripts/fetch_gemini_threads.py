@@ -5710,6 +5710,18 @@ def main() -> int:
         # Feedback the thread filter never sees: a red check on the head.
         # Surfaced, never fixed by the loop.
         ci = ci_status(pull_request)
+        if not args.record_run and not args.cycle_summary and not args.stats:
+            # Stored with the fetch so a local read can tell ci_failed from
+            # clean when no thread is left (SKILL.md stopping condition 6).
+            try:
+                update_run_fields(pr, {
+                    "ci_failing": [
+                        str(c.get("name") or "?") for c in ci.get("failing") or [] if isinstance(c, dict)
+                    ],
+                    "ci_pending": _safe_int(ci.get("pending")),
+                })
+            except OSError as exc:
+                print(f"warning: could not update run tracking: {exc}", file=sys.stderr)
 
         # ---- Judge (optional, opt-in via prefs file or --judge-mode) -------
         # The script is the single source of truth for whether the judge

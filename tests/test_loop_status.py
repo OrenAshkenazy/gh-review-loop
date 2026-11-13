@@ -74,6 +74,12 @@ class TestDecideNext:
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="no_review_for_head")), "head has no review yet: request one", "request_rereview.py"),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="overview_unparseable")), "overview blocks clean (overview_unparseable)", f"--pr {URL}"),
             (dict(phase="summarized", run=run("summarized", cap_used=3, cap_limit=5, cap_reached=False)), "request the re-review", "--json --max-rereview-requests 5"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by=None, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by=None, cap_reached=True)), "record the run as clean", "--outcome clean"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_failing=["tests", "lint"])), "2 head check(s) failed (tests, lint)", "--outcome ci_failed --outcome-reason 'tests'"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_pending=2)), "checks are still running", f"--pr {URL}"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=1, ci_failing=["tests"])), "cycle summary", "--cycle-summary"),
+            (dict(phase="waiting", run=run("waiting", requested_at="2026-11-12T12:00:00Z", wait={"after": T, "last_snapshot": {"status": "settling", "next_wait_seconds": 300}})), "did not finish", "--wait --after 2026-11-12T12:00:00Z --timeout 1800"),
             (dict(phase="waiting", run=run("waiting", requested_at=T)), "did not finish", f"--wait --after {T} --timeout 1800"),
             (dict(phase="bogus", run=run("bogus")), "unknown phase", f"--pr {URL}"),
         ],
@@ -86,6 +92,8 @@ class TestDecideNext:
             "summarized-capped-but-unpushed", "summarized-backstop-nothing-pushed",
             "summarized-pushed-since-fetch", "waiting-ahead", "waiting-head-moved",
             "fetched-clean", "fetched-no-head-review", "fetched-overview-blocked", "summarized-cap-forwarded",
+            "summarized-after-backstop-clean", "summarized-clean-beats-cap", "fetched-ci-failed",
+            "fetched-ci-pending", "fetched-ci-failed-with-threads", "waiting-stale-anchor",
         ],
     )
     def test_table(self, over, action, command):
