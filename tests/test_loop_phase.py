@@ -121,6 +121,19 @@ class TestPhaseWriters:
         assert status["phase"] == "fetched"
         assert status["requestedAt"] is None
 
+    def test_a_fetch_records_the_prs_branch(self, loop, monkeypatch, capsys):
+        """loop_status.py checks the checkout is on this branch before it
+        trusts local HEAD; a payload without the fields stores None."""
+        select_codex(monkeypatch, capsys)
+        assert run_block()["head_ref"] is None and run_block()["head_repo"] is None
+        loop["payload"] = {
+            **copy.deepcopy(FIXTURE["initial"]),
+            "headRefName": "fix/widget", "headRepository": {"nameWithOwner": "someone/widget"},
+        }
+        run_main(monkeypatch, capsys)
+        assert run_block()["head_ref"] == "fix/widget"
+        assert run_block()["head_repo"] == "someone/widget"
+
     def test_open_actionable_follows_the_severity_filter(self, loop, monkeypatch, capsys):
         """What the fetch reports as actionable is the filtered set; a resume
         must not be told to fix threads the fetch dropped."""

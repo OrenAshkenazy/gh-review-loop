@@ -382,6 +382,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
       url
       title
       headRefOid
+      headRefName
       baseRepository { nameWithOwner }
       headRepository { nameWithOwner }
       commits(last:1) {
@@ -5596,6 +5597,8 @@ def main() -> int:
             finding["id"] for finding in summary_findings
         }
         threads = sort_by_severity(threads)
+        head_ref = pull_request.get("headRefName")
+        head_repo = (pull_request.get("headRepository") or {}).get("nameWithOwner")
         if not args.record_run and not args.stats:
             try:
                 update_run_tracking(
@@ -5617,6 +5620,10 @@ def main() -> int:
                             head_review_vendor=head_review_vendor,
                             known_thread_ids=known_finding_ids,
                         ),
+                        # The PR's branch, so a local read can tell the PR's
+                        # checkout from another branch of the same repo.
+                        "head_ref": head_ref if isinstance(head_ref, str) and head_ref else None,
+                        "head_repo": head_repo if isinstance(head_repo, str) and head_repo else None,
                         "cap_count_complete": review_request_count_complete(
                             pull_request,
                             review_request_vendor=review_request_vendor,
