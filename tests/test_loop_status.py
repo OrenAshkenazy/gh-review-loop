@@ -71,7 +71,8 @@ class TestDecideNext:
             (dict(phase="waiting", run=run("waiting", requested_at=T, requested_head="aaaaaaa1", wait={"after": T, "last_snapshot": {"status": "timed_out"}}), git={**GIT, "ahead": 1}), "push (1 local", "git push"),
             (dict(phase="waiting", run=run("waiting", requested_at=T, requested_head="bbbbbbb2", wait={"after": T, "last_snapshot": {"status": "waiting"}})), "head moved", "request_rereview.py"),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None)), "record the run as clean", "--record-run --outcome clean"),
-            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="no_review_for_head")), "cycle summary", "--cycle-summary"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="no_review_for_head")), "head has no review yet: request one", "request_rereview.py"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by="overview_unparseable")), "overview blocks clean (overview_unparseable)", f"--pr {URL}"),
             (dict(phase="summarized", run=run("summarized", cap_used=3, cap_limit=5, cap_reached=False)), "request the re-review", "--json --max-rereview-requests 5"),
             (dict(phase="waiting", run=run("waiting", requested_at=T)), "did not finish", f"--wait --after {T} --timeout 1800"),
             (dict(phase="bogus", run=run("bogus")), "unknown phase", f"--pr {URL}"),
@@ -84,7 +85,7 @@ class TestDecideNext:
             "waiting-timed-out", "waiting-settling", "waiting-no-snapshot", "unknown",
             "summarized-capped-but-unpushed", "summarized-backstop-nothing-pushed",
             "summarized-pushed-since-fetch", "waiting-ahead", "waiting-head-moved",
-            "fetched-clean", "fetched-clean-but-blocked", "summarized-cap-forwarded",
+            "fetched-clean", "fetched-no-head-review", "fetched-overview-blocked", "summarized-cap-forwarded",
         ],
     )
     def test_table(self, over, action, command):

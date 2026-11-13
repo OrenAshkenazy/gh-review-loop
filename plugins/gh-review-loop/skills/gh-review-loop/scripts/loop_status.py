@@ -287,13 +287,29 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         return answer("fetch the reviewer's threads", cmd["fetch"])
     if phase == "fetched":
         open_actionable = run.get("open_actionable")
-        if open_actionable == 0 and not run.get("clean_blocked_by"):
+        blocked = run.get("clean_blocked_by")
+        if open_actionable == 0 and not blocked:
             # A fetch that found nothing to fix is the clean stop; a session
             # that ended before --record-run resumes by recording, not by
             # fixing (SKILL.md stopping condition 2).
             return answer(
                 "the last fetch found no actionable thread: record the run as clean",
                 f"{cmd['record']} --outcome clean --verification <passed|failed|skipped>",
+            )
+        if open_actionable == 0 and blocked:
+            # Nothing to fix, but a head-reviewing vendor has not cleared the
+            # head: zero threads is not clean yet, and a fix cycle would loop
+            # on unchanged code (references/reviewer-selection.md).
+            if blocked == "no_review_for_head":
+                return answer(
+                    "no thread is open but the head has no review yet: request one (the script "
+                    "answers review_pending if one is open), then wait",
+                    cmd["request"],
+                )
+            return answer(
+                f"no thread is open but the head overview blocks clean ({blocked}): read the "
+                "review itself and decide; re-fetch after any change, never report clean on this",
+                cmd["fetch"],
             )
         if facts.get("profile") is None:
             return answer(
