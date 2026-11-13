@@ -285,21 +285,19 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
                 cmd["fetch"],
             )
         return answer("fetch the reviewer's threads", cmd["fetch"])
-    if phase == "fetched":
-        open_actionable = run.get("open_actionable")
+    def nothing_to_fix() -> dict[str, str | None] | None:
+        """The terminal answer when the last fetch found no actionable thread,
+        or None when there is something to fix. Shared by ``fetched`` and
+        ``summarized``: the Stop-hook backstop stamps a summary on a clean
+        fetch too, and an unchanged HEAD then means "record", not "fix"."""
+        if run.get("open_actionable") != 0:
+            return None
         blocked = run.get("clean_blocked_by")
-        if open_actionable == 0 and not blocked:
-            # A fetch that found nothing to fix is the clean stop; a session
-            # that ended before --record-run resumes by recording, not by
-            # fixing (SKILL.md stopping condition 2).
-            return answer(
-                "the last fetch found no actionable thread: record the run as clean",
-                f"{cmd['record']} --outcome clean --verification <passed|failed|skipped>",
-            )
-        if open_actionable == 0 and blocked:
-            # Nothing to fix, but a head-reviewing vendor has not cleared the
-            # head: zero threads is not clean yet, and a fix cycle would loop
-            # on unchanged code (references/reviewer-selection.md).
+        failing = [c for c in (run.get("ci_failing") or []) if isinstance(c, str)]
+        if blocked:
+            # A head-reviewing vendor has not cleared the head: zero threads
+            # is not clean yet, and a fix cycle would loop on unchanged code
+            # (references/reviewer-selection.md).
             if blocked == "no_review_for_head":
                 return answer(
                     "no thread is open but the head has no review yet: request one (the script "
@@ -311,6 +309,33 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
                 "review itself and decide; re-fetch after any change, never report clean on this",
                 cmd["fetch"],
             )
+        if failing:
+            # SKILL.md stopping condition 6: a failing head check with no
+            # actionable thread left is ci_failed, never clean.
+            return answer(
+                f"no thread is open but {len(failing)} head check(s) failed ({', '.join(failing[:3])}): "
+                "record the run as ci_failed",
+                f"{cmd['record']} --outcome ci_failed --outcome-reason '{failing[0]}' "
+                "--verification <passed|failed|skipped>",
+            )
+        if loop_state.safe_int(run.get("ci_pending")) > 0:
+            return answer(
+                "no thread is open but head checks are still running: re-fetch once they finish, "
+                "then record",
+                cmd["fetch"],
+            )
+        # Nothing to fix and nothing blocking: the clean stop (SKILL.md
+        # stopping condition 2); a session that ended before --record-run
+        # resumes by recording.
+        return answer(
+            "the last fetch found no actionable thread: record the run as clean",
+            f"{cmd['record']} --outcome clean --verification <passed|failed|skipped>",
+        )
+
+    if phase == "fetched":
+        terminal = nothing_to_fix()
+        if terminal is not None:
+            return terminal
         if facts.get("profile") is None:
             return answer(
                 "save a verification profile before editing (the edit gate blocks until then)",
@@ -331,6 +356,9 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         # outranks the hard stop).
         if ahead:
             return answer(f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"])
+        terminal = nothing_to_fix()
+        if terminal is not None:
+            return terminal
         if cap_reached:
             return answer(
                 "cap reached: record the run, or raise the cap with --max-rereview-requests",
@@ -373,7 +401,14 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
     if phase == "waiting":
         wait = run.get("wait") if isinstance(run.get("wait"), dict) else {}
         snapshot = wait.get("last_snapshot") if isinstance(wait.get("last_snapshot"), dict) else {}
-        after = wait.get("after") or run.get("requested_at")
+        after = wait.get("after")
+        if requested_at and (not after or after < requested_at):
+            # The saved wait belongs to an earlier request (a blocking wait
+            # never resets the chunked anchor): its anchor would let the
+            # earlier answer satisfy this wait, and its progress is not this
+            # wait's. Anchor on the current request and start over.
+            after = requested_at
+            snapshot = {}
         anchor = f" --after {after}" if after else ""
         status = snapshot.get("status")
         if status == "refused":
