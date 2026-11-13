@@ -408,8 +408,21 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             f"{cmd['record']} --outcome clean --verification <passed|failed|skipped>",
         )
 
+    def stalled() -> dict[str, str | None] | None:
+        """The no_progress stop the last fetch prescribed (SKILL.md stopping
+        condition 5), while HEAD is still the head it saw; a commit since
+        is a new attempt the flag says nothing about."""
+        if run.get("no_progress") is not True or head_moved_since_fetch:
+            return None
+        return answer(
+            "the last fetch found the same open threads as the cycle before (no_progress): "
+            "record the run, do not fix or request again",
+            f"{cmd['record']} --outcome no_progress "
+            "--outcome-reason 'no code change resolved any open thread'",
+        )
+
     if phase == "fetched":
-        terminal = nothing_to_fix()
+        terminal = nothing_to_fix() or stalled()
         if terminal is not None:
             return terminal
         if facts.get("profile") is None:
@@ -439,7 +452,7 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             return answer(
                 f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"], local=True
             )
-        terminal = nothing_to_fix()
+        terminal = nothing_to_fix() or stalled()
         if terminal is not None:
             return terminal
         if cap_reached:
