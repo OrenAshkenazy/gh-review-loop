@@ -14,13 +14,16 @@ All notable changes to this project will be documented in this file. The format 
   `--cycle-summary`, the Stop-hook backstop included, sets `summarized`; a
   wait sets `waiting` and now keeps a timed-out or refused outcome in
   `run.wait.last_snapshot` instead of clearing it (`--wait-heartbeat` renders
-  a kept refusal); `request_rereview.py` sets `requested` with `requested_at`
+  a kept refusal) until a later wait, blocking or chunked, gets an answer;
+  `request_rereview.py` sets `requested` with `requested_at`
   and `requested_head` when it posts, when a POST is confirmed after an
   uncertain answer, when it waits on a push review, and when GitHub still
-  lists a request as pending. `--record-run` still clears the run block and
-  leaves `last_run` (outcome, time, session cycle) in its place. Transitions
-  are recorded, never enforced; the one pair that is never right, a request
-  straight after a fetch with no cycle summary between, prints one warning.
+  lists a request as pending (a `--dry-run` records nothing). `--record-run`
+  still clears the run block and leaves `last_run` (outcome, time, session
+  cycle) in its place. Transitions are recorded, never enforced: a phase
+  write that fails warns on stderr and never stops the wait or request, and
+  the one pair that is never right, a request straight after a fetch with no
+  cycle summary between, prints one warning.
   JSON fetches expose `loopStatus.phase`, `phaseAt`, `requestedAt` and
   `requestedHead`.
 
