@@ -204,10 +204,14 @@ def select_entry(
 # ---------------------------------------------------------------------------
 
 
-def commands(repo: str, pr: int) -> dict[str, str]:
+def commands(repo: str, pr: int, cwd: str | None = None) -> dict[str, str]:
+    """The commands ``Next:`` can name. With ``cwd`` (the ``--cwd`` checkout
+    the git facts came from) every git invocation is bound to it, so a
+    command copied from the block acts on the checkout that was judged."""
     fetch = python_script_command("fetch_gemini_threads.py")
     request = python_script_command("request_rereview.py")
     detect = python_script_command("detect_profile.py")
+    git = f'git -C "{cwd}"' if cwd else "git"
     url = f"https://github.com/{repo}/pull/{pr}"
     return {
         "url": url,
@@ -217,11 +221,11 @@ def commands(repo: str, pr: int) -> dict[str, str]:
             f"{fetch} --pr {url} --cycle-summary --fixed-count <n> "
             "--verification <passed|failed|skipped>"
         ),
-        "request": f'{request} --repo {repo} --pr {pr} --expect-head "$(git rev-parse HEAD)" --json',
-        "detect_profile": f'{detect} "$(git rev-parse --show-toplevel)"',
+        "request": f'{request} --repo {repo} --pr {pr} --expect-head "$({git} rev-parse HEAD)" --json',
+        "detect_profile": f'{detect} "$({git} rev-parse --show-toplevel)"',
         "record": f"{fetch} --pr {url} --record-run",
         "wait": f"{fetch} --pr {url} --wait",
-        "push": "git push",
+        "push": f"{git} push",
     }
 
 
@@ -271,29 +275,45 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
                 f"{cmd['record']} --outcome capped",
             )
         return answer("fix the findings, verify, then emit the cycle summary", cmd["summary"])
+    head = git.get("head")
+    requested_at = run.get("requested_at")
+    requested_head = run.get("requested_head")
     if phase == "summarized":
+        # Unpushed work is finished before the cap is applied: recording
+        # would tear the run down with the fixes unpublished (resume case 2
+        # outranks the hard stop).
+        if ahead:
+            return answer(f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"])
         if cap_reached:
             return answer(
                 "cap reached: record the run, or raise the cap with --max-rereview-requests",
                 f"{cmd['record']} --outcome capped",
             )
-        if ahead:
-            return answer(f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"])
+        # The Stop-hook backstop also stamps a summary. With nothing pushed
+        # since the fetch (HEAD is still the head the fetch saw) there is no
+        # fix to ask a review of; the findings are still to be fixed.
+        fetched_head = run.get("last_head_oid")
+        if fetched_head and head and ahead == 0 and head == fetched_head:
+            return answer(
+                "nothing pushed since the fetch: fix the findings, verify, then emit the cycle summary",
+                cmd["summary"],
+            )
         return answer("request the re-review for the pushed head", cmd["request"])
-    if phase == "requested":
-        requested_at = run.get("requested_at")
-        requested_head = run.get("requested_head")
+    if phase in ("requested", "waiting"):
+        # A push after the request, or a head the request did not cover,
+        # makes the request (and any wait on it) stale, whichever of the two
+        # phases the run is in.
         if ahead:
             return answer(
                 f"push ({ahead} local commit(s) after the request), then request again",
                 cmd["push"],
             )
-        head = git.get("head")
         if requested_head and head and ahead == 0 and head != requested_head:
             return answer(
                 f"the head moved after the request ({requested_head[:7]} -> {head[:7]}): request again",
                 cmd["request"],
             )
+    if phase == "requested":
         if requested_at:
             return answer(
                 "wait for the review that answers the request",
@@ -326,8 +346,12 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             )
         if status in ("waiting", "settling"):
             chunk = loop_state.safe_int(snapshot.get("next_wait_seconds")) or 60
+            # --timeout is the total budget across chunks (the default is
+            # 900): a continuation without it would cut the documented 1800
+            # in half and could time out at once.
             return answer(
-                f"continue the wait ({status})", f"{cmd['wait']}{anchor} --wait-chunk-seconds {chunk}"
+                f"continue the wait ({status})",
+                f"{cmd['wait']}{anchor} --wait-chunk-seconds {chunk} --timeout {WAIT_TIMEOUT_SECONDS}",
             )
         return answer(
             "the wait did not finish: re-run it",
@@ -368,14 +392,17 @@ def build_status(
     reservation_open: bool,
     provenance_incomplete: bool,
     cap_limit: int | None = None,
+    cwd: str | None = None,
     now: _dt.datetime | None = None,
 ) -> dict[str, Any]:
     """Everything the report prints, as one dict (the ``--format json`` body).
 
     ``cap_limit`` is the cap preferences.json holds now. The run block stores
-    the cap the last fetch saw; a cap raised since then (resume case 1) is
-    applied here, so the status stops saying "capped" the moment the user
-    raised it, before any fetch.
+    the cap the last fetch ran under; a preference raised above it since
+    (resume case 1) is applied here, so the status stops saying "capped" the
+    moment the user raised it, before any fetch. A preference at or below the
+    stored cap is not a change: the fetch may have run with a
+    ``--max-rereview-requests`` override, which wins over the preference.
     """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     run = entry.get("run") if isinstance(entry.get("run"), dict) else {}
@@ -383,9 +410,15 @@ def build_status(
     cap_used = run.get("cap_used")
     stored_limit = run.get("cap_limit")
     cap_raised = False
-    if isinstance(cap_limit, int) and isinstance(cap_used, int):
-        if isinstance(stored_limit, int) and cap_limit > stored_limit and run.get("cap_reached"):
-            cap_raised = True
+    # The stored limit is the cap the fetch ran under, which may be a
+    # --max-rereview-requests override above the preference. Only a higher
+    # preference is evidence of a change; a lower or equal one is the default
+    # the override already beat, and must not turn the run capped.
+    if (
+        isinstance(cap_limit, int) and isinstance(cap_used, int)
+        and isinstance(stored_limit, int) and cap_limit > stored_limit
+    ):
+        cap_raised = bool(run.get("cap_reached"))
         run["cap_limit"] = cap_limit
         run["cap_reached"] = cap_used >= cap_limit
     reviewer = entry.get("reviewer") if isinstance(entry.get("reviewer"), dict) else None
@@ -422,7 +455,7 @@ def build_status(
         )
 
     facts = {
-        "commands": commands(repo, pr),
+        "commands": commands(repo, pr, cwd),
         "reviewer": reviewer,
         "phase": phase,
         "run": run,
@@ -583,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
         reservation_open=loop_state.unconfirmed_request_path(repo, number).exists(),
         provenance_incomplete=loop_state.provenance_incomplete(repo, number),
         cap_limit=preferred_cap(prefs),
+        cwd=args.cwd,
     )
     if args.format == "json":
         print(json.dumps(status, indent=2, sort_keys=True))

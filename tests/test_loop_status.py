@@ -64,7 +64,12 @@ class TestDecideNext:
             (dict(phase="waiting", run=run("waiting", wait={"after": T, "last_snapshot": {"status": "refused", "kind": "quota_exhausted"}})), "out of quota", "--outcome human --outcome-reason 'reviewer quota exhausted'"),
             (dict(phase="waiting", run=run("waiting", wait={"after": T, "last_snapshot": {"status": "refused", "kind": "withdrawn"}})), "refused the review", "--outcome human --outcome-reason 'reviewer refused the review'"),
             (dict(phase="waiting", run=run("waiting", wait={"after": T, "last_snapshot": {"status": "timed_out"}})), "timed out", f"--wait --after {T} --timeout 1800"),
-            (dict(phase="waiting", run=run("waiting", wait={"after": T, "last_snapshot": {"status": "settling", "next_wait_seconds": 300}})), "continue the wait (settling)", f"--wait --after {T} --wait-chunk-seconds 300"),
+            (dict(phase="waiting", run=run("waiting", wait={"after": T, "last_snapshot": {"status": "settling", "next_wait_seconds": 300}})), "continue the wait (settling)", f"--wait --after {T} --wait-chunk-seconds 300 --timeout 1800"),
+            (dict(phase="summarized", run=run("summarized", cap_reached=True), git={**GIT, "ahead": 1}), "push the fixes (1", "git push"),
+            (dict(phase="summarized", run=run("summarized", last_head_oid="aaaaaaa1")), "nothing pushed since the fetch", "--cycle-summary"),
+            (dict(phase="summarized", run=run("summarized", last_head_oid="0000000")), "request the re-review", "--expect-head"),
+            (dict(phase="waiting", run=run("waiting", requested_at=T, requested_head="aaaaaaa1", wait={"after": T, "last_snapshot": {"status": "timed_out"}}), git={**GIT, "ahead": 1}), "push (1 local", "git push"),
+            (dict(phase="waiting", run=run("waiting", requested_at=T, requested_head="bbbbbbb2", wait={"after": T, "last_snapshot": {"status": "waiting"}})), "head moved", "request_rereview.py"),
             (dict(phase="waiting", run=run("waiting", requested_at=T)), "did not finish", f"--wait --after {T} --timeout 1800"),
             (dict(phase="bogus", run=run("bogus")), "unknown phase", f"--pr {URL}"),
         ],
@@ -74,12 +79,21 @@ class TestDecideNext:
             "summarized-pushed", "requested-ahead", "requested-head-moved",
             "requested-wait", "requested-no-anchor", "waiting-quota", "waiting-withdrawn",
             "waiting-timed-out", "waiting-settling", "waiting-no-snapshot", "unknown",
+            "summarized-capped-but-unpushed", "summarized-backstop-nothing-pushed",
+            "summarized-pushed-since-fetch", "waiting-ahead", "waiting-head-moved",
         ],
     )
     def test_table(self, over, action, command):
         nxt = loop_status.decide_next(facts(**over))
         assert action in nxt["action"], nxt
         assert command in (nxt["command"] or ""), nxt
+
+    def test_commands_bind_git_to_the_selected_checkout(self):
+        bound = loop_status.commands(REPO, 159, "/work/b")
+        assert bound["push"] == 'git -C "/work/b" push'
+        assert '$(git -C "/work/b" rev-parse HEAD)' in bound["request"]
+        assert '$(git -C "/work/b" rev-parse --show-toplevel)' in bound["detect_profile"]
+        assert loop_status.commands(REPO, 159)["push"] == "git push"
 
     def test_reviewer_outranks_everything_and_reservation_outranks_phase(self):
         assert "select a reviewer" in loop_status.decide_next(
@@ -206,7 +220,7 @@ class TestCli:
         assert any(line.startswith("Local: HEAD") and "1 ahead, 0 behind" in line for line in lines)
         assert "Profile: none saved" in lines
         assert lines[-2].startswith("Next: push the fixes (1")
-        assert lines[-1] == "  git push"
+        assert lines[-1] == f'  git -C "{checkout}" push'
         assert "\033[" not in out
 
     def test_json_is_the_same_decision_machine_readable(self, tmp_path, monkeypatch, capsys):
@@ -287,6 +301,22 @@ class TestCli:
         assert "Warning: the cap was raised to 5 since the last fetch" in out
         assert "Next: fix the findings, verify, then emit the cycle summary" in out
         assert "Profile: confirmed" in out
+
+    def test_a_preference_at_or_below_the_stored_cap_is_not_a_change(self, tmp_path, monkeypatch, capsys):
+        """The fetch may have run with --max-rereview-requests 5 while the
+        preference still says 3; the override won then and must not be
+        undone by status, which would turn cap_used=3 into capped."""
+        self._seed(tmp_path, monkeypatch, {
+            "reviewer": REVIEWER,
+            "run": run("fetched", cap_used=3, cap_limit=5, cap_reached=False, cap_count_complete=True),
+        })
+        (tmp_path / "preferences.json").write_text(json.dumps({
+            "max_rereview_requests": 3, "profiles": {REPO: {"source": "confirmed"}},
+        }))
+        _, out, _ = self._run(capsys, "--pr", URL)
+        assert "3/5 re-review requests used" in out
+        assert "cap was raised" not in out
+        assert "Next: fix the findings" in out
 
     def test_a_kept_refusal_is_shown_and_decides_the_next_step(self, tmp_path, monkeypatch, capsys):
         self._seed(tmp_path, monkeypatch, {
