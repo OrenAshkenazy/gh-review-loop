@@ -11,13 +11,13 @@ python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/loop_status.py"
 python3 "$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts/loop_status.py" --pr <URL>
 ```
 
-Relay the `[loop] status` block verbatim and run its `Next:` command. What it decides, in order: no persisted reviewer → select one; an open unconfirmed re-review reservation → `request_rereview.py` (it settles it first); then the phase:
+Relay the `[loop] status` block verbatim and run its `Next:` command. Local git facts count only when the checkout is on the PR's branch (recorded by the fetch); from another branch's checkout it names the mismatch and asks to re-run with `--cwd <the PR's checkout>` instead of a push or request. Every fetch-script command it prints carries the run's `--max-rereview-requests`. What it decides, in order: no persisted reviewer → select one; an open unconfirmed re-review reservation → `request_rereview.py` (it settles it first); then the phase:
 
 | Phase | Next |
 |---|---|
 | none | fetch; after `--record-run` the entry keeps `last_run` (outcome, time) and the next fetch starts a new loop |
-| `fetched` | no saved profile → the profile decision; cap reached → `--record-run --outcome capped` or raise the cap; else fix, verify, `--cycle-summary` |
-| `summarized` | local commits ahead of the upstream → `git push`; else `request_rereview.py --expect-head` |
+| `fetched` | no thread at the fetch and HEAD unchanged since → record (clean, `ci_failed`) or request the missing head review; no saved profile → the profile decision; cap reached → `--record-run --outcome capped` or raise the cap; else fix, verify, `--cycle-summary` |
+| `summarized` | local commits ahead of the upstream → `git push`; no thread at the fetch and HEAD unchanged since → record as for `fetched`; HEAD still the fetched head → fix, verify, `--cycle-summary`; else `request_rereview.py --expect-head` |
 | `requested` | commits after the request → push, then request again; head moved since the request → request again; else `--wait --after <requested_at>` |
 | `waiting` | kept `timed_out` → re-run the wait or record `--gemini-unconfirmed`; `refused` → record as human (quota: ask the user first); mid-wait → continue the chunked wait |
 

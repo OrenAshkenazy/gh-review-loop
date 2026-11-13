@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file. The format 
   request older than the head means request, a kept timed-out or refused wait
   means re-run it or record. The PR is picked from the checkout's active run,
   else its newest run block, else its last recorded run; `--pr` overrides.
+  A clean or `ci_failed` stop is recommended only while HEAD is still the
+  head the fetch classified. Local git facts count only when the checkout is
+  on the PR's branch (the fetch now records `head_ref` and `head_repo`); from
+  another branch's checkout, status names the mismatch instead of printing a
+  push or request command. Every printed command carries the run's
+  `--max-rereview-requests`, and `--cwd` and check names are shell-quoted.
   SKILL.md's two resume pointers now say to run it first.
 
 - **The loop phase is recorded.** The run block in state.json now carries

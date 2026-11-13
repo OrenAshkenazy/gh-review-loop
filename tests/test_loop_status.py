@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -76,12 +77,16 @@ class TestDecideNext:
             (dict(phase="summarized", run=run("summarized", cap_used=3, cap_limit=5, cap_reached=False)), "request the re-review", "--json --max-rereview-requests 5"),
             (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by=None, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
             (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by=None, cap_reached=True)), "record the run as clean", "--outcome clean"),
-            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_failing=["tests", "lint"])), "2 head check(s) failed (tests, lint)", "--outcome ci_failed --outcome-reason 'tests'"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_failing=["tests", "lint"])), "2 head check(s) failed (tests, lint)", "--outcome ci_failed --outcome-reason tests "),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_pending=2)), "checks are still running", f"--pr {URL}"),
             (dict(phase="fetched", run=run("fetched", open_actionable=1, ci_failing=["tests"])), "cycle summary", "--cycle-summary"),
             (dict(phase="waiting", run=run("waiting", requested_at="2026-11-12T12:00:00Z", wait={"after": T, "last_snapshot": {"status": "settling", "next_wait_seconds": 300}})), "did not finish", "--wait --after 2026-11-12T12:00:00Z --timeout 1800"),
             (dict(phase="waiting", run=run("waiting", requested_at=T)), "did not finish", f"--wait --after {T} --timeout 1800"),
             (dict(phase="bogus", run=run("bogus")), "unknown phase", f"--pr {URL}"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=0, clean_blocked_by=None, last_head_oid="0000000")), "request the re-review", "request_rereview.py"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, last_head_oid="0000000")), "HEAD moved since (0000000 -> aaaaaaa)", "--cycle-summary"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=0, ci_failing=["tests"], last_head_oid="0000000")), "request the re-review", "request_rereview.py"),
         ],
         ids=[
             "no-reviewer", "reservation", "no-run", "last-run", "fetched-no-profile",
@@ -94,6 +99,8 @@ class TestDecideNext:
             "fetched-clean", "fetched-no-head-review", "fetched-overview-blocked", "summarized-cap-forwarded",
             "summarized-after-backstop-clean", "summarized-clean-beats-cap", "fetched-ci-failed",
             "fetched-ci-pending", "fetched-ci-failed-with-threads", "waiting-stale-anchor",
+            "summarized-clean-but-pushed-since", "fetched-clean-but-head-moved",
+            "fetched-clean-same-head", "summarized-ci-failed-but-pushed-since",
         ],
     )
     def test_table(self, over, action, command):
@@ -103,10 +110,104 @@ class TestDecideNext:
 
     def test_commands_bind_git_to_the_selected_checkout(self):
         bound = loop_status.commands(REPO, 159, "/work/b")
-        assert bound["push"] == 'git -C "/work/b" push'
-        assert '$(git -C "/work/b" rev-parse HEAD)' in bound["request"]
-        assert '$(git -C "/work/b" rev-parse --show-toplevel)' in bound["detect_profile"]
+        assert bound["push"] == "git -C /work/b push"
+        assert "$(git -C /work/b rev-parse HEAD)" in bound["request"]
+        assert "$(git -C /work/b rev-parse --show-toplevel)" in bound["detect_profile"]
         assert loop_status.commands(REPO, 159)["push"] == "git push"
+
+    def test_a_checkout_path_is_shell_quoted(self):
+        bound = loop_status.commands(REPO, 159, '/work/my "b" $HOME')
+        assert bound["push"] == "git -C '/work/my \"b\" $HOME' push"
+
+    def test_a_check_name_with_a_quote_survives_the_shell(self):
+        nxt = loop_status.decide_next(facts(
+            phase="fetched",
+            run=run("fetched", open_actionable=0, clean_blocked_by=None, ci_failing=["Don't regress"]),
+        ))
+        reason = nxt["command"].split("--outcome-reason ", 1)[1].rsplit(" --verification", 1)[0]
+        proc = subprocess.run(["sh", "-c", f"printf %s {reason}"], capture_output=True, text=True, check=True)
+        assert proc.stdout == "Don't regress"
+
+    @pytest.mark.parametrize("phase, extra", [
+        ("fetched", {}),
+        ("fetched", {"open_actionable": 0, "clean_blocked_by": None, "ci_pending": 1}),
+        ("fetched", {"cap_reached": True}),
+        ("summarized", {"last_head_oid": "aaaaaaa1"}),
+        ("summarized", {}),
+        ("requested", {"requested_at": T}),
+        ("waiting", {"wait": {"after": T, "last_snapshot": {"status": "timed_out"}}}),
+    ])
+    def test_every_script_command_carries_the_runs_cap(self, phase, extra):
+        """Without it the request script refuses as capped, and a fetch,
+        summary, wait or record writes the preference back over the run's
+        --max-rereview-requests override."""
+        nxt = loop_status.decide_next(facts(
+            phase=phase, run=run(phase, cap_used=3, cap_limit=5, **extra),
+        ))
+        assert "--max-rereview-requests 5" in nxt["command"], nxt
+
+    def test_a_wrong_checkout_never_gets_a_push_or_request(self):
+        mismatch = "the checkout is on other, not the PR's branch fix/widget"
+        for over in (
+            dict(phase="summarized", run=run("summarized"), git={**GIT, "ahead": 2}),
+            dict(phase="summarized", run=run("summarized")),
+            dict(phase="requested", run=run("requested", requested_at=T, requested_head="bbbbbbb2")),
+            dict(reservation_open=True, phase="summarized"),
+        ):
+            nxt = loop_status.decide_next(facts(checkout_mismatch=mismatch, **over))
+            assert nxt["action"].startswith(mismatch + ": re-run status from the PR's checkout"), nxt
+            assert "loop_status.py" in nxt["command"] and "--cwd <the PR's checkout>" in nxt["command"]
+        # A command that does not act on the checkout is unaffected.
+        nxt = loop_status.decide_next(facts(
+            checkout_mismatch=mismatch, phase="requested", run=run("requested", requested_at=T),
+        ))
+        assert "--wait --after" in nxt["command"]
+
+
+class TestCheckoutMismatch:
+    PR_RUN = {"head_ref": "fix/widget", "head_repo": "acme/widget"}
+
+    @pytest.mark.parametrize("git, expected", [
+        ({"branch": "fix/widget", "upstream_branch": "fix/widget", "upstream_repo": "Acme/Widget"}, None),
+        ({"branch": "local-name", "upstream_branch": "fix/widget", "upstream_repo": "acme/widget"}, None),
+        ({"branch": "fix/widget", "upstream_branch": None, "upstream_repo": None}, None),
+        ({"branch": "other", "upstream_branch": "other", "upstream_repo": "acme/widget"}, "tracks acme/widget:other"),
+        ({"branch": "fix/widget", "upstream_branch": "fix/widget", "upstream_repo": "someone/widget"}, "tracks someone/widget:fix/widget"),
+        ({"branch": "other", "upstream_branch": None, "upstream_repo": None}, "is on other"),
+        ({"branch": None}, "HEAD is detached"),
+    ])
+    def test_branch_and_repo(self, git, expected):
+        got = loop_status.checkout_mismatch({"head": "h", **git}, self.PR_RUN)
+        if expected is None:
+            assert got is None
+        else:
+            assert expected in got and "acme/widget:fix/widget" in got
+
+    def test_unknown_without_a_recorded_branch(self):
+        assert loop_status.checkout_mismatch({"head": "h", "branch": "other"}, {}) is None
+
+    def test_local_git_reads_the_branch_and_what_it_tracks(self, tmp_path):
+        checkout = _checkout(tmp_path)
+        _track_upstream(tmp_path, checkout)
+        facts_ = loop_status.local_git(str(checkout))
+        assert facts_["branch"] == "main" and facts_["upstream_branch"] == "main"
+        assert facts_["upstream_repo"] is None  # the bare remote is not on GitHub
+        _git(checkout, "checkout", "-q", "--detach")
+        assert loop_status.local_git(str(checkout))["branch"] is None
+
+    def test_another_prs_branch_skips_the_git_facts(self, tmp_path):
+        checkout = _checkout(tmp_path)
+        _track_upstream(tmp_path, checkout)
+        _git(checkout, "commit", "-q", "--allow-empty", "-m", "unrelated")
+        status = loop_status.build_status(
+            REPO, 159, {"reviewer": REVIEWER, "run": run("summarized", head_ref="fix/widget")},
+            git=loop_status.local_git(str(checkout)), git_repo=REPO,
+            profile="confirmed", sentinel="absent", reservation_open=False, provenance_incomplete=False,
+        )
+        assert status["git"]["ahead"] is None
+        assert status["checkoutMismatch"] == "the checkout's branch main tracks main, not the PR's branch fix/widget"
+        assert "git facts skipped: the checkout's branch main tracks main" in " ".join(status["warnings"])
+        assert "re-run status from the PR's checkout" in status["next"]["action"]
 
     def test_reviewer_outranks_everything_and_reservation_outranks_phase(self):
         assert "select a reviewer" in loop_status.decide_next(
@@ -249,7 +350,7 @@ class TestCli:
         assert any(line.startswith("Local: HEAD") and "1 ahead, 0 behind" in line for line in lines)
         assert "Profile: none saved" in lines
         assert lines[-2].startswith("Next: push the fixes (1")
-        assert lines[-1] == f'  git -C "{checkout}" push'
+        assert lines[-1] == f"  git -C {shlex.quote(str(checkout))} push"
         assert "\033[" not in out
 
     def test_json_is_the_same_decision_machine_readable(self, tmp_path, monkeypatch, capsys):

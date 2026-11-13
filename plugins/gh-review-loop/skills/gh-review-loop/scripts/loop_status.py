@@ -22,6 +22,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from typing import Any
@@ -89,14 +90,65 @@ def repos_from_remotes(cwd: str | None = None) -> set[str]:
 
 
 def local_git(cwd: str | None = None) -> dict[str, Any]:
-    """HEAD, its upstream, and how far apart they are; None where unknown."""
+    """HEAD, its upstream, and how far apart they are; None where unknown.
+
+    Also the checked-out branch and the branch and repo its upstream points
+    at, so a caller can tell whether the checkout is the PR's branch at all.
+    """
     head = _git(["rev-parse", "HEAD"], cwd)
     upstream = _git(["rev-parse", "@{u}"], cwd) if head else None
     ahead = behind = None
     if upstream:
         ahead = _count(_git(["rev-list", "--count", "@{u}..HEAD"], cwd))
         behind = _count(_git(["rev-list", "--count", "HEAD..@{u}"], cwd))
-    return {"head": head or None, "upstream": upstream or None, "ahead": ahead, "behind": behind}
+    branch = _git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd) if head else None
+    upstream_branch = upstream_repo = None
+    if branch:
+        merge = _git(["config", f"branch.{branch}.merge"], cwd) or ""
+        if merge.startswith("refs/heads/"):
+            upstream_branch = merge[len("refs/heads/"):]
+        remote = _git(["config", f"branch.{branch}.remote"], cwd)
+        if remote:
+            # A remote name, or a URL when `gh pr checkout` tracks a fork
+            # it has no remote for.
+            upstream_repo = parse_origin_url(remote) or parse_origin_url(
+                _git(["remote", "get-url", remote], cwd)
+            )
+    return {
+        "head": head or None, "upstream": upstream or None, "ahead": ahead, "behind": behind,
+        "branch": branch or None, "upstream_branch": upstream_branch,
+        "upstream_repo": upstream_repo,
+    }
+
+
+def checkout_mismatch(git: dict[str, Any], run: dict[str, Any]) -> str | None:
+    """Why the checkout is not the PR's branch, or None when it is (or when
+    the run block does not say which branch the PR is on).
+
+    A checkout of the same repository on another PR's branch shares every
+    remote, so repository membership alone would hand that branch's HEAD and
+    ahead count to this PR's push and request commands.
+    """
+    head_ref = run.get("head_ref")
+    if not isinstance(head_ref, str) or not head_ref or not git.get("head"):
+        return None
+    head_repo = run.get("head_repo") if isinstance(run.get("head_repo"), str) else None
+    branch = git.get("branch")
+    tracked = git.get("upstream_branch")
+    tracked_repo = git.get("upstream_repo")
+    pr_branch = f"{head_repo}:{head_ref}" if head_repo else head_ref
+    if not branch:
+        return f"the checkout's HEAD is detached, not on the PR's branch {pr_branch}"
+    if tracked:
+        if tracked != head_ref or (
+            head_repo and tracked_repo and tracked_repo.casefold() != head_repo.casefold()
+        ):
+            where = f"{tracked_repo}:{tracked}" if tracked_repo else tracked
+            return f"the checkout's branch {branch} tracks {where}, not the PR's branch {pr_branch}"
+        return None
+    if branch != head_ref:
+        return f"the checkout is on {branch}, not the PR's branch {pr_branch}"
+    return None
 
 
 def _count(value: str | None) -> int | None:
@@ -227,10 +279,12 @@ def commands(repo: str, pr: int, cwd: str | None = None) -> dict[str, str]:
     fetch = python_script_command("fetch_gemini_threads.py")
     request = python_script_command("request_rereview.py")
     detect = python_script_command("detect_profile.py")
-    git = f'git -C "{cwd}"' if cwd else "git"
+    status = python_script_command("loop_status.py")
+    git = f"git -C {shlex.quote(cwd)}" if cwd else "git"
     url = f"https://github.com/{repo}/pull/{pr}"
     return {
         "url": url,
+        "status": f"{status} --pr {url} --cwd <the PR's checkout>",
         "fetch": f"{fetch} --pr {url}",
         "list_reviewers": f"{fetch} --pr {url} --list-reviewers --format json",
         "summary": (
@@ -259,15 +313,32 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
     run = facts.get("run") or {}
     git = facts.get("git") or {}
     ahead = git.get("ahead")
+    head = git.get("head")
     cap_reached = bool(run.get("cap_reached"))
     # The cap the run ran under may be a --max-rereview-requests override
-    # above the preference; the request script would fall back to the
-    # preference and refuse, so the command carries it.
+    # above the preference. Without it every script named here falls back to
+    # the preference: the request script refuses as capped, and a fetch,
+    # summary, wait or record writes the preference back over the run's cap.
+    # So every one of them carries it.
     cap_limit = run.get("cap_limit")
     if isinstance(cap_limit, int) and not isinstance(cap_limit, bool):
-        cmd["request"] = f"{cmd['request']} --max-rereview-requests {cap_limit}"
+        for name in ("fetch", "summary", "wait", "record", "request"):
+            cmd[name] = f"{cmd[name]} --max-rereview-requests {cap_limit}"
+    # The last fetch classified the head it saw. A different local HEAD is a
+    # commit made or pushed since, which that classification never covered.
+    fetched_head = run.get("last_head_oid")
+    head_moved_since_fetch = bool(fetched_head and head and head != fetched_head)
+    mismatch = facts.get("checkout_mismatch")
 
-    def answer(action: str, command: str | None) -> dict[str, str | None]:
+    def answer(action: str, command: str | None, *, local: bool = False) -> dict[str, str | None]:
+        if local and mismatch:
+            # A push or request from another branch's checkout acts on that
+            # branch (and request_rereview.py posts nothing on a head
+            # mismatch): send the caller to the PR's checkout instead.
+            return {
+                "action": f"{mismatch}: re-run status from the PR's checkout (then: {action})",
+                "command": cmd["status"],
+            }
         return {"action": action, "command": command}
 
     if not reviewer:
@@ -275,7 +346,7 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
     if facts.get("reservation_open"):
         return answer(
             "settle the earlier unconfirmed re-review request; the request script does it first",
-            cmd["request"],
+            cmd["request"], local=True,
         )
     if phase is None:
         last = facts.get("last_run")
@@ -289,8 +360,12 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         """The terminal answer when the last fetch found no actionable thread,
         or None when there is something to fix. Shared by ``fetched`` and
         ``summarized``: the Stop-hook backstop stamps a summary on a clean
-        fetch too, and an unchanged HEAD then means "record", not "fix"."""
-        if run.get("open_actionable") != 0:
+        fetch too, and an unchanged HEAD then means "record", not "fix".
+
+        Only for the head that fetch saw: once HEAD moved, the classification
+        says nothing about the new commits, and an explicit ``--outcome``
+        would end the run as clean even if a fresh fetch found findings."""
+        if run.get("open_actionable") != 0 or head_moved_since_fetch:
             return None
         blocked = run.get("clean_blocked_by")
         failing = [c for c in (run.get("ci_failing") or []) if isinstance(c, str)]
@@ -302,7 +377,7 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
                 return answer(
                     "no thread is open but the head has no review yet: request one (the script "
                     "answers review_pending if one is open), then wait",
-                    cmd["request"],
+                    cmd["request"], local=True,
                 )
             return answer(
                 f"no thread is open but the head overview blocks clean ({blocked}): read the "
@@ -315,7 +390,8 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             return answer(
                 f"no thread is open but {len(failing)} head check(s) failed ({', '.join(failing[:3])}): "
                 "record the run as ci_failed",
-                f"{cmd['record']} --outcome ci_failed --outcome-reason '{failing[0]}' "
+                # Check names come from GitHub verbatim: quote, never wrap.
+                f"{cmd['record']} --outcome ci_failed --outcome-reason {shlex.quote(failing[0])} "
                 "--verification <passed|failed|skipped>",
             )
         if loop_state.safe_int(run.get("ci_pending")) > 0:
@@ -346,8 +422,13 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
                 "cap reached: record the run, or raise the cap with --max-rereview-requests",
                 f"{cmd['record']} --outcome capped",
             )
+        if run.get("open_actionable") == 0 and head_moved_since_fetch:
+            return answer(
+                f"the fetch found no thread, but HEAD moved since ({fetched_head[:7]} -> {head[:7]}): "
+                "verify the new commits, emit the cycle summary, then have them reviewed",
+                cmd["summary"],
+            )
         return answer("fix the findings, verify, then emit the cycle summary", cmd["summary"])
-    head = git.get("head")
     requested_at = run.get("requested_at")
     requested_head = run.get("requested_head")
     if phase == "summarized":
@@ -355,7 +436,9 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         # would tear the run down with the fixes unpublished (resume case 2
         # outranks the hard stop).
         if ahead:
-            return answer(f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"])
+            return answer(
+                f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"], local=True
+            )
         terminal = nothing_to_fix()
         if terminal is not None:
             return terminal
@@ -367,13 +450,12 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         # The Stop-hook backstop also stamps a summary. With nothing pushed
         # since the fetch (HEAD is still the head the fetch saw) there is no
         # fix to ask a review of; the findings are still to be fixed.
-        fetched_head = run.get("last_head_oid")
         if fetched_head and head and ahead == 0 and head == fetched_head:
             return answer(
                 "nothing pushed since the fetch: fix the findings, verify, then emit the cycle summary",
                 cmd["summary"],
             )
-        return answer("request the re-review for the pushed head", cmd["request"])
+        return answer("request the re-review for the pushed head", cmd["request"], local=True)
     if phase in ("requested", "waiting"):
         # A push after the request, or a head the request did not cover,
         # makes the request (and any wait on it) stale, whichever of the two
@@ -381,12 +463,12 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
         if ahead:
             return answer(
                 f"push ({ahead} local commit(s) after the request), then request again",
-                cmd["push"],
+                cmd["push"], local=True,
             )
         if requested_head and head and ahead == 0 and head != requested_head:
             return answer(
                 f"the head moved after the request ({requested_head[:7]} -> {head[:7]}): request again",
-                cmd["request"],
+                cmd["request"], local=True,
             )
     if phase == "requested":
         if requested_at:
@@ -510,12 +592,17 @@ def build_status(
     active = loop_state.safe_int(run.get("update_seq")) > 0
 
     # Git facts only describe this PR when a remote of the checkout points at
-    # its repo: origin, or the upstream remote of a fork checkout.
+    # its repo (origin, or the upstream remote of a fork checkout) and the
+    # checkout is on the PR's branch, not another PR's branch of that repo.
     known = set(git_repos or ())
     if git_repo:
         known.add(git_repo.casefold())
     git_applies = repo.casefold() in known
-    git_facts = dict(git) if git_applies else {"head": None, "upstream": None, "ahead": None, "behind": None}
+    mismatch = checkout_mismatch(git, run) if git_applies else None
+    git_facts = (
+        dict(git) if git_applies and not mismatch
+        else {"head": None, "upstream": None, "ahead": None, "behind": None}
+    )
 
     warnings: list[str] = []
     if not git_applies:
@@ -523,6 +610,8 @@ def build_status(
             f"git facts skipped: no remote of the checkout points at {repo} "
             f"(origin is {git_repo or 'not a GitHub remote'})"
         )
+    elif mismatch:
+        warnings.append(f"git facts skipped: {mismatch}")
     elif git.get("head") and not git.get("upstream"):
         warnings.append("no upstream branch: unpushed work cannot be told")
     if provenance_incomplete:
@@ -551,6 +640,7 @@ def build_status(
         "profile": profile,
         "reservation_open": reservation_open,
         "last_run": last_run,
+        "checkout_mismatch": mismatch,
     }
     nxt = decide_next(facts)
     wait = run.get("wait") if isinstance(run.get("wait"), dict) else None
@@ -575,6 +665,7 @@ def build_status(
         "wait": wait.get("last_snapshot") if wait else None,
         "waitAfter": wait.get("after") if wait else None,
         "git": git_facts,
+        "checkoutMismatch": mismatch,
         "profile": profile,
         "sentinel": sentinel,
         "reservationOpen": reservation_open,
