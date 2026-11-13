@@ -23,7 +23,11 @@ All notable changes to this project will be documented in this file. The format 
   means re-run it or record. The PR is picked from the checkout's active run,
   else its newest run block, else its last recorded run; `--pr` overrides.
   A clean or `ci_failed` stop is recommended only while HEAD is still the
-  head the fetch classified. Local git facts count only when the checkout is
+  head the fetch classified; a fetch's `no_progress` verdict is kept on the
+  run block and becomes `--outcome no_progress` on resume under the same
+  rule. A blocking wait stores its `--after` anchor with its timed-out or
+  refused outcome, so status keeps it instead of discarding it as an
+  earlier wait's. Local git facts count only when the checkout is
   on the PR's branch (the fetch now records `head_ref` and `head_repo`); from
   another branch's checkout, status names the mismatch instead of printing a
   push or request command. Every printed command carries the run's

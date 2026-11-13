@@ -19,6 +19,7 @@ import pytest
 
 import fetch_gemini_threads as fgt
 import loop_state
+import loop_status
 import request_rereview
 from conftest import stub_cap_check_known_under_cap
 from fetch_gemini_threads import PullRequest
@@ -238,6 +239,9 @@ class TestWaitPhase:
         run = run_block()
         assert run["phase"] == "waiting"
         assert run["wait"]["last_snapshot"]["status"] == "timed_out"
+        # A blocking wait keeps its anchor, so status knows the outcome
+        # answers this request and not an earlier one.
+        assert run["wait"]["after"] == REREVIEW_AT
 
     @pytest.mark.parametrize("mode", ["blocking", "chunked"])
     def test_a_refusal_is_kept_not_cleared(self, loop, monkeypatch, capsys, mode):
@@ -253,8 +257,25 @@ class TestWaitPhase:
         run = run_block()
         assert run["phase"] == "waiting"
         assert run["wait"]["last_snapshot"]["status"] == "refused"
+        assert run["wait"]["after"] == after
         heartbeat, _ = run_main(monkeypatch, capsys, "--wait-heartbeat", fmt=None)
         assert "refused the review" in heartbeat
+        # A resume reads the refusal back as the quota stop, not "re-run the wait".
+        status = loop_status.build_status(
+            "acme/widget", 159,
+            {"reviewer": {"login": CODEX}, "run": {**run_block(), "requested_at": after}},
+            git={"head": None}, git_repo=None, profile="confirmed", sentinel="fresh",
+            reservation_open=False, provenance_incomplete=False,
+        )
+        assert "out of quota" in status["next"]["action"]
+
+    def test_the_no_progress_verdict_is_kept_for_a_resume(self, loop, monkeypatch, capsys):
+        """Two fetches over the same open threads prescribe the no_progress
+        stop; status must see it after the session that printed it is gone."""
+        select_codex(monkeypatch, capsys)
+        assert run_block()["no_progress"] is False
+        run_main(monkeypatch, capsys)
+        assert run_block()["no_progress"] is True
 
     @pytest.mark.parametrize("mode", ["blocking", "chunked"])
     def test_a_phase_write_that_fails_does_not_abort_the_wait(self, loop, monkeypatch, capsys, mode):

@@ -2890,7 +2890,12 @@ def read_wait_state(pr: PullRequest) -> dict[str, Any]:
     return dict(wait) if isinstance(wait, dict) else {}
 
 
-def _update_wait_state(pr: PullRequest, updates: dict[str, Any]) -> None:
+def _update_wait_state(
+    pr: PullRequest, updates: dict[str, Any], *, after_iso: str | None = None
+) -> None:
+    """Merge ``updates`` into the run's wait state. With ``after_iso`` the
+    state is first re-anchored on it, dropping progress kept under another
+    anchor (the reset rule of ``begin_wait_chunk``)."""
     key = _state_key(pr)
 
     def mutate(state: dict[str, Any]) -> None:
@@ -2900,6 +2905,8 @@ def _update_wait_state(pr: PullRequest, updates: dict[str, Any]) -> None:
         run = dict(run) if isinstance(run, dict) else {}
         wait = run.get("wait")
         wait = dict(wait) if isinstance(wait, dict) else {}
+        if after_iso is not None and wait.get("after") != after_iso:
+            wait = {"after": after_iso}
         wait.update(updates)
         run["wait"] = wait
         entry["run"] = run
@@ -2916,9 +2923,15 @@ def save_wait_settle(pr: PullRequest, fingerprint: str, since_iso: str) -> None:
     _update_wait_state(pr, {"stable_fingerprint": fingerprint, "stable_since": since_iso})
 
 
-def save_wait_snapshot(pr: PullRequest, snapshot: dict[str, Any]) -> None:
-    """Persist the last non-ready chunk result for --wait-heartbeat rendering."""
-    _update_wait_state(pr, {"last_snapshot": dict(snapshot)})
+def save_wait_snapshot(
+    pr: PullRequest, snapshot: dict[str, Any], *, after_iso: str | None = None
+) -> None:
+    """Persist the last non-ready wait result for --wait-heartbeat rendering.
+
+    A blocking wait opens no chunk state, so it passes its ``--after``
+    anchor here: without one, a later read cannot tell the snapshot answers
+    the current request and discards it as an earlier wait's."""
+    _update_wait_state(pr, {"last_snapshot": dict(snapshot)}, after_iso=after_iso)
 
 
 def clear_wait_state(pr: PullRequest) -> None:
@@ -3546,14 +3559,18 @@ def detect_no_progress(pr: PullRequest, current_fingerprint: str) -> bool:
             run = {}
         prev_fingerprint = run.get("thread_fingerprint")
         update_seq = _safe_int(run.get("update_seq", 0))
-        run["thread_fingerprint"] = current_fingerprint
-        entry["run"] = run
-        state[key] = entry
-        return bool(
+        stalled = bool(
             prev_fingerprint
             and prev_fingerprint == current_fingerprint
             and update_seq >= 2
         )
+        run["thread_fingerprint"] = current_fingerprint
+        # Kept so a local read (loop_status.py) sees the stop this fetch
+        # prescribed after the session that saw it is gone.
+        run["no_progress"] = stalled
+        entry["run"] = run
+        state[key] = entry
+        return stalled
 
     return mutate_sticky_state(mutate)
 
@@ -5437,7 +5454,10 @@ def main() -> int:
                 # (the chunked wait clears on ready the same way).
                 clear_wait_state(pr)
             except ReviewerRefused as refused:
-                save_wait_snapshot(pr, {"status": "refused", "author": args.author, **refused.refusal})
+                save_wait_snapshot(
+                    pr, {"status": "refused", "author": args.author, **refused.refusal},
+                    after_iso=args.after,
+                )
                 print_reviewer_refusal(
                     {"status": "refused", **refused.refusal},
                     author=args.author,
@@ -5457,7 +5477,7 @@ def main() -> int:
                     "author": args.author,
                     "elapsed_seconds": timed_out.elapsed_seconds,
                     "ci": timed_out_ci,
-                })
+                }, after_iso=args.after)
                 if args.format == "json":
                     print(
                         json.dumps(

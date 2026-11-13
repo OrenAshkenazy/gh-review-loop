@@ -87,6 +87,10 @@ class TestDecideNext:
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, last_head_oid="0000000")), "HEAD moved since (0000000 -> aaaaaaa)", "--cycle-summary"),
             (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
             (dict(phase="summarized", run=run("summarized", open_actionable=0, ci_failing=["tests"], last_head_oid="0000000")), "request the re-review", "request_rereview.py"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=2, no_progress=True, last_head_oid="aaaaaaa1")), "(no_progress)", "--record-run --outcome no_progress"),
+            (dict(phase="summarized", run=run("summarized", open_actionable=2, no_progress=True, last_head_oid="aaaaaaa1")), "(no_progress)", "--outcome no_progress"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=2, no_progress=True, last_head_oid="0000000")), "fix the findings", "--cycle-summary"),
+            (dict(phase="fetched", run=run("fetched", open_actionable=0, clean_blocked_by=None, no_progress=True, last_head_oid="aaaaaaa1")), "record the run as clean", "--outcome clean"),
         ],
         ids=[
             "no-reviewer", "reservation", "no-run", "last-run", "fetched-no-profile",
@@ -101,6 +105,8 @@ class TestDecideNext:
             "fetched-ci-pending", "fetched-ci-failed-with-threads", "waiting-stale-anchor",
             "summarized-clean-but-pushed-since", "fetched-clean-but-head-moved",
             "fetched-clean-same-head", "summarized-ci-failed-but-pushed-since",
+            "fetched-no-progress", "summarized-no-progress", "fetched-no-progress-but-head-moved",
+            "fetched-clean-beats-no-progress",
         ],
     )
     def test_table(self, over, action, command):
