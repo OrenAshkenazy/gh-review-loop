@@ -431,8 +431,27 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             "--outcome-reason 'no code change resolved any open thread'",
         )
 
+    def churned() -> dict[str, str | None] | None:
+        """The churn stop (SKILL.md stopping condition 7): on cycle 2+, every
+        new finding of the last fetch landed on lines the loop changed. The
+        rule is ``churn_detected`` in fetch_gemini_threads.py, over the
+        fields that fetch kept; same head rule as ``stalled``."""
+        if head_moved_since_fetch:
+            return None
+        induced = run.get("cycle_fix_induced_fps")
+        induced = len(induced) if isinstance(induced, list) else 0
+        new = loop_state.safe_int(run.get("cycle_new_findings"))
+        if not (new and induced >= new and loop_state.safe_int(run.get("session_cycle")) >= 2):
+            return None
+        return answer(
+            f"churn: all {new} new finding(s) of the last fetch land on lines this loop changed; "
+            "record the run, or continue only if the user asked to ignore churn",
+            f"{cmd['record']} --outcome churn "
+            "--outcome-reason 'the reviewer is reviewing the fixes, not the PR'",
+        )
+
     if phase == "fetched":
-        terminal = nothing_to_fix() or stalled()
+        terminal = nothing_to_fix() or stalled() or churned()
         if terminal is not None:
             return terminal
         if facts.get("profile") is None:
@@ -462,7 +481,7 @@ def decide_next(facts: dict[str, Any]) -> dict[str, str | None]:
             return answer(
                 f"push the fixes ({ahead} local commit(s) not on the upstream)", cmd["push"], local=True
             )
-        terminal = nothing_to_fix() or stalled()
+        terminal = nothing_to_fix() or stalled() or churned()
         if terminal is not None:
             return terminal
         if cap_reached:
