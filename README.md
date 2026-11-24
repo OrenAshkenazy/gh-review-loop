@@ -15,14 +15,14 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
-![A Claude Code session running gh-review-loop: the reviewer flagged 2 sites, the sweep finds 3 more, the tests pass, one re-review is requested and the PR comes back clean](docs/gh-review-loop-demo.gif)
+![A Claude Code session running gh-review-loop: Codex flagged 2 sites, the sweep finds 3 more, the tests pass, one re-review is requested and the PR comes back clean](docs/gh-review-loop-demo.gif)
 
-<sub>A staged session over a real review. The two findings are Sourcery's actual comments on [PR #67](https://github.com/OrenAshkenazy/gh-review-loop/pull/67), and the pattern, sweep report, and receipt lines are the shipping scripts' output on them ([`docs/demo/build_demo.py`](docs/demo/build_demo.py) rebuilds the GIF from those scripts). Reproduce the sweep yourself: `python3 evals/replay/replay.py`.</sub>
+<sub>A staged session over a real review. The two findings are Codex's actual comments on [PR #129](https://github.com/OrenAshkenazy/gh-review-loop/pull/129), and the pattern, sweep report, and receipt lines are the shipping scripts' output on them ([`docs/demo/build_demo.py`](docs/demo/build_demo.py) rebuilds the GIF from those scripts). The fix, the push, and the clean re-review are staged. Reproduce the sweep yourself: `python3 evals/replay/replay.py`.</sub>
 
 A plugin for **Claude Code** and **Codex** that clears AI reviewer feedback on your PR without you leaving the terminal. Three things set it apart:
 
 - **It sweeps the class, not the instance.** When the reviewer flags a pattern at two sites, the loop finds the sibling sites it didn't flag and fixes them in the same cycle, so they don't come back as round two and round three.
-- **It won't push red.** Every push is gated on your repo's own tests and linters.
+- **It won't push red.** Save a verification profile once and every push is gated on your repo's own tests and linters.
 - **It has a brake.** Re-review requests are hard-capped (default 3), enforced by the script that posts them, so the loop can't spam your PR.
 
 Works with the AI reviewer your repo already has: Claude Code, Codex, GitHub Copilot and Gemini Code Assist are built in, and CodeRabbit, Qodo, Sourcery and others are configurable. MIT, no server, no account, no vendor plan.
@@ -74,6 +74,22 @@ Intersecting across sites is the token sweep's safety property: a candidate has 
 
 Everything else it does (reading `isResolved`/`isOutdated` off the `reviewThreads` GraphQL, honoring a maintainer's *"wontfix"* reply, sorting by severity, keeping one live-edited status comment instead of comment spam) is table stakes done carefully. Correct, but not why you'd pick this.
 
+## One defect, six copies, five reviews
+
+The demo PRs hold six copies of one mistake: `json.loads(path.read_text())` followed by `data.get(...)`, in two files. Here is what the reviewers made of it:
+
+| Review | Flagged |
+|---|---|
+| Sourcery, [PR #67](https://github.com/OrenAshkenazy/gh-review-loop/pull/67) | 2 of 6, worded two different ways |
+| Sourcery, the same file contents re-pushed | 1 of 6 |
+| Codex, PR #67 | none |
+| Codex, [PR #129](https://github.com/OrenAshkenazy/gh-review-loop/pull/129) (the same loaders, with the contract written into the docstrings) | 1 of 6, with the other five named in prose |
+| Codex, PR #129 after one more commit | 1 more, in the other file |
+
+None of these reviews is wrong. A reviewer bot samples a diff; it does not enumerate it, and the same bot on the same code does not return the same sample twice. So the wording of a finding is not a stable way to group findings, and "fix what was flagged" leaves the rest for the next round.
+
+That is why the loop groups findings by the code they anchor to and then searches the diff itself. On the two-finding reviews above it reports three of the four unflagged copies. The one it misses returns `data.get("pinned", [])`, which does not share the `{})` token: the sweep reports what the flagged lines have in common and nothing looser. The captures and the exact output are in [`evals/replay/`](evals/replay/).
+
 ## Use it
 
 From a repo with an open GitHub PR:
@@ -111,7 +127,7 @@ An agent that pushes to your branch should be easy to bound. The cap is enforced
 |---|---|
 | Commit and push fixes to the PR branch, after your verification profile passes (pick `Skip` in the profile menu and there is no gate) | Push when a required check fails, or merge anything |
 | Post re-review requests, up to the cap. `request_rereview.py` counts prior requests at write time and refuses past it | Exceed the cap, or post when it can't establish the count (an uncountable write is an uncapped write) |
-| Resolve threads that are already outdated, or that a maintainer answered with a substantive reply | Resolve an unresolved thread, approve, or request changes, unless you explicitly ask |
+| Resolve threads that are already outdated, or that a maintainer answered with a substantive reply | Resolve any other open thread, approve, or request changes, unless you explicitly ask |
 | Keep one PR comment with the receipt, edited in place | Leave a comment per cycle |
 | Report failing CI checks on the head, with the command to read the log | Try to fix CI |
 | Sweep for sibling sites inside the PR's changed files, and show the report before editing | Read or edit files outside your diff for a sweep |
@@ -167,7 +183,7 @@ Checkable claims, with the honest scope of each:
 | Audit trail + local stats | One live-edited PR comment, per-run receipts, per-repo aggregates via `--stats`. Never transmitted | `metrics.py` |
 | Zero infrastructure | Stdlib Python + `gh` + `git`. No SDK, no server, no account | all scripts |
 
-**Reproduce the sweep.** [`python3 evals/replay/replay.py`](evals/replay/) runs two captured Sourcery reviews of [PR #67](https://github.com/OrenAshkenazy/gh-review-loop/pull/67) through the clustering and sweep code — no network, no arguments, stdlib only. The fixtures are that reviewer's real payloads, copied verbatim from the GitHub API rather than written for the demo. Run 1 merges two differently-worded findings into one pattern and reports 3 unflagged siblings; run 2 yields one site and correctly no sweep, because the same reviewer returned different findings on identical file contents.
+**Reproduce the sweep.** [`python3 evals/replay/replay.py`](evals/replay/) runs three captured reviews through the clustering and sweep code: two by Sourcery on [PR #67](https://github.com/OrenAshkenazy/gh-review-loop/pull/67) and one by Codex on [PR #129](https://github.com/OrenAshkenazy/gh-review-loop/pull/129). No network, no arguments, stdlib only. The fixtures are those reviewers' real payloads, copied from the GitHub API rather than written for the demo, and [`evals/replay/README.md`](evals/replay/README.md) says how each was obtained. Where a review flagged two sites, the two differently-worded findings merge into one pattern and the sweep reports 3 unflagged siblings; where it flagged one, there is correctly no sweep.
 
 If you're comparing alternatives, the closest is [pbakaus/agent-reviews](https://github.com/pbakaus/agent-reviews) — broader bot coverage and a nicer CLI, no test gate, no hard round cap, no sibling sweep.
 
@@ -253,13 +269,10 @@ Persistent settings live in `~/.config/gh-review-loop/preferences.json`.
 
 ### Set the loop cap
 
-Default is 3 re-review requests per PR. To change it for one run, say so (*"do 4 cycles"*). To change it for good, say *"always use 4 cycles"*, or set `max_rereview_requests` yourself:
+Default is 3 re-review requests per PR. To change it for one run, say so (*"do 4 cycles"*). To change it for good, say *"always use 4 cycles"*, or add the key to the file yourself. Add it to what is already there; the same file holds your verification profiles and judge settings:
 
 ```json
-{
-  "max_rereview_requests": 4,
-  "schema_version": 2
-}
+"max_rereview_requests": 4
 ```
 
 <details>

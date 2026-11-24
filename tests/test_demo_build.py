@@ -28,6 +28,7 @@ def test_demo_transcript_builds_from_the_real_formatters():
     output = builder.loop_output()
 
     # The headline claim: two flagged sites, three unflagged siblings.
+    assert output["severity"] == "2 medium", "Codex's P2 badges must be read"
     assert output["threads"] == 2
     assert output["siblings"] == 3
     assert any("3 unflagged site(s)" in line for line in output["sweep"])

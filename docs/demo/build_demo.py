@@ -4,8 +4,8 @@
 The demo is a staged Claude Code session, but the loop's own lines are not
 hand-written: every script-owned block (thread header, Patterns, the sweep
 report, the verification profile, receipt pointers, the PR receipt) is
-produced here by calling the shipping formatters on the reviewer findings
-captured from PR #67 (the same fixtures evals/replay/ replays). Change a
+produced here by calling the shipping formatters on the Codex findings
+captured from PR #129 (the capture evals/replay/ replays as "codex"). Change a
 formatter and the demo changes with it on the next build.
 
     python3 -m venv /tmp/demo-venv && /tmp/demo-venv/bin/pip install pillow
@@ -24,6 +24,7 @@ import base64
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,13 +52,17 @@ WIDTH, HEIGHT = 1200, 760
 PALETTE_SIZE = 128
 
 REPO = "OrenAshkenazy/gh-review-loop"
-PR_NUMBER = 67
+PR_NUMBER = 129
+PR_BRANCH = "demo/sweep-proof-codex"
 PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
-REVIEWER_LOGIN = "sourcery-ai"
-REVIEWER_NAME = "Sourcery"
+CAPTURE = "codex.json"
+REVIEWER_LOGIN = "chatgpt-codex-connector"
+REVIEWER_NAME = "Codex"
+REVIEW_TRIGGER = "@codex review"
 # Staged values: the fix commit and receipt comment of the run being depicted.
 FIX_SHA = "9c41e07"
 RECEIPT_URL = f"{PR_URL}#issuecomment-4391207715"
+RECEIPT_TIME = "2026-11-24T22:03:02Z"
 CAP = 3
 SCRIPT_PATH = '"$GGRL_PLUGIN_ROOT/skills/gh-review-loop/scripts'
 
@@ -70,16 +75,19 @@ STAGES = ["fetch", "cluster", "sweep", "fix", "verify", "push", "re-review", "cl
 
 
 def loop_output() -> dict[str, Any]:
-    payload = json.loads((FIXTURES / "run1.json").read_text(encoding="utf-8"))
+    payload = json.loads((FIXTURES / CAPTURE).read_text(encoding="utf-8"))
+    if payload["source"] != PR_URL:
+        raise SystemExit(f"error: {CAPTURE} was captured from {payload['source']}, not {PR_URL}")
     threads = payload["threads"]
-    clusters = cluster_findings.cluster(threads, root=FIXTURES / "src")
+    source_root = FIXTURES / payload["source_root"]
+    clusters = cluster_findings.cluster(threads, root=source_root)
     multi = [c for c in clusters if c.count >= sweep_siblings.MIN_FLAGGED_SITES]
     sweep = sweep_siblings.sweep(
         signature=multi[0].signature,
         label=multi[0].label,
         sites=list(multi[0].sites),
         changed_files=payload["changed_files"],
-        root=FIXTURES / "src",
+        root=source_root,
     )
     siblings = sum(1 for line in sweep_siblings.render_report(sweep).splitlines()
                    if line.lstrip().startswith("+ "))
@@ -102,12 +110,25 @@ def loop_output() -> dict[str, Any]:
           "comments": {"nodes": []}, "reviewThreads": {"nodes": []}}
     header = fetch_gemini_threads.render_markdown(
         pr, [], REVIEWER_LOGIN, reviewer_name=REVIEWER_NAME,
-        review_trigger_mention=f"@{REVIEWER_LOGIN} review",
+        review_trigger_mention=REVIEW_TRIGGER,
     ).splitlines()
     # The header is rendered without threads so the fixture's flattened thread
     # shape never reaches the raw-PR helpers; restore the real count.
     header = [f"Threads: {len(threads)}" if line.startswith("Threads:") else line
               for line in header if line.strip()]
+
+    severities = fetch_gemini_threads.severity_counts(threads)
+    breakdown = ", ".join(f"{severities[name]} {name}"
+                          for name in ("critical", "high", "medium", "low", "unknown")
+                          if severities.get(name))
+
+    def receipt(record: dict[str, Any]) -> str:
+        body = fetch_gemini_threads.build_receipt_comment_body(
+            [metrics.format_run_summary(record, terminal=True),
+             metrics.format_suite_block(details)],
+            status="DONE")
+        # The body stamps the wall clock; pin it so a rebuild is byte-identical.
+        return re.sub(r"Last updated: \S+\.", f"Last updated: {RECEIPT_TIME}.", body)
 
     base = {"findings_fetched": len(threads), "fixed_count": len(threads),
             "cycle_cap": CAP, "verification": "passed", "session_cycle": 1}
@@ -115,7 +136,20 @@ def loop_output() -> dict[str, Any]:
     terminal = {**base, "remaining_actionable": 0, "cycles_used": 1,
                 "outcome": "clean", "duration_seconds": 6 * 60 + 12,
                 "terminal_breakdown": {"confirmed_fixed_outdated": len(threads)}}
+    # The fix shown is staged, but it is drawn on the first flagged site's real
+    # lines, so the diff in the demo is the code the reviewer anchored to.
+    path, _, span = multi[0].sites[0].rpartition(":")
+    first = int(span.split("-")[0])
+    source = (source_root / path).read_text(encoding="utf-8").splitlines()
     return {
+        "signature": multi[0].signature,
+        "fix_path": path,
+        "fix_rows": [
+            (str(first - 1), "", source[first - 2]),
+            (str(first), "-", source[first - 1]),
+            (str(first), "+", "    data = _read_json_object(path)"),
+            (str(first + 1), "", source[first]),
+        ],
         "threads": len(threads),
         "siblings": siblings,
         "header": header,
@@ -128,8 +162,8 @@ def loop_output() -> dict[str, Any]:
             findings_new=len(threads), findings_carried=0),
         "summary_pointer": metrics.format_compact_receipt_line(
             terminal, terminal=True, receipt_url=RECEIPT_URL),
-        "receipt": (metrics.format_run_summary(terminal, terminal=True) + "\n\n"
-                    + metrics.format_suite_block(details)).splitlines(),
+        "severity": breakdown,
+        "receipt": receipt(terminal),
     }
 
 
@@ -223,10 +257,10 @@ def timeline(o: dict[str, Any]) -> list[dict[str, Any]]:
     frame(2600, stage=1, add=tool(
         "Bash", f'python3 {SCRIPT_PATH}/fetch_gemini_threads.py"', fetch_out),
         spinner="Clustering findings… (14s · esc to interrupt)",
-        caption="Clusters findings by pattern: two comments, one defect")
+        caption="Clusters findings by code shape: two comments, one pattern")
     frame(1400, add=say(
         f"[loop] session cycle 1 — re-review cap: 0/{CAP} consumed. "
-        f"{o['threads']} actionable thread(s) (severity: {o['threads']} unknown). Fixing."))
+        f"{o['threads']} actionable thread(s) (severity: {o['severity']}). Fixing."))
 
     sweep_out = []
     for line in o["sweep"]:
@@ -237,21 +271,16 @@ def timeline(o: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             sweep_out.append(loop_line(line))
     frame(3800, stage=2, add=tool(
-        "Bash", f'python3 {SCRIPT_PATH}/sweep_siblings.py" --signature shape:802659ea …', sweep_out),
+        "Bash", f'python3 {SCRIPT_PATH}/sweep_siblings.py" --signature {o["signature"]} …', sweep_out),
         spinner="Sweeping siblings… (31s · esc to interrupt)",
-        caption=f"The reviewer flagged {o['threads']}. The sweep finds the other {o['siblings']}.")
-    total = o["threads"] + o["siblings"]
+        caption=f"Codex flagged {o['threads']}. The sweep finds {o['siblings']} more.")
     frame(1500, stage=3, add=say(
         f"The sweep reported {o['siblings']} unflagged siblings of the flagged pattern. "
-        f"Fixing all {total} sites this cycle."),
+        f"Fixing them with the {o['threads']} flagged sites this cycle."),
         spinner="Fixing… (48s · esc to interrupt)",
         caption="Fixes the whole class in one cycle, not one instance per round")
     frame(1500, add=diff(
-        "loaders/profiles.py", "Updated loaders/profiles.py with 13 additions and 3 removals",
-        [("15", "", '    """Read one exported verification profile."""'),
-         ("16", "-", '    data = json.loads(path.read_text(encoding="utf-8"))'),
-         ("16", "+", "    data = _read_json_object(path)"),
-         ("17", "", '    return data.get("profile", {})')]),
+        o["fix_path"], f"Updated {o['fix_path']} with 13 additions and 3 removals", o["fix_rows"]),
         spinner="Fixing… (1m 12s · esc to interrupt)")
     frame(700, add=tool("Update", "loaders/bundle.py",
                          ["Updated loaders/bundle.py with 4 additions and 3 removals"]))
@@ -299,38 +328,55 @@ def timeline(o: dict[str, Any]) -> list[dict[str, Any]]:
         f"[loop] DONE — 0 actionable threads remaining. Re-review requests used: 1/{CAP}."))
     frame(1900, add=say(o["summary_pointer"]), spinner="", stage=8)
 
-    frame(3400, overlay=receipt_card(o),
+    frame(3400, overlay=receipt_card(o["receipt"]),
           caption="The full receipt lives on the PR, edited in place as the loop runs")
     frame(4200, overlay=end_card(o), caption="")
     return frames
 
 
-def receipt_card(o: dict[str, Any]) -> str:
-    code = "\n".join(loop_line(line) for line in o["receipt"])
+def receipt_card(body: str) -> str:
+    """Render a sticky-receipt comment body the way GitHub shows it."""
+    parts: list[str] = []
+    fenced = False
+    block: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("```"):
+            if fenced:
+                parts.append("<pre>" + "\n".join(loop_line(row) for row in block) + "</pre>")
+                block = []
+            fenced = not fenced
+        elif fenced:
+            block.append(line)
+        elif line.startswith("### "):
+            title, _, status = line[4:].rpartition(" — ")
+            parts.append(f'<h3>{esc(title)} — <span class="st {status.lower()}">{esc(status)}</span></h3>')
+        elif line.startswith("_") and line.endswith("_"):
+            parts.append(f'<p class="ghdim"><i>{esc(line.strip("_"))}</i></p>')
+        elif line.startswith("<!--") or not line.strip():
+            continue
+        elif line.lstrip().startswith("https://"):
+            parts.append(f'<div class="ghline link">{esc(line)}</div>')
+        else:
+            parts.append(f'<div class="ghline">{esc(line)}</div>')
     return f"""
 <div class="scrim"></div>
 <div class="ghcard">
   <div class="ghhead"><span class="avatar"></span><b>OrenAshkenazy</b> commented
     <span class="ghdim">· edited</span>
     <span class="ghright">{esc(REPO)} <b>#{PR_NUMBER}</b></span></div>
-  <div class="ghbody">
-    <h3>gh-review-loop receipt — <span class="done">DONE</span></h3>
-    <pre>{code}</pre>
-    <p class="ghdim"><i>This comment is edited in place as the loop progresses.</i></p>
-  </div>
+  <div class="ghbody">{''.join(parts)}</div>
 </div>"""
 
 
 def end_card(o: dict[str, Any]) -> str:
-    total = o["threads"] + o["siblings"]
     return f"""
 <div class="scrim solid"></div>
 <div class="end">
   <img src="{icon_uri()}" alt="">
   <div class="wordmark">gh-review-loop</div>
-  <div class="headline">Your AI reviewer flagged {o['threads']}. <span class="blue">There were {total}.</span></div>
+  <div class="headline">Your AI reviewer flagged {o['threads']}. <span class="blue">The sweep found {o['siblings']} more.</span></div>
   <div class="facts">
-    <span><i class="pip g"></i>all {total} sites fixed in one cycle</span>
+    <span><i class="pip g"></i>fixed in the same cycle</span>
     <span><i class="pip a"></i>pushed only on green tests</span>
     <span><i class="pip b"></i>1 of {CAP} re-reviews used</span>
   </div>
@@ -426,7 +472,11 @@ body { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: #e6edf3;
 .avatar { width: 24px; height: 24px; border-radius: 50%; background: #58a6ff; display: block; }
 .ghbody { padding: 16px 20px 18px; font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; }
 .ghbody h3 { font-size: 21px; margin-bottom: 12px; color: #f0f6fc; }
-.ghbody .done { color: #3fb950; }
+.ghbody .st.done { color: #3fb950; }
+.ghbody .st.running { color: #d29922; }
+.ghline { white-space: pre; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+          font-size: 14px; line-height: 21px; color: #c9d1d9; }
+.ghline.link { color: #58a6ff; }
 .ghbody pre { background: #151b23; border-radius: 8px; padding: 14px 16px; font-size: 15px;
               line-height: 22px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
               color: #e6edf3; margin-bottom: 12px; }
@@ -471,7 +521,7 @@ def page(state: dict[str, Any]) -> str:
   <div class="rail">{''.join(chips)}<span class="cap">cap {pips}</span></div></div>
 <div class="win">
   <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i>
-    <span class="t">claude · gh-review-loop · PR #{PR_NUMBER} demo/sweep-proof</span></div>
+    <span class="t">claude · gh-review-loop · PR #{PR_NUMBER} {PR_BRANCH}</span></div>
   <div class="view"><div class="flow">
     <div class="log">{''.join(state['items'])}</div>
     <div class="spin">{spinner}</div>
@@ -494,7 +544,8 @@ def find_chrome() -> str:
         os.environ.get("CHROME"),
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chromium-browser"),
+        shutil.which("google-chrome"), shutil.which("google-chrome-stable"),
+        shutil.which("chromium"), shutil.which("chromium-browser"),
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
@@ -524,8 +575,21 @@ def main() -> int:
         raise SystemExit("error: Pillow is required (pip install pillow)") from None
 
     frames = timeline(loop_output())
+    if args.only is not None and not 0 <= args.only < len(frames):
+        raise SystemExit(f"error: --only must be between 0 and {len(frames) - 1}")
     chrome = find_chrome()
     work = Path(tempfile.mkdtemp(prefix="grl-demo-"))
+    try:
+        return build(frames, chrome, work, args, Image)
+    finally:
+        if args.keep or args.only is not None:
+            print(f"frames kept in {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def build(frames: list[dict[str, Any]], chrome: str, work: Path,
+          args: argparse.Namespace, Image: Any) -> int:
     indexes = [args.only] if args.only is not None else list(range(len(frames)))
 
     def render(index: int) -> Path:
@@ -560,16 +624,19 @@ def main() -> int:
     palette.putpalette([channel for colour, _ in counts.most_common(PALETTE_SIZE)
                         for channel in colour])
     quantized = [im.quantize(palette=palette, dither=Image.Dither.NONE) for im in images]
-    quantized[0].save(
-        args.out, save_all=True, append_images=quantized[1:], loop=0, optimize=False,
-        duration=[frame["ms"] for frame in frames], disposal=1,
-    )
+    # Written beside the target and renamed over it, so an interrupted build
+    # never leaves a half-written GIF where the README points.
+    partial = args.out.with_name(args.out.name + ".partial")
+    try:
+        quantized[0].save(
+            partial, format="GIF", save_all=True, append_images=quantized[1:], loop=0,
+            optimize=False, duration=[frame["ms"] for frame in frames], disposal=1,
+        )
+        os.replace(partial, args.out)
+    finally:
+        partial.unlink(missing_ok=True)
     total = sum(frame["ms"] for frame in frames) / 1000
     print(f"{args.out}: {len(frames)} frames, {total:.1f}s, {args.out.stat().st_size / 1024:.0f} KB")
-    if args.keep:
-        print(f"frames kept in {work}")
-    else:
-        shutil.rmtree(work, ignore_errors=True)
     return 0
 
 

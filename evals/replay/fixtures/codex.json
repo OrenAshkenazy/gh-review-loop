@@ -1,0 +1,65 @@
+{
+ "captured_from": "GitHub GraphQL API pullRequest.reviewThreads",
+ "changed_files": [
+  "loaders/bundle.py",
+  "loaders/profiles.py"
+ ],
+ "commit": "24d20259d758f7a2aee2ba29836e2776255ec54b",
+ "description": "PR #129, Codex's two reviews of the same six loaders (commits eb662b6 and 24d2025). Two findings: a different failure in each file, on the same two-line code shape.",
+ "source": "https://github.com/OrenAshkenazy/gh-review-loop/pull/129",
+ "source_root": "src-codex",
+ "threads": [
+  {
+   "comments": [
+    {
+     "author": {
+      "__typename": "Bot",
+      "login": "chatgpt-codex-connector"
+     },
+     "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Return empty defaults when optional files are absent**\n\nOn a machine that has never imported a profile, `path.read_text()` raises `FileNotFoundError` instead of returning the documented empty dictionary; the `.get()` fallback only handles a missing key in an existing JSON file. The same defect affects all three loaders in `profiles.py` and all three readers in `bundle.py`, so older bundles lacking optional sections also fail to load. Handle absent files before decoding JSON and return the appropriate empty value (`{}` or `[]`) for each reader.\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->",
+     "createdAt": "2026-11-24T21:57:08Z",
+     "id": "4687098217",
+     "line": 20,
+     "originalLine": 20,
+     "path": "loaders/profiles.py",
+     "url": "https://github.com/OrenAshkenazy/gh-review-loop/pull/129#discussion_r4687098217"
+    }
+   ],
+   "diffSide": "RIGHT",
+   "id": "replay-4687098217",
+   "isOutdated": false,
+   "isResolved": false,
+   "line": 20,
+   "originalLine": 20,
+   "originalStartLine": 19,
+   "path": "loaders/profiles.py",
+   "startLine": 19
+  },
+  {
+   "comments": [
+    {
+     "author": {
+      "__typename": "Bot",
+      "login": "chatgpt-codex-connector"
+     },
+     "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Return empty sections for legacy list-shaped bundle JSON**\n\nWhen importing a pre-0.3 bundle, the documented bare JSON list decodes to a Python list, so calling `.get()` raises `AttributeError` instead of returning an empty section. This is reproducible with `[]` in all three bundle readers: `read_manifest`, `read_lockfile`, and `read_overrides`. Handle the legacy list layout before accessing object keys, returning `{}` or `[]` as appropriate so these supported bundles can be read.\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->",
+     "createdAt": "2026-11-24T21:59:16Z",
+     "id": "4687119806",
+     "line": 19,
+     "originalLine": 19,
+     "path": "loaders/bundle.py",
+     "url": "https://github.com/OrenAshkenazy/gh-review-loop/pull/129#discussion_r4687119806"
+    }
+   ],
+   "diffSide": "RIGHT",
+   "id": "replay-4687119806",
+   "isOutdated": false,
+   "isResolved": false,
+   "line": 19,
+   "originalLine": 19,
+   "originalStartLine": 18,
+   "path": "loaders/bundle.py",
+   "startLine": 18
+  }
+ ]
+}

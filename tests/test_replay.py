@@ -63,10 +63,19 @@ class TestReplayShowsWhatTheReadmeClaims:
 
     def test_run2_is_one_site_and_correctly_does_not_sweep(self):
         out = run_replay()
-        run2 = out.split("run2:")[1]
+        run2 = out.split("run2:")[1].split("codex:")[0]
         assert "1 site " in run2
         assert "nothing to sweep" in run2
         assert "[sweep]" not in run2
+
+    def test_codex_capture_merges_two_failures_into_one_shape_and_sweeps(self):
+        """The README demo is built from this capture; pin what it shows."""
+        out = run_replay()
+        codex = out.split("codex:")[1]
+        assert "Patterns (2):" in codex, "prose alone must split the two findings"
+        assert "[medium]" in codex, "Codex's P2 badge must be read as medium"
+        assert "2 sites   (sig: shape:" in codex, "shape must merge them into one"
+        assert "siblings:  3 unflagged site(s) match the same shape" in codex
 
 
 class TestFixturesAreRealCapturedData:
@@ -84,11 +93,25 @@ class TestFixturesAreRealCapturedData:
                 assert comment["body"].strip(), "body must be kept verbatim, not elided"
                 assert comment["url"].startswith("https://github.com/")
 
+    def test_codex_fixture_carries_provenance_and_verbatim_bodies(self):
+        payload = json.loads(
+            (REPLAY_DIR / "fixtures" / "codex.json").read_text(encoding="utf-8")
+        )
+        assert payload["source"].endswith("/pull/129")
+        assert len(payload["commit"]) == 40
+        assert len(payload["threads"]) == 2
+        for thread in payload["threads"]:
+            comment = thread["comments"][0]
+            assert comment["author"]["login"] == "chatgpt-codex-connector"
+            assert "P2 Badge" in comment["body"], "the severity badge must be kept verbatim"
+            assert comment["url"].startswith("https://github.com/")
+
     def test_vendored_source_is_present_so_replay_needs_no_branch(self):
-        """The demo branch may be reset or deleted; replay must still work."""
-        for name in ("profiles.py", "bundle.py"):
-            src = REPLAY_DIR / "fixtures" / "src" / "loaders" / name
-            assert src.exists()
-            assert 'json.loads(path.read_text(encoding="utf-8"))' in src.read_text(
-                encoding="utf-8"
-            )
+        """The demo branches may be reset or deleted; replay must still work."""
+        for root in ("src", "src-codex"):
+            for name in ("profiles.py", "bundle.py"):
+                src = REPLAY_DIR / "fixtures" / root / "loaders" / name
+                assert src.exists()
+                assert 'json.loads(path.read_text(encoding="utf-8"))' in src.read_text(
+                    encoding="utf-8"
+                )
