@@ -2,7 +2,8 @@
 """Deterministic replay of the sibling sweep over captured reviewer payloads.
 
 Runs the real clusterer and the real sweep against reviewer findings captured
-from PR #67, plus the reviewed source vendored beside them. No network, no
+from PR #67 (Sourcery) and PR #129 (Codex), plus the reviewed source vendored
+beside them. No network, no
 arguments, stdlib only — the output depends on nothing but this repository.
 
     python3 evals/replay/replay.py
@@ -29,13 +30,15 @@ import metrics  # noqa: E402
 import sweep_siblings  # noqa: E402
 
 FIXTURES = HERE / "fixtures"
-SOURCE_ROOT = FIXTURES / "src"
-RUNS = ("run1", "run2")
+RUNS = ("run1", "run2", "codex")
 
 
 def replay_one(name: str) -> None:
     payload = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
     threads = payload["threads"]
+    # Each capture replays against the source it was written about; the two
+    # Sourcery runs share one tree, the Codex capture has its own.
+    source_root = FIXTURES / payload.get("source_root", "src")
 
     print("=" * 72)
     print(f"{name}: {payload['description']}")
@@ -55,7 +58,7 @@ def replay_one(name: str) -> None:
     print(metrics.format_patterns_block(prose) or "Patterns (0):")
 
     # The shipping path: fetch_gemini_threads passes root=repo_root().
-    shaped = cluster_findings.cluster(threads, root=SOURCE_ROOT)
+    shaped = cluster_findings.cluster(threads, root=source_root)
     print("\n-- clustered by prose and code shape (shipping behaviour) --")
     print(metrics.format_patterns_block(shaped) or "Patterns (0):")
 
@@ -70,7 +73,7 @@ def replay_one(name: str) -> None:
             label=cluster.label,
             sites=list(cluster.sites),
             changed_files=payload["changed_files"],
-            root=SOURCE_ROOT,
+            root=source_root,
         )
         print(sweep_siblings.render_report(result))
     if not swept_any:

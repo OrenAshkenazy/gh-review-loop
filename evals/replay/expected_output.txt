@@ -47,3 +47,32 @@ Patterns (1):
 -- sweep --
 no cluster reached 2 sites; nothing to sweep
 
+========================================================================
+codex: PR #129, Codex's two reviews of the same six loaders (commits eb662b6 and 24d2025). Two findings: a different failure in each file, on the same two-line code shape.
+commit: 24d20259d758f7a2aee2ba29836e2776255ec54b
+threads: 2
+  - loaders/profiles.py:20
+  - loaders/bundle.py:19
+========================================================================
+
+-- clustered by finding prose alone --
+Patterns (2):
+  [medium] exception-wrap — 1 site   (sig: exception-wrap)
+           loaders/profiles.py:19-20
+  [medium] ** return empty sections for legacy list-shaped bundle json*… — 1 site   (sig: 993847d3)
+           loaders/bundle.py:18-19
+
+-- clustered by prose and code shape (shipping behaviour) --
+Patterns (1):
+  [medium] ** return empty defaults when optional files are absent** on… — 2 sites   (sig: shape:d0395f1f)
+           loaders/profiles.py:19-20, loaders/bundle.py:18-19
+
+-- sweep --
+[sweep] ** return empty defaults when optional files are absent** on…
+  flagged:   loaders/profiles.py:19-20, loaders/bundle.py:18-19
+  shared:    data get {})
+  siblings:  3 unflagged site(s) match the same shape
+    + loaders/bundle.py:31  return data.get("overrides", {})
+    + loaders/profiles.py:26  return data.get("reviewers", {})
+    + loaders/profiles.py:32  return data.get("defaults", {})
+
