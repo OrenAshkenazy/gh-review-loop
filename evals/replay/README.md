@@ -64,10 +64,14 @@ How the Codex capture came about, since it is not one clean review:
 - PR #129 is the same six loaders with the contract written into the
   docstrings. Reviewing `eb662b6`, Codex posted one finding, on the first
   loader, and named the other five in prose.
-- `24d2025` gave the bundle readers a second, different contract. Codex's
-  review of that commit added the `bundle.py` finding.
+- `24d2025` gave the bundle readers a second, different contract. Codex
+  reviewed that commit twice, 21 seconds apart, and each review posted the
+  same finding on `bundle.py:19` as its own comment.
 
-The fixture holds the two open findings a loop run on PR #129 would fetch.
+The fixture holds one comment per flagged site: the `profiles.py` finding and
+the first of the two `bundle.py` comments (`4687119806`). The second
+(`4687123502`) is left out. A loop run on PR #129 fetches all three; the
+pattern then reads "3 sites" and the sweep reports the same 3 siblings.
 The sweep does not report the sixth site, `read_lockfile`: it returns
 `data.get("pinned", [])`, which does not share the `{})` token.
 
