@@ -13,19 +13,24 @@ from pathlib import Path
 from typing import Any
 
 
+def _read_section(path: Path) -> dict[str, Any]:
+    """Decode one section file; the pre-0.3 bare-list layout reads as empty."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return {}
+    return data
+
+
 def read_manifest(path: Path) -> dict[str, Any]:
     """Read the manifest listing every included profile ({} for a legacy bundle)."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("manifest", {})
+    return _read_section(path).get("manifest", {})
 
 
 def read_lockfile(path: Path) -> list[str]:
     """Read the pinned plugin versions ([] for a legacy bundle)."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("pinned", [])
+    return _read_section(path).get("pinned", [])
 
 
 def read_overrides(path: Path) -> dict[str, Any]:
     """Read per-developer overrides ({} for a legacy bundle)."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("overrides", {})
+    return _read_section(path).get("overrides", {})
