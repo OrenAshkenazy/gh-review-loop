@@ -23,6 +23,7 @@ import argparse
 import base64
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -48,8 +49,14 @@ import fetch_gemini_threads
 import metrics
 import sweep_siblings
 
+# The page is laid out at WIDTH x HEIGHT CSS pixels and rendered at SCALE device
+# pixels each. GitHub shows a README image about 850 CSS pixels wide, so a 1x
+# render is stretched on a HiDPI screen and its text goes soft; 2x keeps every
+# glyph on real pixels there.
 WIDTH, HEIGHT = 1200, 760
-PALETTE_SIZE = 128
+SCALE = 2
+PALETTE_SIZE = 256
+PALETTE_ROUNDS = 12
 
 REPO = "OrenAshkenazy/gh-review-loop"
 PR_NUMBER = 129
@@ -556,7 +563,7 @@ def find_chrome() -> str:
 def screenshot(chrome: str, html_path: Path, png_path: Path, profile_dir: Path) -> None:
     subprocess.run(
         [chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
-         "--force-device-scale-factor=1", f"--window-size={WIDTH},{HEIGHT}",
+         f"--force-device-scale-factor={SCALE}", f"--window-size={WIDTH},{HEIGHT}",
          f"--user-data-dir={profile_dir}", f"--screenshot={png_path}", html_path.as_uri()],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
     )
@@ -588,6 +595,55 @@ def main() -> int:
             shutil.rmtree(work, ignore_errors=True)
 
 
+def pixels(im: Any) -> Any:
+    """The image's RGB tuples, on Pillow versions before and after get_flattened_data."""
+    flat = getattr(im, "get_flattened_data", None)
+    return flat() if flat else im.getdata()
+
+
+def shared_palette(
+    counts: Counter[tuple[int, int, int]], Image: Any,
+) -> tuple[list[int], dict[tuple[int, int, int], int]]:
+    """One palette for every frame, plus the exact nearest entry for each colour.
+
+    A single palette keeps unchanged pixels byte-identical between frames, so
+    the GIF stores only what moved. It has to serve two populations at once:
+    a handful of flat fills that cover almost every pixel, and thousands of
+    anti-aliasing shades that each cover almost none but decide how the text
+    reads. Seeding from an octree over square-root-damped counts gives the
+    rare shades and the small accents a slot; a few rounds of k-means then
+    pull each entry onto the colours it actually stands for.
+    """
+    colours = list(counts)
+    weight = {colour: math.sqrt(count) for colour, count in counts.items()}
+    sample = [colour for colour in colours for _ in range(max(1, round(weight[colour] / 4)))]
+    side = math.isqrt(len(sample) - 1) + 1
+    sample += [sample[-1]] * (side * side - len(sample))
+    seed = Image.new("RGB", (side, side))
+    seed.putdata(sample)
+    flat = seed.quantize(colors=PALETTE_SIZE, method=Image.Quantize.FASTOCTREE,
+                         dither=Image.Dither.NONE).getpalette()[:PALETTE_SIZE * 3]
+    entries = [tuple(flat[n:n + 3]) for n in range(0, len(flat), 3)]
+
+    def assign() -> dict[tuple[int, int, int], int]:
+        return {
+            (r, g, b): min(range(len(entries)), key=lambda n: (
+                (r - entries[n][0]) ** 2 + (g - entries[n][1]) ** 2 + (b - entries[n][2]) ** 2))
+            for r, g, b in colours
+        }
+
+    for _ in range(PALETTE_ROUNDS):
+        sums = [[0.0, 0.0, 0.0, 0.0] for _ in entries]
+        for colour, index in assign().items():
+            total = sums[index]
+            for channel in range(3):
+                total[channel] += colour[channel] * weight[colour]
+            total[3] += weight[colour]
+        entries = [tuple(round(total[channel] / total[3]) for channel in range(3))
+                   if total[3] else entry for total, entry in zip(sums, entries)]
+    return [channel for entry in entries for channel in entry], assign()
+
+
 def build(frames: list[dict[str, Any]], chrome: str, work: Path,
           args: argparse.Namespace, Image: Any) -> int:
     indexes = [args.only] if args.only is not None else list(range(len(frames)))
@@ -609,21 +665,21 @@ def build(frames: list[dict[str, Any]], chrome: str, work: Path,
 
     images = [Image.open(p).convert("RGB") for p in pngs]
     sizes = {im.size for im in images}
-    if sizes != {(WIDTH, HEIGHT)}:
+    if sizes != {(WIDTH * SCALE, HEIGHT * SCALE)}:
         raise SystemExit(f"error: unexpected frame sizes {sizes}")
-    # One palette for every frame, so unchanged pixels stay byte-identical and
-    # Pillow's frame differencing keeps each frame down to what actually moved.
-    # It is the most frequent exact colours across the whole run rather than a
-    # median cut: this is flat UI, and a median cut spends its slots on text
-    # anti-aliasing and drops the small accents (traffic lights, the [loop] tag).
     counts: Counter[tuple[int, int, int]] = Counter()
     for im in images:
-        for count, colour in im.getcolors(maxcolors=WIDTH * HEIGHT):
+        for count, colour in im.getcolors(maxcolors=im.width * im.height):
             counts[colour] += count
-    palette = Image.new("P", (1, 1))
-    palette.putpalette([channel for colour, _ in counts.most_common(PALETTE_SIZE)
-                        for channel in colour])
-    quantized = [im.quantize(palette=palette, dither=Image.Dither.NONE) for im in images]
+    palette, index_of = shared_palette(counts, Image)
+    # Each frame is mapped colour by colour through index_of rather than with
+    # Image.quantize(palette=...): Pillow's palette lookup is approximate, and
+    # on anti-aliased text its misses show up as ragged, discoloured edges.
+    quantized = []
+    for im in images:
+        frame = Image.frombytes("P", im.size, bytes(map(index_of.__getitem__, pixels(im))))
+        frame.putpalette(palette)
+        quantized.append(frame)
     # Written beside the target and renamed over it, so an interrupted build
     # never leaves a half-written GIF where the README points.
     partial = args.out.with_name(args.out.name + ".partial")
