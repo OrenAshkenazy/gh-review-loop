@@ -74,7 +74,7 @@ Intersecting across sites is the token sweep's safety property: a candidate has 
 
 Everything else it does (reading `isResolved`/`isOutdated` off the `reviewThreads` GraphQL, honoring a maintainer's *"wontfix"* reply, sorting by severity, keeping one live-edited status comment instead of comment spam) is table stakes done carefully. Correct, but not why you'd pick this.
 
-## One defect, six copies, five reviews
+## One defect, six copies, six reviews
 
 The demo PRs hold six copies of one mistake: `json.loads(path.read_text())` followed by `data.get(...)`, in two files. Here is what the reviewers made of it:
 
@@ -85,6 +85,7 @@ The demo PRs hold six copies of one mistake: `json.loads(path.read_text())` foll
 | Codex, PR #67 | none |
 | Codex, [PR #129](https://github.com/OrenAshkenazy/gh-review-loop/pull/129) (the same loaders, with the contract written into the docstrings) | 1 of 6, with the other five named in prose |
 | Codex, PR #129 after one more commit | 1 more, in the other file |
+| Codex, a second review of that same commit 21 seconds later | the same site once more, as a second comment |
 
 None of these reviews is wrong. A reviewer bot samples a diff; it does not enumerate it, and the same bot on the same code does not return the same sample twice. So the wording of a finding is not a stable way to group findings, and "fix what was flagged" leaves the rest for the next round.
 
