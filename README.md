@@ -21,7 +21,7 @@
 
 A plugin for **Claude Code** and **Codex** that clears AI reviewer feedback on your PR without you leaving the terminal. Three things set it apart:
 
-- **It sweeps the class, not the instance.** When the reviewer flags a pattern at two sites, the loop finds the sibling sites it didn't flag and fixes them in the same cycle, so they don't come back as round two and round three.
+- **It sweeps the class, not the instance.** When the reviewer flags a pattern at two sites, the loop searches your diff for other sites with the same code shape and fixes the ones it finds in the same cycle, so they don't come back as round two and round three. It reports what matches the flagged lines, which is not always every sibling.
 - **It won't push red.** Save a verification profile once and every push is gated on your repo's own tests and linters.
 - **It has a brake.** Re-review requests are hard-capped (default 3), enforced by the script that posts them, so the loop can't spam your PR.
 
